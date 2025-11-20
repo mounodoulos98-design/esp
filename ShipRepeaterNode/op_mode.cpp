@@ -995,26 +995,12 @@ void loopOperationalMode() {
                 
                 delay(2000);
                 
+                // Send STATUS command to sensor
                 String extractedSn;
                 bool success = sjm_requestStatus(sensorIp, extractedSn);
                 
                 if (success) {
                   Serial.printf("[HB-TASK-LEGACY] STATUS completed for SN=%s\n", sensorSn.c_str());
-                  
-                  if (initSdCard()) {
-                    ensureDir("/received");
-                    char filename[128];
-                    unsigned long ts = millis();
-                    snprintf(filename, sizeof(filename), "/received/status_%s_%lu.txt", 
-                            sensorSn.c_str(), ts);
-                    FsFile f = sd.open(filename, O_WRITE | O_CREAT | O_TRUNC);
-                    if (f) {
-                      f.printf("SN=%s,IP=%s,Timestamp=%lu\n", 
-                              sensorSn.c_str(), sensorIp.c_str(), ts);
-                      f.close();
-                      Serial.printf("[HB-TASK-LEGACY] Status saved to %s\n", filename);
-                    }
-                  }
                 } else {
                   Serial.printf("[HB-TASK-LEGACY] STATUS failed for SN=%s\n", sensorSn.c_str());
                 }
@@ -1023,7 +1009,7 @@ void loopOperationalMode() {
                 vTaskDelete(NULL);
               },
               "LegacyStatusTask",
-              4096,
+              8192,  // Increased stack size from 4096 to 8192
               new String[2]{ip, sensorSn},
               1,
               NULL
