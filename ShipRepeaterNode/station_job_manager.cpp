@@ -2,6 +2,7 @@
 #include "config.h"
 #include "firmware_updater.h"
 #include "config_updater.h"
+#include "status_utils.h"
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <vector>
@@ -56,7 +57,7 @@ static bool writeJsonFile(const char* path, StaticJsonDocument<16384>& doc) {
 // ---------------------
 // STATUS request:
 //   - GET /api?command=STATUS&datetime=<ms>&
-//   - Παίρνουμε S/N από το body
+//   - Parse JSON response using status_utils
 // ---------------------
 static bool sjm_requestStatus(const String& ip, String& snOut) {
     if (ip.length() == 0 || ip == "0.0.0.0") return false;
@@ -102,32 +103,14 @@ static bool sjm_requestStatus(const String& ip, String& snOut) {
         return false;
     }
 
-    // status body: MODE=...,FIRMWARE_VERSION=...,S/N=324269,...
-    snOut = "";
-    int pos = 0;
-    while (true) {
-        int comma = body.indexOf(',', pos);
-        String part = (comma < 0) ? body.substring(pos) : body.substring(pos, comma);
-        int eq = part.indexOf('=');
-        if (eq > 0) {
-            String key = part.substring(0, eq);
-            String val = part.substring(eq + 1);
-            key.trim();
-            val.trim();
-            if (key == "S/N") {
-                snOut = val;
-                break;
-            }
-        }
-        if (comma < 0) break;
-        pos = comma + 1;
-    }
-
-    if (snOut.length() == 0) {
-        Serial.println("[STATUS] WARNING: S/N not found in body");
+    // Parse response using status_utils
+    StatusData statusData;
+    if (!parseStatusResponse(body, statusData)) {
+        Serial.println("[STATUS] ERROR: Failed to parse status response");
         return false;
     }
 
+    snOut = statusData.serialNumber;
     Serial.printf("[STATUS] SN=%s for IP=%s\n", snOut.c_str(), ip.c_str());
     return true;
 }
