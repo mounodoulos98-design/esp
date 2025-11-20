@@ -4,7 +4,9 @@ This document describes the async sensor communication flow implemented in the E
 
 ## Overview
 
-The ESP32 Collector operates in an async mode where it handles multiple sensors simultaneously through event-driven heartbeat processing, rather than sequential polling.
+The ESP32 Collector operates in an async mode where it handles multiple sensors simultaneously through event-driven heartbeat processing. **No active polling** - sensors must send POST requests to the collector's heartbeat endpoint.
+
+**Important:** Sensors must have firmware that sends heartbeat POST requests to `http://192.168.4.1:3000/event/heartbeat`. The collector does not actively poll sensors.
 
 ## Flow Diagram
 

@@ -805,6 +805,7 @@ void loopOperationalMode() {
           }
 
           // --- STATION EVENTS ---
+          // Track when stations connect to update activity timeout
           stationConnectedEventId =
             WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
               if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
@@ -821,18 +822,13 @@ void loopOperationalMode() {
                         info.wifi_ap_staconnected.mac[4],
                         info.wifi_ap_staconnected.mac[5]);
 
-                Serial.printf("[AP] Station connected: %s\n", macStr);
-
-                // the real station job manager
-                sjm_addStation(String(macStr));
+                Serial.printf("[AP] Station connected: %s (waiting for heartbeat POST)\n", macStr);
               }
 
               else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
                 Serial.println("[AP] Station disconnected.");
               }
             });
-
-          sjm_init();
           apActive = true;
           hadStation = false;
           jobProcessedThisWindow = false;
@@ -970,10 +966,10 @@ void loopOperationalMode() {
           // ======================================================
         }
 
-        // ---- PROCESS JOBS FOR ANY CONNECTED SENSOR ----
-        if (hadStation) {
-          sjm_processStations();
-        }
+        // ---- ASYNC HEARTBEAT-BASED PROCESSING ----
+        // Sensors send POST requests to /event/heartbeat (port 3000)
+        // The heartbeat callbacks (onStatus/onOther) handle job execution asynchronously
+        // No active polling needed - event-driven architecture
 
         // ---- TIMEOUT CHECK ----
         unsigned long timeout = hadStation ? (config.collectorDataTimeoutSec * 1000UL) : (config.collectorApWindowSec * 1000UL);
