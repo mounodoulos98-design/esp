@@ -960,6 +960,158 @@ void loopOperationalMode() {
             lastActivityMillis = millis();
           });
 
+          // ======================================================
+          //       LEGACY COMPATIBILITY ENDPOINTS
+          // ======================================================
+          // Support for sensors using old API format
+          
+          // Legacy GET /api/heartbeat?sensor_sn=XXX&ip=YYY
+          sensorServer.on("/api/heartbeat", HTTP_GET, [](AsyncWebServerRequest *request) {
+            if (!request->hasParam("sensor_sn")) {
+              request->send(400, "text/plain", "Missing sensor_sn");
+              return;
+            }
+            
+            String sensorSn = request->getParam("sensor_sn")->value();
+            IPAddress remoteIp = request->client()->remoteIP();
+            
+            Serial.printf("[HB-LEGACY] GET /api/heartbeat from SN=%s IP=%s\n", 
+                         sensorSn.c_str(), remoteIp.toString().c_str());
+            
+            // Log heartbeat
+            appendToHeartbeatLog(sensorSn);
+            
+            // Trigger STATUS command (same as heartbeats_after_measurement=1)
+            String ip = remoteIp.toString();
+            xTaskCreate(
+              [](void* param) {
+                String* params = (String*)param;
+                String sensorIp = params[0];
+                String sensorSn = params[1];
+                
+                Serial.printf("[HB-TASK-LEGACY] Sending STATUS to SN=%s IP=%s\n",
+                             sensorSn.c_str(), sensorIp.c_str());
+                
+                delay(2000);
+                
+                String extractedSn;
+                bool success = sjm_requestStatus(sensorIp, extractedSn);
+                
+                if (success) {
+                  Serial.printf("[HB-TASK-LEGACY] STATUS completed for SN=%s\n", sensorSn.c_str());
+                  
+                  if (initSdCard()) {
+                    ensureDir("/received");
+                    char filename[128];
+                    unsigned long ts = millis();
+                    snprintf(filename, sizeof(filename), "/received/status_%s_%lu.txt", 
+                            sensorSn.c_str(), ts);
+                    FsFile f = sd.open(filename, O_WRITE | O_CREAT | O_TRUNC);
+                    if (f) {
+                      f.printf("SN=%s,IP=%s,Timestamp=%lu\n", 
+                              sensorSn.c_str(), sensorIp.c_str(), ts);
+                      f.close();
+                      Serial.printf("[HB-TASK-LEGACY] Status saved to %s\n", filename);
+                    }
+                  }
+                } else {
+                  Serial.printf("[HB-TASK-LEGACY] STATUS failed for SN=%s\n", sensorSn.c_str());
+                }
+                
+                delete[] params;
+                vTaskDelete(NULL);
+              },
+              "LegacyStatusTask",
+              4096,
+              new String[2]{ip, sensorSn},
+              1,
+              NULL
+            );
+            
+            request->send(200, "text/plain", "OK");
+            lastActivityMillis = millis();
+          });
+
+          // Legacy POST /api/status - sensor sends status data directly
+          sensorServer.on(
+            "/api/status",
+            HTTP_POST,
+            [](AsyncWebServerRequest *request) {
+              request->send(400, "text/plain", "Expected JSON body");
+            },
+            nullptr,
+            [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+              if (index != 0 && index + len != total) return;
+              
+              DynamicJsonDocument doc(1024);
+              DeserializationError err = deserializeJson(doc, data, len);
+              if (err) {
+                request->send(400, "text/plain", "Invalid JSON");
+                return;
+              }
+              
+              // Extract S/N from the data field
+              String dataStr = doc["data"] | "";
+              String sensorSn = "";
+              
+              // Parse S/N from format: "MODE=...,S/N=25000120,..."
+              int snPos = dataStr.indexOf("S/N=");
+              if (snPos >= 0) {
+                int commaPos = dataStr.indexOf(',', snPos);
+                if (commaPos >= 0) {
+                  sensorSn = dataStr.substring(snPos + 4, commaPos);
+                } else {
+                  sensorSn = dataStr.substring(snPos + 4);
+                }
+                sensorSn.trim();
+              }
+              
+              IPAddress remoteIp = request->client()->remoteIP();
+              
+              Serial.printf("[HB-LEGACY] POST /api/status from SN=%s IP=%s\n", 
+                           sensorSn.c_str(), remoteIp.toString().c_str());
+              
+              // Save status data to file
+              if (initSdCard() && sensorSn.length() > 0) {
+                ensureDir("/received");
+                char filename[128];
+                unsigned long ts = millis();
+                snprintf(filename, sizeof(filename), "/received/status_%s_%lu.txt", 
+                        sensorSn.c_str(), ts);
+                FsFile f = sd.open(filename, O_WRITE | O_CREAT | O_TRUNC);
+                if (f) {
+                  f.println(dataStr);
+                  f.close();
+                  Serial.printf("[HB-LEGACY] Status data saved to %s\n", filename);
+                }
+              }
+              
+              request->send(200, "text/plain", "OK");
+              lastActivityMillis = millis();
+            }
+          );
+
+          // Legacy POST /api/measure - sensor sends measurement data
+          sensorServer.on(
+            "/api/measure",
+            HTTP_POST,
+            [](AsyncWebServerRequest *request) {
+              request->send(400, "text/plain", "Expected binary data");
+            },
+            nullptr,
+            [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+              // Accept measurement data
+              Serial.printf("[HB-LEGACY] POST /api/measure received %d bytes (index=%d, total=%d)\n", 
+                           len, index, total);
+              
+              // For now, just acknowledge receipt
+              if (index + len >= total) {
+                request->send(200, "text/plain", "OK");
+                lastActivityMillis = millis();
+              }
+            }
+          );
+
           sensorServer.begin();
           Serial.println("[HB] Heartbeat server started on :3000");
 
