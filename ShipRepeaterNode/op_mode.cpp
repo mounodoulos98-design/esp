@@ -116,6 +116,40 @@ static void ensureDir(const char* path) {
   }
 }
 
+// Log heartbeat to CSV file (like sensordaemon)
+static void appendToHeartbeatLog(const String& sensorSn) {
+  if (!initSdCard()) return;
+  
+  ensureDir(RECEIVED_DIR);
+  const char* hbFile = "/received/heartbeat_api.csv";
+  
+  // Get current time (epoch or millis if no RTC sync)
+  time_t now;
+  time(&now);
+  struct tm* timeinfo = localtime(&now);
+  
+  char timestamp[32];
+  if (timeinfo && timeinfo->tm_year > (2023 - 1900)) {
+    // Valid time - use ISO 8601 format
+    snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+             timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+             timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+  } else {
+    // No valid time - use millis
+    snprintf(timestamp, sizeof(timestamp), "T%lu", millis());
+  }
+  
+  // Append to CSV file
+  FsFile f = sd.open(hbFile, O_WRONLY | O_CREAT | O_APPEND);
+  if (f) {
+    f.printf("%s,%s\n", timestamp, sensorSn.c_str());
+    f.close();
+    Serial.printf("[HB] Logged heartbeat: %s,%s\n", timestamp, sensorSn.c_str());
+  } else {
+    Serial.printf("[HB] Failed to open %s\n", hbFile);
+  }
+}
+
 // next progressive filename: /queue/entry_00000001.bin
 static String nextQueueFilename() {
   ensureDir(QUEUE_DIR);
@@ -825,6 +859,9 @@ void loopOperationalMode() {
                           ctx.sensorSn.c_str(),
                           ctx.lastIp.toString().c_str());
 
+            // Log heartbeat to CSV file
+            appendToHeartbeatLog(ctx.sensorSn);
+
             // Send STATUS command to sensor (async in separate task to avoid blocking)
             String sn = ctx.sensorSn;
             String ip = ctx.lastIp.toString();
@@ -887,6 +924,9 @@ void loopOperationalMode() {
             Serial.printf("[HB] OTHER heartbeat received for SN=%s IP=%s\n",
                           ctx.sensorSn.c_str(),
                           ctx.lastIp.toString().c_str());
+
+            // Log heartbeat to CSV file
+            appendToHeartbeatLog(ctx.sensorSn);
 
             // Execute jobs for this sensor asynchronously
             String sn = ctx.sensorSn;
