@@ -984,33 +984,21 @@ void loopOperationalMode() {
             xTaskCreate(
               [](void* param) {
                 String* params = (String*)param;
-                String sensorIp = params[0];
-                String sensorSn = params[1];
+                String sensorSn = params[0];
                 
-                Serial.printf("[HB-TASK-LEGACY] Sending STATUS to SN=%s IP=%s\n",
-                             sensorSn.c_str(), sensorIp.c_str());
+                Serial.printf("[HB-TASK-LEGACY] Processing heartbeat for SN=%s\n", sensorSn.c_str());
                 
                 // Log heartbeat (safe to access SD card from FreeRTOS task)
                 appendToHeartbeatLog(sensorSn);
                 
-                delay(2000);
-                
-                // Send STATUS command to sensor
-                String extractedSn;
-                bool success = sjm_requestStatus(sensorIp, extractedSn);
-                
-                if (success) {
-                  Serial.printf("[HB-TASK-LEGACY] STATUS completed for SN=%s\n", sensorSn.c_str());
-                } else {
-                  Serial.printf("[HB-TASK-LEGACY] STATUS failed for SN=%s\n", sensorSn.c_str());
-                }
+                Serial.printf("[HB-TASK-LEGACY] Heartbeat logged for SN=%s\n", sensorSn.c_str());
                 
                 delete[] params;
                 vTaskDelete(NULL);
               },
-              "LegacyStatusTask",
-              8192,  // Increased stack size from 4096 to 8192
-              new String[2]{ip, sensorSn},
+              "LegacyHeartbeatTask",
+              4096,  // Stack size for SD logging only
+              new String[1]{sensorSn},
               1,
               NULL
             );
