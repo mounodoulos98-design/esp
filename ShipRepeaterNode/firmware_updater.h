@@ -10,6 +10,7 @@ struct FirmwareJob {
   String hexPath;         // π.χ. "/firmware/vibration_sensor_app_v1.17.hex"
   uint32_t maxLines;      // 0 => όλες οι γραμμές
   uint32_t totalTimeoutMs; // συνολικό timeout (π.χ. 8 λεπτά)
+  unsigned long lineRateLimitMs; // optional per-line delay override (0 = use default)
 };
 
 // Εκτελεί ολόκληρο το firmware update βάσει FirmwareJob.

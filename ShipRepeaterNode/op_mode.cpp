@@ -2,6 +2,9 @@
 #include "firmware_updater.h"
 #include "config_updater.h"
 #include "station_job_manager.h"
+#include "http_utils.h"
+#include "logging.h"
+#include "tuning.h"
 #include <ArduinoJson.h>
 #include <vector>
 #include <map>
@@ -9,7 +12,7 @@
 #include <sys/time.h>
 #include "sensor_heartbeat_manager.h"
 
-
+extern RuntimeTuning g_tuning;
 
 extern "C" {
 #include "esp_event.h"
@@ -24,14 +27,18 @@ static bool safeBringUpAP(const String& ssidIn, const String& passIn, const Stri
   delay(300);
   yield();
 
-  // Δημιουργία default event loop αν δεν υπάρχει (διορθώνει το "Invalid mbox")
+  // Create default event loop if it doesn't exist
+  // This fixes "Invalid mbox" errors during WiFi initialization
+  // The loop is created once per boot and is safe to call multiple times
+  // due to the static guard below. ESP_ERR_INVALID_STATE indicates the loop
+  // already exists, which is expected and safe to ignore.
   static bool loopCreated = false;
   if (!loopCreated) {
     esp_err_t res = esp_event_loop_create_default();
     if (res == ESP_ERR_INVALID_STATE) {
-      Serial.println("[WiFi] Event loop already exists.");
+      Serial.println("[WiFi] Event loop already exists (expected).");
     } else if (res == ESP_OK) {
-      Serial.println("[WiFi] Event loop created.");
+      Serial.println("[WiFi] Event loop created successfully.");
     } else {
       Serial.printf("[WiFi] Event loop error: %d\n", res);
     }
@@ -325,90 +332,58 @@ void ensureRepeaterHttpServer() {
 // Collector: HTTP upload to Root
 // =============================
 bool uploadFileToRoot(const String& fullPath, const String& basename) {
-  if (!initSdCard()) return false;
-  FsFile f = sd.open(fullPath.c_str(), O_RDONLY);
-  if (!f) {
-    Serial.printf("[HTTP UP] Cannot open %s\n", fullPath.c_str());
-    return false;
-  }
-  f.seekEnd(0);
-  uint32_t fsize = f.curPosition();
-  f.rewind();
-
+  // Ensure WiFi connection first
   if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.printf("[UPLINK] Connecting STA to %s...\n", config.uplinkSSID.c_str());
+    LOG_INFO("UPLINK", "Connecting STA to %s...", config.uplinkSSID.c_str());
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(200); }
   }
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[UPLINK] STA connect failed");
-    f.close();
+    LOG_ERROR("UPLINK", "STA connect failed");
     return false;
   }
 
-  WiFiClient client;
-  Serial.printf("[HTTP UP] Connecting to %s:%d...\n", config.uplinkHost.c_str(), config.uplinkPort);
-  if (!client.connect(config.uplinkHost.c_str(), config.uplinkPort)) {
-    Serial.println("[HTTP UP] Connect failed");
-    f.close();
-    return false;
-  }
-
-  String boundary = "----esp32bound" + String(millis());
-  String head = "POST /ingest HTTP/1.1\r\nHost: " + config.uplinkHost + "\r\n";
-  head += "Connection: close\r\nContent-Type: multipart/form-data; boundary=" + boundary + "\r\n";
-  String pre = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"" + basename + "\"\r\nContent-Type: application/octet-stream\r\n\r\n";
-  String post = "\r\n--" + boundary + "--\r\n";
-  uint32_t contentLength = pre.length() + fsize + post.length();
-  head += "Content-Length: " + String(contentLength) + "\r\n\r\n";
-
-  client.print(head);
-  client.print(pre);
-  uint8_t buf[SD_CHUNK_SIZE];
-  while (f.available()) {
-    int rd = f.read(buf, sizeof(buf));
-    if (rd > 0) client.write(buf, rd);
-    delay(0);
-  }
-  client.print(post);
-  f.close();
-
-  unsigned long t0 = millis();
-  while (client.connected() && millis() - t0 < 10000) {
-    while (client.available()) {
-      client.read();
-      t0 = millis();
-    }
-    delay(10);
-  }
-  client.stop();
-  Serial.printf("[HTTP UP] Uploaded %s (%lu bytes)\n", basename.c_str(), (unsigned long)fsize);
-  return true;
+  // Use new HTTP multipart upload utility
+  return httpMultipartPostFile(config.uplinkHost, config.uplinkPort, 
+                               "/ingest", "file", fullPath);
 }
 
-void processQueue() {
+// Track upload failures for early sleep decision
+static int consecutiveUploadFailures = 0;
+static const int MAX_UPLOAD_FAILURES = 3;
+
+bool processQueue() {
   // For COLLECTOR: uplink via HTTP
   if (config.role == ROLE_COLLECTOR) {
     String oldest;
-    if (!findOldestQueueFile(oldest)) return;
-    if (!initSdCard()) return;
+    if (!findOldestQueueFile(oldest)) return false;
+    if (!initSdCard()) return false;
     String base = oldest.substring(String(QUEUE_DIR).length() + 1);
     bool ok = uploadFileToRoot(oldest, base);
-    if (ok && initSdCard()) { sd.remove(oldest.c_str()); }
-    return;
+    if (ok && initSdCard()) { 
+      sd.remove(oldest.c_str()); 
+      consecutiveUploadFailures = 0;  // Reset on success
+      return true;
+    } else {
+      consecutiveUploadFailures++;
+      LOG_WARN("UPLINK", "Upload failed (%d consecutive failures)", consecutiveUploadFailures);
+      return false;
+    }
   }
+  return false;
 }
 
 // =============================
 // JOB EXECUTION (JSON-based)
 // =============================
 
-// very small helper to do one HTTP GET (for STATUS / CONFIGURE)
+// Helper to do one HTTP GET (for STATUS / CONFIGURE)
+// Parses full URL and delegates to httpGet utility
 static bool doSimpleHttpGet(const String& url, String& bodyOut, unsigned long timeoutMs = 5000) {
-  Serial.printf("[HTTP] GET %s\n", url.c_str());
-  WiFiClient client;
+  LOG_DEBUG("HTTP", "GET %s", url.c_str());
+  
   // Extract host & path from full URL "http://x.x.x.x/....."
   String host, path;
   if (url.startsWith("http://")) {
@@ -418,40 +393,12 @@ static bool doSimpleHttpGet(const String& url, String& bodyOut, unsigned long ti
     host = url.substring(hostStart, slash);
     path = (slash < (int)url.length()) ? url.substring(slash) : "/";
   } else {
-    Serial.println("[HTTP] URL must start with http://");
+    LOG_ERROR("HTTP", "URL must start with http://");
     return false;
   }
 
-  if (!client.connect(host.c_str(), 80)) {
-    Serial.println("[HTTP] connect() failed");
-    return false;
-  }
-
-  client.print(String("GET ") + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n");
-
-  unsigned long t0 = millis();
-  while (client.connected() && !client.available() && (millis() - t0) < timeoutMs) {
-    delay(10);
-  }
-  if (!client.available()) {
-    Serial.println("[HTTP] no data");
-    client.stop();
-    return false;
-  }
-
-  String resp;
-  while (client.available()) {
-    resp += (char)client.read();
-  }
-  client.stop();
-
-  int bodyIndex = resp.indexOf("\r\n\r\n");
-  if (bodyIndex >= 0) {
-    bodyOut = resp.substring(bodyIndex + 4);
-  } else {
-    bodyOut = resp;
-  }
-  return true;
+  // Use new HTTP utility
+  return httpGet(host, path, bodyOut, timeoutMs, g_tuning.httpRetries, false);
 }
 
 // Execute a single JSON job from JOB_FILE; returns true if a job was found & executed
@@ -709,7 +656,7 @@ void loopOperationalMode() {
     static unsigned long lastPrint = 0;
     if (millis() - lastPrint > 10000) {
       debugPrintTime("Root loop");
-      lastPrint = 0;
+      lastPrint = millis();  // Fixed: should be current time, not 0
     }
     return;
   }
@@ -803,6 +750,9 @@ void loopOperationalMode() {
           hadStation = false;
           jobProcessedThisWindow = false;
           lastActivityMillis = millis();
+          
+          // Cleanup stale job files
+          sjm_cleanupStaleDoneFiles();
 
           // ======================================================
           //                HEARTBEAT INTEGRATION
@@ -856,6 +806,9 @@ void loopOperationalMode() {
         if (hadStation) {
           sjm_processStations();
         }
+        
+        // Purge old sensor contexts periodically
+        heartbeatManager.purgeOldContexts(g_tuning.sensorContextTimeoutMs);
 
         // ---- TIMEOUT CHECK ----
         unsigned long timeout = hadStation ? (config.collectorDataTimeoutSec * 1000UL) : (config.collectorApWindowSec * 1000UL);
@@ -905,8 +858,19 @@ void loopOperationalMode() {
 
           String still;
           if (!findOldestQueueFile(still)) {
-            Serial.println("[UPLINK] Queue empty → sleeping early.");
+            LOG_INFO("UPLINK", "Queue empty → sleeping early");
             started = false;
+            consecutiveUploadFailures = 0;  // Reset counter
+            decideAndGoToSleep();
+            return;
+          }
+          
+          // Check for repeated failures and sleep early
+          if (consecutiveUploadFailures >= MAX_UPLOAD_FAILURES) {
+            LOG_ERROR("UPLINK", "Max upload failures (%d) reached → sleeping early", 
+                      MAX_UPLOAD_FAILURES);
+            started = false;
+            consecutiveUploadFailures = 0;  // Reset counter
             decideAndGoToSleep();
             return;
           }

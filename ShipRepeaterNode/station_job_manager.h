@@ -15,3 +15,4 @@ struct PendingStation {
 void sjm_init();
 void sjm_addStation(const String& mac);
 void sjm_processStations();
+void sjm_cleanupStaleDoneFiles();
