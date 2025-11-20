@@ -350,17 +350,29 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
                                "/ingest", "file", fullPath);
 }
 
-void processQueue() {
+// Track upload failures for early sleep decision
+static int consecutiveUploadFailures = 0;
+static const int MAX_UPLOAD_FAILURES = 3;
+
+bool processQueue() {
   // For COLLECTOR: uplink via HTTP
   if (config.role == ROLE_COLLECTOR) {
     String oldest;
-    if (!findOldestQueueFile(oldest)) return;
-    if (!initSdCard()) return;
+    if (!findOldestQueueFile(oldest)) return false;
+    if (!initSdCard()) return false;
     String base = oldest.substring(String(QUEUE_DIR).length() + 1);
     bool ok = uploadFileToRoot(oldest, base);
-    if (ok && initSdCard()) { sd.remove(oldest.c_str()); }
-    return;
+    if (ok && initSdCard()) { 
+      sd.remove(oldest.c_str()); 
+      consecutiveUploadFailures = 0;  // Reset on success
+      return true;
+    } else {
+      consecutiveUploadFailures++;
+      LOG_WARN("UPLINK", "Upload failed (%d consecutive failures)", consecutiveUploadFailures);
+      return false;
+    }
   }
+  return false;
 }
 
 // =============================
@@ -846,8 +858,19 @@ void loopOperationalMode() {
 
           String still;
           if (!findOldestQueueFile(still)) {
-            Serial.println("[UPLINK] Queue empty → sleeping early.");
+            LOG_INFO("UPLINK", "Queue empty → sleeping early");
             started = false;
+            consecutiveUploadFailures = 0;  // Reset counter
+            decideAndGoToSleep();
+            return;
+          }
+          
+          // Check for repeated failures and sleep early
+          if (consecutiveUploadFailures >= MAX_UPLOAD_FAILURES) {
+            LOG_ERROR("UPLINK", "Max upload failures (%d) reached → sleeping early", 
+                      MAX_UPLOAD_FAILURES);
+            started = false;
+            consecutiveUploadFailures = 0;  // Reset counter
             decideAndGoToSleep();
             return;
           }
