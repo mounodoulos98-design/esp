@@ -1,0 +1,26 @@
+[Unit]
+Description=HAT Sensors Daemon Service
+# start only after the DB is up
+After=mariadb.service
+# pull the DB in when we start
+#Requires=mariadb.service
+Requires=mysql.service
+# follow mariadb’s *start/stop/restart*
+#PartOf=mariadb.service
+PartOf=mysql.service
+
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+
+User=root
+Group=root
+
+WorkingDirectory=/opt/hat/onlinemonitoringsystem/python/sensorsdaemon
+ExecStart=/opt/hat/onlinemonitoringsystem/python/sensorsdaemon/sensorsdaemon.py
+ExecStop=/opt/hat/onlinemonitoringsystem/python/sensorsdaemon/sensorsdaemon_stop.sh
+
+[Install]
+WantedBy=multi-user.target
