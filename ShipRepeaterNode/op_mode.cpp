@@ -978,31 +978,8 @@ void loopOperationalMode() {
             Serial.printf("[HB-LEGACY] GET /api/heartbeat from SN=%s IP=%s\n", 
                          sensorSn.c_str(), remoteIp.toString().c_str());
             
-            // Trigger STATUS command (same as heartbeats_after_measurement=1)
-            // Note: Heartbeat logging moved to task to avoid SD card access in callback
-            String ip = remoteIp.toString();
-            xTaskCreate(
-              [](void* param) {
-                String* params = (String*)param;
-                String sensorSn = params[0];
-                
-                Serial.printf("[HB-TASK-LEGACY] Processing heartbeat for SN=%s\n", sensorSn.c_str());
-                
-                // Log heartbeat (safe to access SD card from FreeRTOS task)
-                appendToHeartbeatLog(sensorSn);
-                
-                Serial.printf("[HB-TASK-LEGACY] Heartbeat logged for SN=%s\n", sensorSn.c_str());
-                
-                delete[] params;
-                vTaskDelete(NULL);
-              },
-              "LegacyHeartbeatTask",
-              4096,  // Stack size for SD logging only
-              new String[1]{sensorSn},
-              1,
-              NULL
-            );
-            
+            // Simply acknowledge the heartbeat - no task needed
+            // The sensor will send POST /api/status next which saves the data
             request->send(200, "text/plain", "OK");
             lastActivityMillis = millis();
           });
