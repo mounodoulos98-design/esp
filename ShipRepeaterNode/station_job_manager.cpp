@@ -58,7 +58,7 @@ static bool writeJsonFile(const char* path, StaticJsonDocument<16384>& doc) {
 //   - GET /api?command=STATUS&datetime=<ms>&
 //   - Παίρνουμε S/N από το body
 // ---------------------
-static bool sjm_requestStatus(const String& ip, String& snOut) {
+bool sjm_requestStatus(const String& ip, String& snOut) {
     if (ip.length() == 0 || ip == "0.0.0.0") return false;
 
     // Wait 2s πριν το STATUS, όπως ο daemon
@@ -136,7 +136,7 @@ static bool sjm_requestStatus(const String& ip, String& snOut) {
 // Βρίσκουμε jobs για συγκεκριμένο SN
 // Προτεραιότητα: FW πρώτα, μετά CONFIG
 // ---------------------
-static bool processJobsForSN(const String& sn, const String& ip) {
+bool processJobsForSN(const String& sn, const String& ip) {
     bool didSomething = false;
 
     // 1) Firmware jobs (προτεραιότητα)

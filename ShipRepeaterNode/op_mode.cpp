@@ -819,30 +819,108 @@ void loopOperationalMode() {
           heartbeatManager.begin(sensorServer);
 
           // -------- STATUS (heartbeats_after_measurement = 1)
+          // When sensor sends a heartbeat with value=1, send STATUS command to get full status
           heartbeatManager.onStatus([](const SensorHeartbeatContext& ctx) {
-            Serial.printf("[HB] STATUS for SN=%s IP=%s\n",
+            Serial.printf("[HB] STATUS heartbeat received for SN=%s IP=%s\n",
                           ctx.sensorSn.c_str(),
                           ctx.lastIp.toString().c_str());
 
-            FsFile f = sd.open("/jobs/job.json", O_WRITE | O_CREAT | O_TRUNC);
-            if (f) {
-              f.printf("{\"type\":\"STATUS\",\"sensor_sn\":\"%s\",\"sensor_ip\":\"%s\"}",
-                       ctx.sensorSn.c_str(),
-                       ctx.lastIp.toString().c_str());
-              f.close();
-            }
+            // Send STATUS command to sensor (async in separate task to avoid blocking)
+            String sn = ctx.sensorSn;
+            String ip = ctx.lastIp.toString();
+            
+            // Create a task to handle STATUS request asynchronously
+            xTaskCreate(
+              [](void* param) {
+                String* params = (String*)param;
+                String sensorIp = params[0];
+                String sensorSn = params[1];
+                
+                Serial.printf("[HB-TASK] Sending STATUS to SN=%s IP=%s\n",
+                            sensorSn.c_str(), sensorIp.c_str());
+                
+                // Wait 2 seconds before sending (like sensordaemon)
+                delay(2000);
+                
+                // Send STATUS request (using the helper from station_job_manager)
+                String extractedSn;
+                bool success = sjm_requestStatus(sensorIp, extractedSn);
+                
+                if (success) {
+                  Serial.printf("[HB-TASK] STATUS completed for SN=%s\n", sensorSn.c_str());
+                  
+                  // Store status data to queue for upload to root
+                  if (initSdCard()) {
+                    ensureDir("/received");
+                    char filename[128];
+                    unsigned long ts = millis();
+                    snprintf(filename, sizeof(filename), "/received/status_%s_%lu.txt", 
+                            sensorSn.c_str(), ts);
+                    FsFile f = sd.open(filename, O_WRITE | O_CREAT | O_TRUNC);
+                    if (f) {
+                      f.printf("SN=%s,IP=%s,Timestamp=%lu\n", 
+                              sensorSn.c_str(), sensorIp.c_str(), ts);
+                      f.close();
+                      Serial.printf("[HB-TASK] Status saved to %s\n", filename);
+                    }
+                  }
+                } else {
+                  Serial.printf("[HB-TASK] STATUS failed for SN=%s\n", sensorSn.c_str());
+                }
+                
+                delete[] params;
+                vTaskDelete(NULL);
+              },
+              "StatusTask",
+              4096,
+              new String[2]{ip, sn},
+              1,
+              NULL
+            );
 
             lastActivityMillis = millis();
           });
 
-          // -------- OTHER (Config / Firmware) - Option 1: δεν τρέχουμε jobs εδώ
+          // -------- OTHER (Config / Firmware) - heartbeats_after_measurement > 1
+          // When sensor sends heartbeat with value>1, check for and execute jobs
           heartbeatManager.onOther([](const SensorHeartbeatContext& ctx) {
-            Serial.printf("[HB] OTHER for SN=%s IP=%s\n",
+            Serial.printf("[HB] OTHER heartbeat received for SN=%s IP=%s\n",
                           ctx.sensorSn.c_str(),
                           ctx.lastIp.toString().c_str());
-            // Option 1: δεν τρέχουμε ούτε δημιουργούμε jobs εδώ.
-            // Όλα τα FW/CONFIG jobs εκτελούνται μέσα από sjm_processStations()
-            // με βάση τα JSON αρχεία στο SD.
+
+            // Execute jobs for this sensor asynchronously
+            String sn = ctx.sensorSn;
+            String ip = ctx.lastIp.toString();
+            
+            // Create a task to handle job execution asynchronously
+            xTaskCreate(
+              [](void* param) {
+                String* params = (String*)param;
+                String sensorIp = params[0];
+                String sensorSn = params[1];
+                
+                Serial.printf("[HB-TASK] Checking jobs for SN=%s IP=%s\n",
+                            sensorSn.c_str(), sensorIp.c_str());
+                
+                // Check and execute jobs (firmware takes priority, then config)
+                bool didJobs = processJobsForSN(sensorSn, sensorIp);
+                
+                if (didJobs) {
+                  Serial.printf("[HB-TASK] Jobs executed for SN=%s\n", sensorSn.c_str());
+                } else {
+                  Serial.printf("[HB-TASK] No jobs found for SN=%s\n", sensorSn.c_str());
+                }
+                
+                delete[] params;
+                vTaskDelete(NULL);
+              },
+              "JobTask",
+              8192,  // Larger stack for job execution
+              new String[2]{ip, sn},
+              1,
+              NULL
+            );
+
             lastActivityMillis = millis();
           });
 
