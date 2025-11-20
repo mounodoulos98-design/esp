@@ -1023,20 +1023,8 @@ void loopOperationalMode() {
               Serial.printf("[HB-LEGACY] POST /api/status from SN=%s IP=%s\n", 
                            sensorSn.c_str(), remoteIp.toString().c_str());
               
-              // Save status data to file
-              if (initSdCard() && sensorSn.length() > 0) {
-                ensureDir("/received");
-                char filename[128];
-                unsigned long ts = millis();
-                snprintf(filename, sizeof(filename), "/received/status_%s_%lu.txt", 
-                        sensorSn.c_str(), ts);
-                FsFile f = sd.open(filename, O_WRITE | O_CREAT | O_TRUNC);
-                if (f) {
-                  f.println(dataStr);
-                  f.close();
-                  Serial.printf("[HB-LEGACY] Status data saved to %s\n", filename);
-                }
-              }
+              // Just log the status data to Serial - no SD operations to avoid mutex conflicts
+              Serial.printf("[HB-LEGACY] Status data: %s\n", dataStr.c_str());
               
               request->send(200, "text/plain", "OK");
               lastActivityMillis = millis();
