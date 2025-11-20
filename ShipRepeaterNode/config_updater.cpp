@@ -1,73 +1,66 @@
 #include "config_updater.h"
 #include "config.h"
+#include "http_utils.h"
+#include "logging.h"
+#include "tuning.h"
 #include <WiFi.h>
 #include <WiFiClient.h>
+
+extern RuntimeTuning g_tuning;
 
 // Simple CONFIGURE HTTP GET (Diagnonic style)
 // No JSON response, we only check if body contains "OK".
 bool cu_sendConfiguration(const ConfigJob& job)
 {
-    Serial.printf("[CONFIG] Starting configuration update for SN=%s IP=%s\n",
-                  job.sensorSn.c_str(), job.sensorIp.c_str());
+    LOG_INFO("CONFIG", "Starting configuration update for SN=%s IP=%s",
+             job.sensorSn.c_str(), job.sensorIp.c_str());
 
     if (job.sensorIp.length() == 0) {
-        Serial.println("[CONFIG] ERROR: empty sensor IP");
+        LOG_ERROR("CONFIG", "Empty sensor IP");
         return false;
     }
 
     // Time stamp in ms, like python (epoch_ms). If we don't have real epoch, millis() is still monotonic.
     unsigned long epochMs = millis();
-    String query = "/api?command=CONFIGURE&datetime=" + String(epochMs) + "&";
+    String query = "/api?command=CONFIGURE&datetime=" + String(epochMs);
 
-    // Append params from JSON
+    // Append params from JSON with URL encoding
     for (JsonPair kv : job.params) {
         const char* key = kv.key().c_str();
-        String value = kv.value().as<String>();
-        query += String(key) + "=" + value + "&";
+        String value;
+        
+        // Handle both numeric and string values
+        if (kv.value().is<int>() || kv.value().is<float>()) {
+            value = kv.value().as<String>();
+        } else {
+            value = kv.value().as<String>();
+        }
+        
+        // URL encode the value
+        String encodedValue = urlEncode(value);
+        query += "&" + String(key) + "=" + encodedValue;
     }
 
-    // 2-second wait before sending, mirroring python daemon's "wait_for_commands" behavior
-    delay(2000);
+    // Wait before sending, mirroring python daemon's "wait_for_commands" behavior
+    delay(g_tuning.configureDelayMs);
 
-    WiFiClient client;
-    String request =
-        String("GET ") + query + " HTTP/1.1\r\n" +
-        "Host: " + job.sensorIp + "\r\n" +
-        "Connection: close\r\n\r\n";
+    // Use new HTTP utility
+    String body;
+    bool ok = httpGet(job.sensorIp, query, body, g_tuning.httpTimeoutMs, 
+                     g_tuning.httpRetries, false);
 
-    Serial.printf("[CONFIG] HTTP GET http://%s%s\n",
-                  job.sensorIp.c_str(), query.c_str());
-
-    if (!client.connect(job.sensorIp.c_str(), 80)) {
-        Serial.println("[CONFIG] ERROR: Cannot connect to sensor");
+    if (!ok) {
+        LOG_ERROR("CONFIG", "HTTP request failed");
         return false;
     }
 
-    client.print(request);
-
-    unsigned long start = millis();
-    String response;
-    while (millis() - start < 5000UL) {
-        while (client.available()) {
-            char c = client.read();
-            response += c;
-        }
-        if (!client.connected()) break;
-        delay(1);
-    }
-    client.stop();
-
-    int headerEnd = response.indexOf("\r\n\r\n");
-    String body = (headerEnd >= 0) ? response.substring(headerEnd + 4) : response;
-
-    Serial.println("[CONFIG] Response body:");
-    Serial.println(body);
+    LOG_DEBUG("CONFIG", "Response body: %s", body.c_str());
 
     if (body.indexOf("OK") >= 0) {
-        Serial.println("[CONFIG] SUCCESS (OK found in response)");
+        LOG_INFO("CONFIG", "SUCCESS (OK found in response)");
         return true;
     }
 
-    Serial.println("[CONFIG] FAILED (no OK in response)");
+    LOG_WARN("CONFIG", "FAILED (no OK in response)");
     return false;
 }

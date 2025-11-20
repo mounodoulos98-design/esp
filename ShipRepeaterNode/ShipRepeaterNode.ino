@@ -1,4 +1,5 @@
 #include "config.h"
+#include "tuning.h"
 
 // =================================================================
 // == GLOBAL OBJECT DEFINITIONS
@@ -12,6 +13,9 @@ Adafruit_NeoPixel pixel(1, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 SdFat sd;
 NodeConfig config;
 SemaphoreHandle_t sdCardMutex;
+
+// Global tuning parameters
+RuntimeTuning g_tuning;
 
 // Global state machine control
 bool isOperationalMode = false;
@@ -33,6 +37,10 @@ void setup() {
   delay(200);
 
   loadConfiguration();
+  
+  // Load runtime tuning parameters
+  g_tuning = loadRuntimeTuning();
+  Serial.println("[TUNING] Runtime parameters loaded");
 
   if (forceConfigMode || !config.isConfigured) {
     if (forceConfigMode) {

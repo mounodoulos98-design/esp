@@ -2,6 +2,9 @@
 #include "config.h"
 #include "firmware_updater.h"
 #include "config_updater.h"
+#include "http_utils.h"
+#include "logging.h"
+#include "tuning.h"
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <vector>
@@ -9,6 +12,8 @@
 
 extern SdFat sd;
 extern bool initSdCard();
+extern RuntimeTuning g_tuning;
+extern SemaphoreHandle_t sdCardMutex;
 
 // ---------------------
 // Εσωτερική κατάσταση
@@ -20,85 +25,101 @@ static const char* FW_JOBS_PATH  = "/jobs/firmware_jobs.json";
 static const char* CFG_JOBS_PATH = "/jobs/config_jobs.json";
 
 // ---------------------
-// Helper για SD + JSON
+// Helper για SD + JSON with mutex protection
 // ---------------------
 static bool readJsonFile(const char* path, StaticJsonDocument<16384>& doc) {
-    if (!initSdCard()) return false;
-    if (!sd.exists(path)) return false;
-    FsFile f = sd.open(path, O_RDONLY);
-    if (!f) return false;
+    if (sdCardMutex && xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        if (!initSdCard()) {
+            xSemaphoreGive(sdCardMutex);
+            return false;
+        }
+        if (!sd.exists(path)) {
+            xSemaphoreGive(sdCardMutex);
+            return false;
+        }
+        
+        // Check file size
+        FsFile f = sd.open(path, O_RDONLY);
+        if (!f) {
+            xSemaphoreGive(sdCardMutex);
+            return false;
+        }
+        
+        f.seekEnd(0);
+        uint32_t fsize = f.curPosition();
+        f.rewind();
+        
+        if (fsize > 14000) {
+            LOG_WARN("JOBS", "JSON file %s is large (%lu bytes), may cause memory issues", 
+                     path, (unsigned long)fsize);
+        }
 
-    DeserializationError err = deserializeJson(doc, f);
-    f.close();
-    if (err) {
-        Serial.printf("[JOBS] JSON parse error in %s: %s\n", path, err.c_str());
-        return false;
+        DeserializationError err = deserializeJson(doc, f);
+        f.close();
+        xSemaphoreGive(sdCardMutex);
+        
+        if (err) {
+            LOG_ERROR("JOBS", "JSON parse error in %s: %s", path, err.c_str());
+            return false;
+        }
+        return true;
     }
-    return true;
+    LOG_ERROR("JOBS", "Failed to acquire SD mutex for reading %s", path);
+    return false;
 }
 
 static bool writeJsonFile(const char* path, StaticJsonDocument<16384>& doc) {
-    if (!initSdCard()) return false;
-    FsFile f = sd.open(path, O_WRONLY | O_CREAT | O_TRUNC);
-    if (!f) {
-        Serial.printf("[JOBS] Cannot open %s for writing\n", path);
-        return false;
-    }
-    if (serializeJson(doc, f) == 0) {
-        Serial.printf("[JOBS] Failed to serialize JSON to %s\n", path);
+    if (sdCardMutex && xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        if (!initSdCard()) {
+            xSemaphoreGive(sdCardMutex);
+            return false;
+        }
+        
+        FsFile f = sd.open(path, O_WRONLY | O_CREAT | O_TRUNC);
+        if (!f) {
+            LOG_ERROR("JOBS", "Cannot open %s for writing", path);
+            xSemaphoreGive(sdCardMutex);
+            return false;
+        }
+        if (serializeJson(doc, f) == 0) {
+            LOG_ERROR("JOBS", "Failed to serialize JSON to %s", path);
+            f.close();
+            xSemaphoreGive(sdCardMutex);
+            return false;
+        }
         f.close();
-        return false;
+        xSemaphoreGive(sdCardMutex);
+        return true;
     }
-    f.close();
-    return true;
+    LOG_ERROR("JOBS", "Failed to acquire SD mutex for writing %s", path);
+    return false;
 }
 
 // ---------------------
 // STATUS request:
-//   - GET /api?command=STATUS&datetime=<ms>&
+//   - GET /api?command=STATUS&datetime=<ms>
 //   - Παίρνουμε S/N από το body
 // ---------------------
 static bool sjm_requestStatus(const String& ip, String& snOut) {
     if (ip.length() == 0 || ip == "0.0.0.0") return false;
 
-    // Wait 2s πριν το STATUS, όπως ο daemon
-    delay(2000);
+    // Wait before STATUS request
+    delay(g_tuning.statusDelayMs);
 
-    WiFiClient client;
     unsigned long epochMs = millis();
-    String path = "/api?command=STATUS&datetime=" + String(epochMs) + "&";
+    String path = "/api?command=STATUS&datetime=" + String(epochMs);
 
-    String request =
-        String("GET ") + path + " HTTP/1.1\r\n" +
-        "Host: " + ip + "\r\n" +
-        "Connection: close\r\n\r\n";
+    LOG_DEBUG("STATUS", "Requesting status from %s", ip.c_str());
 
-    Serial.printf("[STATUS] HTTP GET http://%s%s\n", ip.c_str(), path.c_str());
-
-    if (!client.connect(ip.c_str(), 80)) {
-        Serial.println("[STATUS] ERROR: connect() failed");
+    // Use new HTTP utility
+    String body;
+    if (!httpGet(ip, path, body, g_tuning.httpTimeoutMs, g_tuning.httpRetries, true)) {
+        LOG_ERROR("STATUS", "HTTP GET failed for %s", ip.c_str());
         return false;
     }
 
-    client.print(request);
-
-    unsigned long start = millis();
-    String response;
-    while (millis() - start < 5000UL) {
-        while (client.available()) {
-            char c = client.read();
-            response += c;
-        }
-        if (!client.connected()) break;
-        delay(1);
-    }
-    client.stop();
-
-    int headerEnd = response.indexOf("\r\n\r\n");
-    String body = (headerEnd >= 0) ? response.substring(headerEnd + 4) : response;
-
     if (body.length() == 0) {
-        Serial.println("[STATUS] WARNING: empty body");
+        LOG_WARN("STATUS", "Empty body from %s", ip.c_str());
         return false;
     }
 
@@ -124,11 +145,11 @@ static bool sjm_requestStatus(const String& ip, String& snOut) {
     }
 
     if (snOut.length() == 0) {
-        Serial.println("[STATUS] WARNING: S/N not found in body");
+        LOG_WARN("STATUS", "S/N not found in body from %s", ip.c_str());
         return false;
     }
 
-    Serial.printf("[STATUS] SN=%s for IP=%s\n", snOut.c_str(), ip.c_str());
+    LOG_INFO("STATUS", "SN=%s for IP=%s", snOut.c_str(), ip.c_str());
     return true;
 }
 
@@ -148,6 +169,17 @@ static bool processJobsForSN(const String& sn, const String& ip) {
                 for (size_t i = 0; i < arr.size(); ++i) {
                     JsonObject jobObj = arr[i];
                     String jobSn = jobObj["sn"].as<String>();
+                    
+                    // Schema validation
+                    if (jobSn.length() == 0) {
+                        LOG_WARN("JOBS", "FW job missing 'sn', skipping");
+                        continue;
+                    }
+                    if (!jobObj.containsKey("hex_path")) {
+                        LOG_WARN("JOBS", "FW job for SN=%s missing 'hex_path', skipping", jobSn.c_str());
+                        continue;
+                    }
+                    
                     if (jobSn == sn) {
                         FirmwareJob fw;
                         fw.sensorSN  = sn;
@@ -155,11 +187,12 @@ static bool processJobsForSN(const String& sn, const String& ip) {
                         fw.hexPath   = jobObj["hex_path"] | String("/firmware/default.hex");
                         fw.maxLines  = jobObj["max_lines"] | 0;
                         fw.totalTimeoutMs = jobObj["timeout_ms"] | (8UL * 60UL * 1000UL);
+                        fw.lineRateLimitMs = jobObj["line_rate_limit_ms"] | 0;
 
-                        Serial.printf("[JOBS] Found FW job for SN=%s\n", sn.c_str());
+                        LOG_INFO("JOBS", "Found FW job for SN=%s", sn.c_str());
                         bool ok = executeFirmwareJob(fw);
-                        Serial.printf("[JOBS] FW job result for SN=%s -> %s\n",
-                                      sn.c_str(), ok ? "OK" : "FAIL");
+                        LOG_INFO("JOBS", "FW job result for SN=%s -> %s", 
+                                 sn.c_str(), ok ? "OK" : "FAIL");
 
                         arr.remove(i);
                         if (arr.size() == 0) {
@@ -186,6 +219,12 @@ static bool processJobsForSN(const String& sn, const String& ip) {
                 for (size_t i = 0; i < arr.size(); ++i) {
                     JsonObject jobObj = arr[i];
                     String jobSn = jobObj["sn"].as<String>();
+                    
+                    if (jobSn.length() == 0) {
+                        LOG_WARN("JOBS", "CONFIG job missing 'sn', skipping");
+                        continue;
+                    }
+                    
                     if (jobSn == sn) {
                         JsonObject params = jobObj["params"].as<JsonObject>();
 
@@ -194,10 +233,10 @@ static bool processJobsForSN(const String& sn, const String& ip) {
                         cfg.sensorIp = ip;
                         cfg.params   = params;
 
-                        Serial.printf("[JOBS] Found CONFIG job for SN=%s\n", sn.c_str());
+                        LOG_INFO("JOBS", "Found CONFIG job for SN=%s", sn.c_str());
                         bool ok = cu_sendConfiguration(cfg);
-                        Serial.printf("[JOBS] CONFIG job result for SN=%s -> %s\n",
-                                      sn.c_str(), ok ? "OK" : "FAIL");
+                        LOG_INFO("JOBS", "CONFIG job result for SN=%s -> %s",
+                                 sn.c_str(), ok ? "OK" : "FAIL");
 
                         arr.remove(i);
                         if (arr.size() == 0) {
@@ -350,5 +389,54 @@ void sjm_processStations() {
                 }),
             g_stations.end()
         );
+    }
+}
+
+// ---------------------
+// Cleanup stale .done files
+// ---------------------
+void sjm_cleanupStaleDoneFiles() {
+    if (!initSdCard()) return;
+    
+    const char* JOBS_DIR = "/jobs";
+    if (!sd.exists(JOBS_DIR)) return;
+    
+    FsFile jobsDir = sd.open(JOBS_DIR, O_RDONLY);
+    if (!jobsDir || !jobsDir.isDir()) {
+        LOG_WARN("JOBS", "Cannot open /jobs directory");
+        return;
+    }
+    
+    unsigned long now = millis();
+    unsigned long maxAge = g_tuning.jobCleanupAgeHours * 3600UL * 1000UL;
+    int cleaned = 0;
+    
+    FsFile entry;
+    while (entry.openNext(&jobsDir, O_RDONLY)) {
+        char name[64];
+        if (entry.getName(name, sizeof(name))) {
+            String filename(name);
+            if (filename.endsWith(".done")) {
+                // Get file modification time
+                uint16_t date, time;
+                if (entry.getModifyDateTime(&date, &time)) {
+                    // Note: This is a simplified check. For accurate age tracking,
+                    // we'd need to convert FAT date/time to epoch and compare properly.
+                    // For now, we just log and skip complex logic.
+                    String fullPath = String(JOBS_DIR) + "/" + filename;
+                    LOG_DEBUG("JOBS", "Found .done file: %s", fullPath.c_str());
+                    
+                    // Since we don't have accurate timestamp tracking,
+                    // we'll just note this for future enhancement
+                    // In production, you'd want to track creation time in a metadata file
+                }
+            }
+        }
+        entry.close();
+    }
+    jobsDir.close();
+    
+    if (cleaned > 0) {
+        LOG_INFO("JOBS", "Cleaned up %d stale .done files", cleaned);
     }
 }
