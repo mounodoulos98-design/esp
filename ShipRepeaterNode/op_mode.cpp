@@ -80,6 +80,63 @@ static SensorHeartbeatManager heartbeatManager;
 // Heartbeat server for sensors on port 3000
 static AsyncWebServer sensorServer(3000);
 
+// === FreeRTOS Queue-based SD Writer ===
+struct SDWriteRequest {
+  String filename;
+  String data;
+  bool append;
+};
+
+static QueueHandle_t sdWriteQueue = nullptr;
+static TaskHandle_t sdWriteTaskHandle = nullptr;
+
+// Dedicated SD writer task
+static void sdWriteTask(void* param) {
+  SDWriteRequest req;
+  while (true) {
+    if (xQueueReceive(sdWriteQueue, &req, portMAX_DELAY)) {
+      // Safe SD write - only this task accesses SD
+      if (initSdCard()) {
+        File f = SD.open(req.filename.c_str(), req.append ? FILE_APPEND : FILE_WRITE);
+        if (f) {
+          f.print(req.data);
+          f.close();
+          Serial.printf("[SD-WRITER] Saved to %s (%d bytes)\n", req.filename.c_str(), req.data.length());
+        } else {
+          Serial.printf("[SD-WRITER] Failed to open %s\n", req.filename.c_str());
+        }
+      }
+    }
+  }
+}
+
+// Helper to queue SD write
+static bool queueSDWrite(const String& filename, const String& data, bool append = true) {
+  if (!sdWriteQueue) return false;
+  
+  SDWriteRequest req;
+  req.filename = filename;
+  req.data = data;
+  req.append = append;
+  
+  if (xQueueSend(sdWriteQueue, &req, 0) == pdTRUE) {
+    return true;
+  } else {
+    Serial.println("[SD-WRITER] Queue full, dropping write");
+    return false;
+  }
+}
+
+// FreeRTOS Queue for thread-safe SD writes
+struct SDWriteRequest {
+  String filePath;
+  String data;
+  bool isBinary;
+  uint8_t* binaryData;
+  size_t binaryLen;
+};
+static QueueHandle_t sdWriteQueue = nullptr;
+
 // Collector AP State (sensor intake / command execution)
 bool hadStation = false;
 unsigned long lastActivityMillis = 0;
