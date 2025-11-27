@@ -58,7 +58,7 @@ static bool writeJsonFile(const char* path, StaticJsonDocument<16384>& doc) {
 //   - GET /api?command=STATUS&datetime=<ms>&
 //   - Παίρνουμε S/N από το body
 // ---------------------
-static bool sjm_requestStatus(const String& ip, String& snOut) {
+bool sjm_requestStatus(const String& ip, String& snOut) {
     if (ip.length() == 0 || ip == "0.0.0.0") return false;
 
     // Wait 2s πριν το STATUS, όπως ο daemon
@@ -133,17 +133,30 @@ static bool sjm_requestStatus(const String& ip, String& snOut) {
 }
 
 // ---------------------
+// Helper: Get jobs array from JSON document
+// Supports both {"jobs": [...]} and [...] formats
+static JsonArray getJobsArray(JsonDocument& doc) {
+    // Try {"jobs": [...]} format first
+    JsonArray arr = doc["jobs"].as<JsonArray>();
+    if (!arr.isNull()) {
+        return arr;
+    }
+    // Try root array format [...]
+    arr = doc.as<JsonArray>();
+    return arr;
+}
+
 // Βρίσκουμε jobs για συγκεκριμένο SN
 // Προτεραιότητα: FW πρώτα, μετά CONFIG
 // ---------------------
-static bool processJobsForSN(const String& sn, const String& ip) {
+bool processJobsForSN(const String& sn, const String& ip) {
     bool didSomething = false;
 
     // 1) Firmware jobs (προτεραιότητα)
     {
         StaticJsonDocument<16384> doc;
         if (readJsonFile(FW_JOBS_PATH, doc)) {
-            JsonArray arr = doc["jobs"].as<JsonArray>();
+            JsonArray arr = getJobsArray(doc);
             if (!arr.isNull()) {
                 for (size_t i = 0; i < arr.size(); ++i) {
                     JsonObject jobObj = arr[i];
@@ -161,13 +174,16 @@ static bool processJobsForSN(const String& sn, const String& ip) {
                         Serial.printf("[JOBS] FW job result for SN=%s -> %s\n",
                                       sn.c_str(), ok ? "OK" : "FAIL");
 
-                        arr.remove(i);
-                        if (arr.size() == 0) {
-                            sd.remove(FW_JOBS_PATH);
-                        } else {
-                            writeJsonFile(FW_JOBS_PATH, doc);
+                        // Only remove job on success
+                        if (ok) {
+                            arr.remove(i);
+                            if (arr.size() == 0) {
+                                sd.remove(FW_JOBS_PATH);
+                            } else {
+                                writeJsonFile(FW_JOBS_PATH, doc);
+                            }
                         }
-                        didSomething = true;
+                        didSomething = ok;
 
                         // Αν υπήρχε FW job, δεν κάνουμε CONFIG στο ίδιο window
                         return didSomething;
@@ -181,7 +197,7 @@ static bool processJobsForSN(const String& sn, const String& ip) {
     {
         StaticJsonDocument<16384> doc;
         if (readJsonFile(CFG_JOBS_PATH, doc)) {
-            JsonArray arr = doc["jobs"].as<JsonArray>();
+            JsonArray arr = getJobsArray(doc);
             if (!arr.isNull()) {
                 for (size_t i = 0; i < arr.size(); ++i) {
                     JsonObject jobObj = arr[i];
@@ -199,13 +215,16 @@ static bool processJobsForSN(const String& sn, const String& ip) {
                         Serial.printf("[JOBS] CONFIG job result for SN=%s -> %s\n",
                                       sn.c_str(), ok ? "OK" : "FAIL");
 
-                        arr.remove(i);
-                        if (arr.size() == 0) {
-                            sd.remove(CFG_JOBS_PATH);
-                        } else {
-                            writeJsonFile(CFG_JOBS_PATH, doc);
+                        // Only remove job on success
+                        if (ok) {
+                            arr.remove(i);
+                            if (arr.size() == 0) {
+                                sd.remove(CFG_JOBS_PATH);
+                            } else {
+                                writeJsonFile(CFG_JOBS_PATH, doc);
+                            }
                         }
-                        didSomething = true;
+                        didSomething = ok;
                         break;
                     }
                 }

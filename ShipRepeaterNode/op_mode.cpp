@@ -80,6 +80,55 @@ static SensorHeartbeatManager heartbeatManager;
 // Heartbeat server for sensors on port 3000
 static AsyncWebServer sensorServer(3000);
 
+// === Simple Memory-Based Buffer for Callback-to-Loop Communication ===
+// FreeRTOS queues cause mutex crashes when used from AsyncWebServer callbacks.
+// This uses simple volatile arrays that are safe to write from any context.
+
+// Heartbeat buffer - stores pending heartbeats for SD logging and job execution
+struct HeartbeatEntry {
+  char sensorSn[32];
+  char sensorIp[20];
+  bool hasData;
+  bool needsJobCheck;
+  uint8_t statusData[256];
+  size_t statusDataLen;
+};
+
+static volatile int hbBufferWriteIdx = 0;
+static volatile int hbBufferReadIdx = 0;
+static const int HB_BUFFER_SIZE = 10;
+static HeartbeatEntry hbBuffer[HB_BUFFER_SIZE];
+
+// Queue a heartbeat from callback (safe - no FreeRTOS calls)
+static void bufferHeartbeat(const String& sn, const String& ip, bool needsJobCheck = false, 
+                            const uint8_t* statusData = nullptr, size_t statusDataLen = 0) {
+  int nextIdx = (hbBufferWriteIdx + 1) % HB_BUFFER_SIZE;
+  if (nextIdx == hbBufferReadIdx) {
+    // Buffer full, drop oldest
+    hbBufferReadIdx = (hbBufferReadIdx + 1) % HB_BUFFER_SIZE;
+  }
+  
+  HeartbeatEntry& entry = hbBuffer[hbBufferWriteIdx];
+  strncpy((char*)entry.sensorSn, sn.c_str(), sizeof(entry.sensorSn) - 1);
+  entry.sensorSn[sizeof(entry.sensorSn) - 1] = '\0';
+  strncpy((char*)entry.sensorIp, ip.c_str(), sizeof(entry.sensorIp) - 1);
+  entry.sensorIp[sizeof(entry.sensorIp) - 1] = '\0';
+  entry.hasData = true;
+  entry.needsJobCheck = needsJobCheck;
+  
+  if (statusData && statusDataLen > 0 && statusDataLen <= sizeof(entry.statusData)) {
+    memcpy((void*)entry.statusData, statusData, statusDataLen);
+    entry.statusDataLen = statusDataLen;
+  } else {
+    entry.statusDataLen = 0;
+  }
+  
+  hbBufferWriteIdx = nextIdx;
+}
+
+// Forward declaration - implemented after ensureDir
+static void processHeartbeatBuffer();
+
 // Collector AP State (sensor intake / command execution)
 bool hadStation = false;
 unsigned long lastActivityMillis = 0;
@@ -113,6 +162,107 @@ static void ensureDir(const char* path) {
     } else {
       Serial.printf("[SD] mkdir(%s) OK\n", path);
     }
+  }
+}
+
+// Process buffered heartbeats from main loop (safe for SD and job operations)
+static void processHeartbeatBuffer() {
+  while (hbBufferReadIdx != hbBufferWriteIdx) {
+    HeartbeatEntry& entry = hbBuffer[hbBufferReadIdx];
+    
+    if (entry.hasData) {
+      String sn = String((char*)entry.sensorSn);
+      String ip = String((char*)entry.sensorIp);
+      
+      // Log heartbeat to SD
+      if (initSdCard()) {
+        ensureDir(RECEIVED_DIR);
+        
+        // Get timestamp
+        time_t now;
+        time(&now);
+        struct tm* timeinfo = localtime(&now);
+        char timestamp[32];
+        if (timeinfo && timeinfo->tm_year > (2023 - 1900)) {
+          snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+                   timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+                   timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+        } else {
+          snprintf(timestamp, sizeof(timestamp), "T%lu", millis());
+        }
+        
+        // Append heartbeat to CSV
+        FsFile f = sd.open("/received/heartbeat_api.csv", O_WRONLY | O_CREAT | O_APPEND);
+        if (f) {
+          f.printf("%s,%s,%s\n", timestamp, sn.c_str(), ip.c_str());
+          f.close();
+          Serial.printf("[HB-BUFFER] Logged heartbeat to SD: %s\n", sn.c_str());
+        }
+        
+        // Save status data if present
+        if (entry.statusDataLen > 0) {
+          char statusFile[64];
+          snprintf(statusFile, sizeof(statusFile), "/received/status_%s_%lu.txt", 
+                   sn.c_str(), (unsigned long)now);
+          FsFile sf = sd.open(statusFile, O_WRONLY | O_CREAT | O_TRUNC);
+          if (sf) {
+            sf.write((uint8_t*)entry.statusData, entry.statusDataLen);
+            sf.close();
+            Serial.printf("[HB-BUFFER] Saved status data: %s (%d bytes)\n", 
+                         statusFile, (int)entry.statusDataLen);
+          }
+        }
+      }
+      
+      // Execute jobs if needed
+      if (entry.needsJobCheck) {
+        Serial.printf("[HB-BUFFER] Checking jobs for SN=%s IP=%s\n", sn.c_str(), ip.c_str());
+        bool didJobs = processJobsForSN(sn, ip);
+        if (didJobs) {
+          Serial.printf("[HB-BUFFER] Jobs executed for SN=%s\n", sn.c_str());
+        } else {
+          Serial.printf("[HB-BUFFER] No jobs found for SN=%s\n", sn.c_str());
+        }
+      }
+      
+      entry.hasData = false;
+    }
+    
+    hbBufferReadIdx = (hbBufferReadIdx + 1) % HB_BUFFER_SIZE;
+  }
+}
+
+// Log heartbeat to CSV file (like sensordaemon)
+static void appendToHeartbeatLog(const String& sensorSn) {
+  if (!initSdCard()) return;
+  
+  ensureDir(RECEIVED_DIR);
+  const char* hbFile = "/received/heartbeat_api.csv";
+  
+  // Get current time (epoch or millis if no RTC sync)
+  time_t now;
+  time(&now);
+  struct tm* timeinfo = localtime(&now);
+  
+  char timestamp[32];
+  if (timeinfo && timeinfo->tm_year > (2023 - 1900)) {
+    // Valid time - use ISO 8601 format
+    snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+             timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+             timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+  } else {
+    // No valid time - use millis
+    snprintf(timestamp, sizeof(timestamp), "T%lu", millis());
+  }
+  
+  // Append to CSV file
+  FsFile f = sd.open(hbFile, O_WRONLY | O_CREAT | O_APPEND);
+  if (f) {
+    f.printf("%s,%s\n", timestamp, sensorSn.c_str());
+    f.close();
+    Serial.printf("[HB] Logged heartbeat: %s,%s\n", timestamp, sensorSn.c_str());
+  } else {
+    Serial.printf("[HB] Failed to open %s\n", hbFile);
   }
 }
 
@@ -753,6 +903,9 @@ void loopOperationalMode() {
           } else {
             Serial.println("[SD] Card initialized successfully.");
           }
+          
+          // NOTE: SD writer task removed - causes mutex crashes from AsyncWebServer callbacks
+          // All SD operations now happen in main loop context
 
           setStatusLed(STATUS_WIFI_ACTIVITY);
           Serial.println("[STATE] Executing: COLLECTOR AP");
@@ -771,6 +924,7 @@ void loopOperationalMode() {
           }
 
           // --- STATION EVENTS ---
+          // Track when stations connect to update activity timeout
           stationConnectedEventId =
             WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
               if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
@@ -787,18 +941,13 @@ void loopOperationalMode() {
                         info.wifi_ap_staconnected.mac[4],
                         info.wifi_ap_staconnected.mac[5]);
 
-                Serial.printf("[AP] Station connected: %s\n", macStr);
-
-                // the real station job manager
-                sjm_addStation(String(macStr));
+                Serial.printf("[AP] Station connected: %s (waiting for heartbeat POST)\n", macStr);
               }
 
               else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
                 Serial.println("[AP] Station disconnected.");
               }
             });
-
-          sjm_init();
           apActive = true;
           hadStation = false;
           jobProcessedThisWindow = false;
@@ -819,32 +968,125 @@ void loopOperationalMode() {
           heartbeatManager.begin(sensorServer);
 
           // -------- STATUS (heartbeats_after_measurement = 1)
+          // When sensor sends a heartbeat with value=1, send STATUS command to get full status
           heartbeatManager.onStatus([](const SensorHeartbeatContext& ctx) {
-            Serial.printf("[HB] STATUS for SN=%s IP=%s\n",
+            // Buffer for main loop processing (safe - no FreeRTOS)
+            Serial.printf("[HB] STATUS heartbeat received for SN=%s IP=%s\n",
                           ctx.sensorSn.c_str(),
                           ctx.lastIp.toString().c_str());
-
-            FsFile f = sd.open("/jobs/job.json", O_WRITE | O_CREAT | O_TRUNC);
-            if (f) {
-              f.printf("{\"type\":\"STATUS\",\"sensor_sn\":\"%s\",\"sensor_ip\":\"%s\"}",
-                       ctx.sensorSn.c_str(),
-                       ctx.lastIp.toString().c_str());
-              f.close();
-            }
-
+            
+            bufferHeartbeat(ctx.sensorSn, ctx.lastIp.toString(), false);
             lastActivityMillis = millis();
           });
 
-          // -------- OTHER (Config / Firmware) - Option 1: δεν τρέχουμε jobs εδώ
+          // -------- OTHER (Config / Firmware) - heartbeats_after_measurement > 1
+          // When sensor sends heartbeat with value>1, check for and execute jobs
           heartbeatManager.onOther([](const SensorHeartbeatContext& ctx) {
-            Serial.printf("[HB] OTHER for SN=%s IP=%s\n",
+            // Buffer for main loop processing with job check (safe - no FreeRTOS)
+            Serial.printf("[HB] OTHER heartbeat received for SN=%s IP=%s\n",
                           ctx.sensorSn.c_str(),
                           ctx.lastIp.toString().c_str());
-            // Option 1: δεν τρέχουμε ούτε δημιουργούμε jobs εδώ.
-            // Όλα τα FW/CONFIG jobs εκτελούνται μέσα από sjm_processStations()
-            // με βάση τα JSON αρχεία στο SD.
+            
+            bufferHeartbeat(ctx.sensorSn, ctx.lastIp.toString(), true);
             lastActivityMillis = millis();
           });
+
+          // ======================================================
+          //       LEGACY COMPATIBILITY ENDPOINTS
+          // ======================================================
+          // Support for sensors using old API format
+          
+          // Legacy GET /api/heartbeat?sensor_sn=XXX&ip=YYY
+          // Buffer heartbeat for main loop processing
+          sensorServer.on("/api/heartbeat", HTTP_GET, [](AsyncWebServerRequest *request) {
+            if (!request->hasParam("sensor_sn")) {
+              request->send(400, "text/plain", "Missing sensor_sn");
+              return;
+            }
+            
+            String sensorSn = request->getParam("sensor_sn")->value();
+            IPAddress remoteIp = request->client()->remoteIP();
+            
+            // Log to Serial and buffer for main loop processing
+            Serial.printf("[HB-LEGACY] GET /api/heartbeat from SN=%s IP=%s\n", 
+                         sensorSn.c_str(), remoteIp.toString().c_str());
+            
+            // Buffer with job check enabled - main loop will process
+            bufferHeartbeat(sensorSn, remoteIp.toString(), true);
+            
+            request->send(200, "text/plain", "OK");
+            lastActivityMillis = millis();
+          });
+
+          // Legacy POST /api/status - sensor sends status data directly
+          // Buffer status data for main loop processing
+          sensorServer.on(
+            "/api/status",
+            HTTP_POST,
+            [](AsyncWebServerRequest *request) {
+              request->send(400, "text/plain", "Expected JSON body");
+            },
+            nullptr,
+            [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+              if (index != 0 && index + len != total) return;
+              
+              DynamicJsonDocument doc(1024);
+              DeserializationError err = deserializeJson(doc, data, len);
+              if (err) {
+                request->send(400, "text/plain", "Invalid JSON");
+                return;
+              }
+              
+              // Extract S/N from the data field
+              String dataStr = doc["data"] | "";
+              String sensorSn = "";
+              
+              // Parse S/N from format: "MODE=...,S/N=25000120,..."
+              int snPos = dataStr.indexOf("S/N=");
+              if (snPos >= 0) {
+                int commaPos = dataStr.indexOf(',', snPos);
+                if (commaPos >= 0) {
+                  sensorSn = dataStr.substring(snPos + 4, commaPos);
+                } else {
+                  sensorSn = dataStr.substring(snPos + 4);
+                }
+                sensorSn.trim();
+              }
+              
+              IPAddress remoteIp = request->client()->remoteIP();
+              
+              // Log to Serial
+              Serial.printf("[HB-LEGACY] POST /api/status from SN=%s IP=%s (%d bytes)\n", 
+                           sensorSn.c_str(), remoteIp.toString().c_str(), (int)len);
+              
+              // Buffer heartbeat with status data - main loop will save to SD
+              bufferHeartbeat(sensorSn, remoteIp.toString(), false, data, len);
+              
+              request->send(200, "text/plain", "OK");
+              lastActivityMillis = millis();
+            }
+          );
+
+          // Legacy POST /api/measure - sensor sends measurement data
+          sensorServer.on(
+            "/api/measure",
+            HTTP_POST,
+            [](AsyncWebServerRequest *request) {
+              request->send(400, "text/plain", "Expected binary data");
+            },
+            nullptr,
+            [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+              // Accept measurement data
+              Serial.printf("[HB-LEGACY] POST /api/measure received %d bytes (index=%d, total=%d)\n", 
+                           len, index, total);
+              
+              // For now, just acknowledge receipt
+              if (index + len >= total) {
+                request->send(200, "text/plain", "OK");
+                lastActivityMillis = millis();
+              }
+            }
+          );
 
           sensorServer.begin();
           Serial.println("[HB] Heartbeat server started on :3000");
@@ -852,10 +1094,15 @@ void loopOperationalMode() {
           // ======================================================
         }
 
-        // ---- PROCESS JOBS FOR ANY CONNECTED SENSOR ----
-        if (hadStation) {
-          sjm_processStations();
-        }
+        // ---- ASYNC HEARTBEAT-BASED PROCESSING ----
+        // Sensors send POST requests to /event/heartbeat (port 3000)
+        // The heartbeat callbacks (onStatus/onOther) handle job execution asynchronously
+        // No active polling needed - event-driven architecture
+
+        // ---- TIMEOUT CHECK ----
+        // ---- PROCESS BUFFERED HEARTBEATS (SD writes and job execution) ----
+        // This runs in main loop context where SD and job operations are safe
+        processHeartbeatBuffer();
 
         // ---- TIMEOUT CHECK ----
         unsigned long timeout = hadStation ? (config.collectorDataTimeoutSec * 1000UL) : (config.collectorApWindowSec * 1000UL);
