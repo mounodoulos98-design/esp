@@ -174,13 +174,16 @@ bool processJobsForSN(const String& sn, const String& ip) {
                         Serial.printf("[JOBS] FW job result for SN=%s -> %s\n",
                                       sn.c_str(), ok ? "OK" : "FAIL");
 
-                        arr.remove(i);
-                        if (arr.size() == 0) {
-                            sd.remove(FW_JOBS_PATH);
-                        } else {
-                            writeJsonFile(FW_JOBS_PATH, doc);
+                        // Only remove job on success
+                        if (ok) {
+                            arr.remove(i);
+                            if (arr.size() == 0) {
+                                sd.remove(FW_JOBS_PATH);
+                            } else {
+                                writeJsonFile(FW_JOBS_PATH, doc);
+                            }
                         }
-                        didSomething = true;
+                        didSomething = ok;
 
                         // Αν υπήρχε FW job, δεν κάνουμε CONFIG στο ίδιο window
                         return didSomething;
@@ -212,13 +215,16 @@ bool processJobsForSN(const String& sn, const String& ip) {
                         Serial.printf("[JOBS] CONFIG job result for SN=%s -> %s\n",
                                       sn.c_str(), ok ? "OK" : "FAIL");
 
-                        arr.remove(i);
-                        if (arr.size() == 0) {
-                            sd.remove(CFG_JOBS_PATH);
-                        } else {
-                            writeJsonFile(CFG_JOBS_PATH, doc);
+                        // Only remove job on success
+                        if (ok) {
+                            arr.remove(i);
+                            if (arr.size() == 0) {
+                                sd.remove(CFG_JOBS_PATH);
+                            } else {
+                                writeJsonFile(CFG_JOBS_PATH, doc);
+                            }
                         }
-                        didSomething = true;
+                        didSomething = ok;
                         break;
                     }
                 }
