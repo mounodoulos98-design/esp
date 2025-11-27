@@ -80,131 +80,116 @@ static SensorHeartbeatManager heartbeatManager;
 // Heartbeat server for sensors on port 3000
 static AsyncWebServer sensorServer(3000);
 
-// === FreeRTOS Queue-based SD Writer ===
-struct SDWriteRequest {
-  char filename[128];
-  char data[2048];
-  bool append;
+// === Simple Memory-Based Buffer for Callback-to-Loop Communication ===
+// FreeRTOS queues cause mutex crashes when used from AsyncWebServer callbacks.
+// This uses simple volatile arrays that are safe to write from any context.
+
+// Heartbeat buffer - stores pending heartbeats for SD logging and job execution
+struct HeartbeatEntry {
+  char sensorSn[32];
+  char sensorIp[20];
+  bool hasData;
+  bool needsJobCheck;
+  uint8_t statusData[256];
+  size_t statusDataLen;
 };
 
-static QueueHandle_t sdWriteQueue = nullptr;
-static TaskHandle_t sdWriteTaskHandle = nullptr;
+static volatile int hbBufferWriteIdx = 0;
+static volatile int hbBufferReadIdx = 0;
+static const int HB_BUFFER_SIZE = 10;
+static HeartbeatEntry hbBuffer[HB_BUFFER_SIZE];
 
-// Initialize the SD writer queue and task
-static void initSDWriter() {
-  if (sdWriteQueue != nullptr) return;  // Already initialized
-  
-  sdWriteQueue = xQueueCreate(20, sizeof(SDWriteRequest));
-  if (sdWriteQueue == nullptr) {
-    Serial.println("[SD-WRITER] Failed to create queue!");
-    return;
+// Queue a heartbeat from callback (safe - no FreeRTOS calls)
+static void bufferHeartbeat(const String& sn, const String& ip, bool needsJobCheck = false, 
+                            const uint8_t* statusData = nullptr, size_t statusDataLen = 0) {
+  int nextIdx = (hbBufferWriteIdx + 1) % HB_BUFFER_SIZE;
+  if (nextIdx == hbBufferReadIdx) {
+    // Buffer full, drop oldest
+    hbBufferReadIdx = (hbBufferReadIdx + 1) % HB_BUFFER_SIZE;
   }
   
-  xTaskCreate(
-    [](void* param) {
-      SDWriteRequest req;
-      while (true) {
-        if (xQueueReceive(sdWriteQueue, &req, portMAX_DELAY)) {
-          // Safe SD write - only this task accesses SD
-          if (initSdCard()) {
-            // Ensure directory exists
-            String fn = String(req.filename);
-            int lastSlash = fn.lastIndexOf('/');
-            if (lastSlash > 0) {
-              String dir = fn.substring(0, lastSlash);
-              if (!sd.exists(dir.c_str())) {
-                sd.mkdir(dir.c_str());
-              }
-            }
-            
-            oflag_t mode = req.append ? (O_WRONLY | O_CREAT | O_APPEND) : (O_WRONLY | O_CREAT | O_TRUNC);
-            FsFile f = sd.open(req.filename, mode);
-            if (f) {
-              f.print(req.data);
-              f.close();
-              Serial.printf("[SD-WRITER] Saved to %s (%d bytes)\n", req.filename, strlen(req.data));
-            } else {
-              Serial.printf("[SD-WRITER] Failed to open %s\n", req.filename);
-            }
+  HeartbeatEntry& entry = hbBuffer[hbBufferWriteIdx];
+  strncpy((char*)entry.sensorSn, sn.c_str(), sizeof(entry.sensorSn) - 1);
+  entry.sensorSn[sizeof(entry.sensorSn) - 1] = '\0';
+  strncpy((char*)entry.sensorIp, ip.c_str(), sizeof(entry.sensorIp) - 1);
+  entry.sensorIp[sizeof(entry.sensorIp) - 1] = '\0';
+  entry.hasData = true;
+  entry.needsJobCheck = needsJobCheck;
+  
+  if (statusData && statusDataLen > 0 && statusDataLen <= sizeof(entry.statusData)) {
+    memcpy((void*)entry.statusData, statusData, statusDataLen);
+    entry.statusDataLen = statusDataLen;
+  } else {
+    entry.statusDataLen = 0;
+  }
+  
+  hbBufferWriteIdx = nextIdx;
+}
+
+// Process buffered heartbeats from main loop (safe for SD and job operations)
+static void processHeartbeatBuffer() {
+  while (hbBufferReadIdx != hbBufferWriteIdx) {
+    HeartbeatEntry& entry = hbBuffer[hbBufferReadIdx];
+    
+    if (entry.hasData) {
+      String sn = String((char*)entry.sensorSn);
+      String ip = String((char*)entry.sensorIp);
+      
+      // Log heartbeat to SD
+      if (initSdCard()) {
+        ensureDir(RECEIVED_DIR);
+        
+        // Get timestamp
+        time_t now;
+        time(&now);
+        struct tm* timeinfo = localtime(&now);
+        char timestamp[32];
+        if (timeinfo && timeinfo->tm_year > (2023 - 1900)) {
+          snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+                   timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+                   timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+        } else {
+          snprintf(timestamp, sizeof(timestamp), "T%lu", millis());
+        }
+        
+        // Append heartbeat to CSV
+        FsFile f = sd.open("/received/heartbeat_api.csv", O_WRONLY | O_CREAT | O_APPEND);
+        if (f) {
+          f.printf("%s,%s,%s\n", timestamp, sn.c_str(), ip.c_str());
+          f.close();
+          Serial.printf("[HB-BUFFER] Logged heartbeat to SD: %s\n", sn.c_str());
+        }
+        
+        // Save status data if present
+        if (entry.statusDataLen > 0) {
+          char statusFile[64];
+          snprintf(statusFile, sizeof(statusFile), "/received/status_%s_%lu.txt", 
+                   sn.c_str(), (unsigned long)now);
+          FsFile sf = sd.open(statusFile, O_WRONLY | O_CREAT | O_TRUNC);
+          if (sf) {
+            sf.write((uint8_t*)entry.statusData, entry.statusDataLen);
+            sf.close();
+            Serial.printf("[HB-BUFFER] Saved status data: %s (%d bytes)\n", 
+                         statusFile, (int)entry.statusDataLen);
           }
         }
       }
-    },
-    "SDWriter",
-    8192,
-    nullptr,
-    1,
-    &sdWriteTaskHandle
-  );
-  
-  Serial.println("[SD-WRITER] Task started");
-}
-
-// Helper to queue SD write
-static bool queueSDWrite(const String& filename, const String& data, bool append = true) {
-  if (!sdWriteQueue) {
-    Serial.println("[SD-WRITER] Queue not initialized");
-    return false;
-  }
-  
-  SDWriteRequest req;
-  strncpy(req.filename, filename.c_str(), sizeof(req.filename) - 1);
-  req.filename[sizeof(req.filename) - 1] = '\0';
-  strncpy(req.data, data.c_str(), sizeof(req.data) - 1);
-  req.data[sizeof(req.data) - 1] = '\0';
-  req.append = append;
-  
-  if (xQueueSend(sdWriteQueue, &req, 0) == pdTRUE) {
-    return true;
-  } else {
-    Serial.println("[SD-WRITER] Queue full, dropping write");
-    return false;
-  }
-}
-
-// === Job Request Queue (for async job execution from main loop) ===
-struct JobRequest {
-  char sensorSn[32];
-  char sensorIp[20];
-};
-
-static QueueHandle_t jobRequestQueue = nullptr;
-
-// Initialize job request queue (called from setup, NOT from callback)
-static void initJobQueue() {
-  if (jobRequestQueue != nullptr) return;
-  jobRequestQueue = xQueueCreate(10, sizeof(JobRequest));
-  if (jobRequestQueue) {
-    Serial.println("[JOB-QUEUE] Initialized");
-  }
-}
-
-// Queue a job request (safe to call from callbacks - just queues, no task creation)
-static bool queueJobRequest(const String& sn, const String& ip) {
-  if (!jobRequestQueue) return false;
-  
-  JobRequest req;
-  strncpy(req.sensorSn, sn.c_str(), sizeof(req.sensorSn) - 1);
-  req.sensorSn[sizeof(req.sensorSn) - 1] = '\0';
-  strncpy(req.sensorIp, ip.c_str(), sizeof(req.sensorIp) - 1);
-  req.sensorIp[sizeof(req.sensorIp) - 1] = '\0';
-  
-  return xQueueSend(jobRequestQueue, &req, 0) == pdTRUE;
-}
-
-// Process pending job requests (call from main loop, NOT from callback)
-static void processJobQueue() {
-  if (!jobRequestQueue) return;
-  
-  JobRequest req;
-  while (xQueueReceive(jobRequestQueue, &req, 0) == pdTRUE) {
-    Serial.printf("[JOB-QUEUE] Processing job for SN=%s IP=%s\n", req.sensorSn, req.sensorIp);
-    bool didJobs = processJobsForSN(String(req.sensorSn), String(req.sensorIp));
-    if (didJobs) {
-      Serial.printf("[JOB-QUEUE] Jobs executed for SN=%s\n", req.sensorSn);
-    } else {
-      Serial.printf("[JOB-QUEUE] No jobs found for SN=%s\n", req.sensorSn);
+      
+      // Execute jobs if needed
+      if (entry.needsJobCheck) {
+        Serial.printf("[HB-BUFFER] Checking jobs for SN=%s IP=%s\n", sn.c_str(), ip.c_str());
+        bool didJobs = processJobsForSN(sn, ip);
+        if (didJobs) {
+          Serial.printf("[HB-BUFFER] Jobs executed for SN=%s\n", sn.c_str());
+        } else {
+          Serial.printf("[HB-BUFFER] No jobs found for SN=%s\n", sn.c_str());
+        }
+      }
+      
+      entry.hasData = false;
     }
+    
+    hbBufferReadIdx = (hbBufferReadIdx + 1) % HB_BUFFER_SIZE;
   }
 }
 
@@ -982,22 +967,24 @@ void loopOperationalMode() {
           // -------- STATUS (heartbeats_after_measurement = 1)
           // When sensor sends a heartbeat with value=1, send STATUS command to get full status
           heartbeatManager.onStatus([](const SensorHeartbeatContext& ctx) {
-            // ONLY Serial logging - NO FreeRTOS operations from callback!
+            // Buffer for main loop processing (safe - no FreeRTOS)
             Serial.printf("[HB] STATUS heartbeat received for SN=%s IP=%s\n",
                           ctx.sensorSn.c_str(),
                           ctx.lastIp.toString().c_str());
             
+            bufferHeartbeat(ctx.sensorSn, ctx.lastIp.toString(), false);
             lastActivityMillis = millis();
           });
 
           // -------- OTHER (Config / Firmware) - heartbeats_after_measurement > 1
           // When sensor sends heartbeat with value>1, check for and execute jobs
           heartbeatManager.onOther([](const SensorHeartbeatContext& ctx) {
-            // ONLY Serial logging - NO FreeRTOS operations from callback!
+            // Buffer for main loop processing with job check (safe - no FreeRTOS)
             Serial.printf("[HB] OTHER heartbeat received for SN=%s IP=%s\n",
                           ctx.sensorSn.c_str(),
                           ctx.lastIp.toString().c_str());
             
+            bufferHeartbeat(ctx.sensorSn, ctx.lastIp.toString(), true);
             lastActivityMillis = millis();
           });
 
@@ -1007,7 +994,7 @@ void loopOperationalMode() {
           // Support for sensors using old API format
           
           // Legacy GET /api/heartbeat?sensor_sn=XXX&ip=YYY
-          // NOTE: NO FreeRTOS calls from callbacks - causes mutex crash
+          // Buffer heartbeat for main loop processing
           sensorServer.on("/api/heartbeat", HTTP_GET, [](AsyncWebServerRequest *request) {
             if (!request->hasParam("sensor_sn")) {
               request->send(400, "text/plain", "Missing sensor_sn");
@@ -1017,16 +1004,19 @@ void loopOperationalMode() {
             String sensorSn = request->getParam("sensor_sn")->value();
             IPAddress remoteIp = request->client()->remoteIP();
             
-            // ONLY Serial logging - no FreeRTOS queue/task operations from callback!
+            // Log to Serial and buffer for main loop processing
             Serial.printf("[HB-LEGACY] GET /api/heartbeat from SN=%s IP=%s\n", 
                          sensorSn.c_str(), remoteIp.toString().c_str());
+            
+            // Buffer with job check enabled - main loop will process
+            bufferHeartbeat(sensorSn, remoteIp.toString(), true);
             
             request->send(200, "text/plain", "OK");
             lastActivityMillis = millis();
           });
 
           // Legacy POST /api/status - sensor sends status data directly
-          // NOTE: NO FreeRTOS calls from callbacks - causes mutex crash
+          // Buffer status data for main loop processing
           sensorServer.on(
             "/api/status",
             HTTP_POST,
@@ -1062,9 +1052,12 @@ void loopOperationalMode() {
               
               IPAddress remoteIp = request->client()->remoteIP();
               
-              // ONLY Serial logging - no FreeRTOS queue operations from callback!
+              // Log to Serial
               Serial.printf("[HB-LEGACY] POST /api/status from SN=%s IP=%s (%d bytes)\n", 
                            sensorSn.c_str(), remoteIp.toString().c_str(), (int)len);
+              
+              // Buffer heartbeat with status data - main loop will save to SD
+              bufferHeartbeat(sensorSn, remoteIp.toString(), false, data, len);
               
               request->send(200, "text/plain", "OK");
               lastActivityMillis = millis();
@@ -1102,6 +1095,11 @@ void loopOperationalMode() {
         // Sensors send POST requests to /event/heartbeat (port 3000)
         // The heartbeat callbacks (onStatus/onOther) handle job execution asynchronously
         // No active polling needed - event-driven architecture
+
+        // ---- TIMEOUT CHECK ----
+        // ---- PROCESS BUFFERED HEARTBEATS (SD writes and job execution) ----
+        // This runs in main loop context where SD and job operations are safe
+        processHeartbeatBuffer();
 
         // ---- TIMEOUT CHECK ----
         unsigned long timeout = hadStation ? (config.collectorDataTimeoutSec * 1000UL) : (config.collectorApWindowSec * 1000UL);
