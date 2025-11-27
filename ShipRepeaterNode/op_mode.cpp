@@ -82,41 +82,76 @@ static AsyncWebServer sensorServer(3000);
 
 // === FreeRTOS Queue-based SD Writer ===
 struct SDWriteRequest {
-  String filename;
-  String data;
+  char filename[128];
+  char data[2048];
   bool append;
 };
 
 static QueueHandle_t sdWriteQueue = nullptr;
 static TaskHandle_t sdWriteTaskHandle = nullptr;
 
-// Dedicated SD writer task
-static void sdWriteTask(void* param) {
-  SDWriteRequest req;
-  while (true) {
-    if (xQueueReceive(sdWriteQueue, &req, portMAX_DELAY)) {
-      // Safe SD write - only this task accesses SD
-      if (initSdCard()) {
-        File f = SD.open(req.filename.c_str(), req.append ? FILE_APPEND : FILE_WRITE);
-        if (f) {
-          f.print(req.data);
-          f.close();
-          Serial.printf("[SD-WRITER] Saved to %s (%d bytes)\n", req.filename.c_str(), req.data.length());
-        } else {
-          Serial.printf("[SD-WRITER] Failed to open %s\n", req.filename.c_str());
+// Initialize the SD writer queue and task
+static void initSDWriter() {
+  if (sdWriteQueue != nullptr) return;  // Already initialized
+  
+  sdWriteQueue = xQueueCreate(20, sizeof(SDWriteRequest));
+  if (sdWriteQueue == nullptr) {
+    Serial.println("[SD-WRITER] Failed to create queue!");
+    return;
+  }
+  
+  xTaskCreate(
+    [](void* param) {
+      SDWriteRequest req;
+      while (true) {
+        if (xQueueReceive(sdWriteQueue, &req, portMAX_DELAY)) {
+          // Safe SD write - only this task accesses SD
+          if (initSdCard()) {
+            // Ensure directory exists
+            String fn = String(req.filename);
+            int lastSlash = fn.lastIndexOf('/');
+            if (lastSlash > 0) {
+              String dir = fn.substring(0, lastSlash);
+              if (!sd.exists(dir.c_str())) {
+                sd.mkdir(dir.c_str());
+              }
+            }
+            
+            oflag_t mode = req.append ? (O_WRONLY | O_CREAT | O_APPEND) : (O_WRONLY | O_CREAT | O_TRUNC);
+            FsFile f = sd.open(req.filename, mode);
+            if (f) {
+              f.print(req.data);
+              f.close();
+              Serial.printf("[SD-WRITER] Saved to %s (%d bytes)\n", req.filename, strlen(req.data));
+            } else {
+              Serial.printf("[SD-WRITER] Failed to open %s\n", req.filename);
+            }
+          }
         }
       }
-    }
-  }
+    },
+    "SDWriter",
+    8192,
+    nullptr,
+    1,
+    &sdWriteTaskHandle
+  );
+  
+  Serial.println("[SD-WRITER] Task started");
 }
 
 // Helper to queue SD write
 static bool queueSDWrite(const String& filename, const String& data, bool append = true) {
-  if (!sdWriteQueue) return false;
+  if (!sdWriteQueue) {
+    Serial.println("[SD-WRITER] Queue not initialized");
+    return false;
+  }
   
   SDWriteRequest req;
-  req.filename = filename;
-  req.data = data;
+  strncpy(req.filename, filename.c_str(), sizeof(req.filename) - 1);
+  req.filename[sizeof(req.filename) - 1] = '\0';
+  strncpy(req.data, data.c_str(), sizeof(req.data) - 1);
+  req.data[sizeof(req.data) - 1] = '\0';
   req.append = append;
   
   if (xQueueSend(sdWriteQueue, &req, 0) == pdTRUE) {
@@ -126,16 +161,6 @@ static bool queueSDWrite(const String& filename, const String& data, bool append
     return false;
   }
 }
-
-// FreeRTOS Queue for thread-safe SD writes
-struct SDWriteRequest {
-  String filePath;
-  String data;
-  bool isBinary;
-  uint8_t* binaryData;
-  size_t binaryLen;
-};
-static QueueHandle_t sdWriteQueue = nullptr;
 
 // Collector AP State (sensor intake / command execution)
 bool hadStation = false;
@@ -844,6 +869,9 @@ void loopOperationalMode() {
           } else {
             Serial.println("[SD] Card initialized successfully.");
           }
+          
+          // Initialize SD writer task for thread-safe writes
+          initSDWriter();
 
           setStatusLed(STATUS_WIFI_ACTIVITY);
           Serial.println("[STATE] Executing: COLLECTOR AP");
@@ -1035,8 +1063,52 @@ void loopOperationalMode() {
             Serial.printf("[HB-LEGACY] GET /api/heartbeat from SN=%s IP=%s\n", 
                          sensorSn.c_str(), remoteIp.toString().c_str());
             
-            // Simply acknowledge the heartbeat - no task needed
-            // The sensor will send POST /api/status next which saves the data
+            // Log heartbeat to CSV via queue
+            time_t now;
+            time(&now);
+            struct tm* timeinfo = localtime(&now);
+            char timestamp[32];
+            if (timeinfo && timeinfo->tm_year > (2023 - 1900)) {
+              snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+                       timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+                       timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+            } else {
+              snprintf(timestamp, sizeof(timestamp), "T%lu", millis());
+            }
+            String logLine = String(timestamp) + "," + sensorSn + "\n";
+            queueSDWrite("/received/heartbeat_api.csv", logLine, true);
+            
+            // Check for jobs and execute them asynchronously
+            String sn = sensorSn;
+            String ip = remoteIp.toString();
+            
+            xTaskCreate(
+              [](void* param) {
+                String* params = (String*)param;
+                String sensorIp = params[0];
+                String sensorSn = params[1];
+                
+                Serial.printf("[HB-LEGACY-TASK] Checking jobs for SN=%s IP=%s\n",
+                            sensorSn.c_str(), sensorIp.c_str());
+                
+                bool didJobs = processJobsForSN(sensorSn, sensorIp);
+                
+                if (didJobs) {
+                  Serial.printf("[HB-LEGACY-TASK] Jobs executed for SN=%s\n", sensorSn.c_str());
+                } else {
+                  Serial.printf("[HB-LEGACY-TASK] No jobs found for SN=%s\n", sensorSn.c_str());
+                }
+                
+                delete[] params;
+                vTaskDelete(NULL);
+              },
+              "LegacyJobTask",
+              8192,
+              new String[2]{ip, sn},
+              1,
+              NULL
+            );
+            
             request->send(200, "text/plain", "OK");
             lastActivityMillis = millis();
           });
@@ -1080,8 +1152,12 @@ void loopOperationalMode() {
               Serial.printf("[HB-LEGACY] POST /api/status from SN=%s IP=%s\n", 
                            sensorSn.c_str(), remoteIp.toString().c_str());
               
-              // Just log the status data to Serial - no SD operations to avoid mutex conflicts
-              Serial.printf("[HB-LEGACY] Status data: %s\n", dataStr.c_str());
+              // Save status data via queue
+              char filename[128];
+              unsigned long ts = millis();
+              snprintf(filename, sizeof(filename), "/received/status_%s_%lu.txt", 
+                      sensorSn.c_str(), ts);
+              queueSDWrite(String(filename), dataStr, false);
               
               request->send(200, "text/plain", "OK");
               lastActivityMillis = millis();
