@@ -162,6 +162,52 @@ static bool queueSDWrite(const String& filename, const String& data, bool append
   }
 }
 
+// === Job Request Queue (for async job execution from main loop) ===
+struct JobRequest {
+  char sensorSn[32];
+  char sensorIp[20];
+};
+
+static QueueHandle_t jobRequestQueue = nullptr;
+
+// Initialize job request queue (called from setup, NOT from callback)
+static void initJobQueue() {
+  if (jobRequestQueue != nullptr) return;
+  jobRequestQueue = xQueueCreate(10, sizeof(JobRequest));
+  if (jobRequestQueue) {
+    Serial.println("[JOB-QUEUE] Initialized");
+  }
+}
+
+// Queue a job request (safe to call from callbacks - just queues, no task creation)
+static bool queueJobRequest(const String& sn, const String& ip) {
+  if (!jobRequestQueue) return false;
+  
+  JobRequest req;
+  strncpy(req.sensorSn, sn.c_str(), sizeof(req.sensorSn) - 1);
+  req.sensorSn[sizeof(req.sensorSn) - 1] = '\0';
+  strncpy(req.sensorIp, ip.c_str(), sizeof(req.sensorIp) - 1);
+  req.sensorIp[sizeof(req.sensorIp) - 1] = '\0';
+  
+  return xQueueSend(jobRequestQueue, &req, 0) == pdTRUE;
+}
+
+// Process pending job requests (call from main loop, NOT from callback)
+static void processJobQueue() {
+  if (!jobRequestQueue) return;
+  
+  JobRequest req;
+  while (xQueueReceive(jobRequestQueue, &req, 0) == pdTRUE) {
+    Serial.printf("[JOB-QUEUE] Processing job for SN=%s IP=%s\n", req.sensorSn, req.sensorIp);
+    bool didJobs = processJobsForSN(String(req.sensorSn), String(req.sensorIp));
+    if (didJobs) {
+      Serial.printf("[JOB-QUEUE] Jobs executed for SN=%s\n", req.sensorSn);
+    } else {
+      Serial.printf("[JOB-QUEUE] No jobs found for SN=%s\n", req.sensorSn);
+    }
+  }
+}
+
 // Collector AP State (sensor intake / command execution)
 bool hadStation = false;
 unsigned long lastActivityMillis = 0;
