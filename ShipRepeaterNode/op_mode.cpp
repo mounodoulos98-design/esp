@@ -126,6 +126,45 @@ static void bufferHeartbeat(const String& sn, const String& ip, bool needsJobChe
   hbBufferWriteIdx = nextIdx;
 }
 
+// Forward declaration - implemented after ensureDir
+static void processHeartbeatBuffer();
+
+// Collector AP State (sensor intake / command execution)
+bool hadStation = false;
+unsigned long lastActivityMillis = 0;
+static WiFiEventId_t stationConnectedEventId;
+
+// RTC Memory
+RTC_DATA_ATTR time_t rtc_last_known_time = 0;
+RTC_DATA_ATTR uint32_t rtc_last_sleep_duration_s = 0;
+RTC_DATA_ATTR State rtc_next_state = STATE_INITIAL;
+
+// TX state (collector) for HTTP uploads from SD queue
+static bool txActive = false;
+
+// =============================
+// Small utils (SD queue)
+// =============================
+static const char* QUEUE_DIR = "/queue";
+static const char* RECEIVED_DIR = "/received";
+static const char* JOB_FILE = "/jobs/job.json";
+static const char* QUEUE_NS = "queue_store";
+
+static void ensureDir(const char* path) {
+  if (!initSdCard()) {
+    Serial.println("[SD] initSdCard() failed, retrying...");
+    delay(100);
+    initSdCard();
+  }
+  if (!sd.exists(path)) {
+    if (!sd.mkdir(path)) {
+      Serial.printf("[SD] mkdir(%s) failed!\n", path);
+    } else {
+      Serial.printf("[SD] mkdir(%s) OK\n", path);
+    }
+  }
+}
+
 // Process buffered heartbeats from main loop (safe for SD and job operations)
 static void processHeartbeatBuffer() {
   while (hbBufferReadIdx != hbBufferWriteIdx) {
@@ -190,42 +229,6 @@ static void processHeartbeatBuffer() {
     }
     
     hbBufferReadIdx = (hbBufferReadIdx + 1) % HB_BUFFER_SIZE;
-  }
-}
-
-// Collector AP State (sensor intake / command execution)
-bool hadStation = false;
-unsigned long lastActivityMillis = 0;
-static WiFiEventId_t stationConnectedEventId;
-
-// RTC Memory
-RTC_DATA_ATTR time_t rtc_last_known_time = 0;
-RTC_DATA_ATTR uint32_t rtc_last_sleep_duration_s = 0;
-RTC_DATA_ATTR State rtc_next_state = STATE_INITIAL;
-
-// TX state (collector) for HTTP uploads from SD queue
-static bool txActive = false;
-
-// =============================
-// Small utils (SD queue)
-// =============================
-static const char* QUEUE_DIR = "/queue";
-static const char* RECEIVED_DIR = "/received";
-static const char* JOB_FILE = "/jobs/job.json";
-static const char* QUEUE_NS = "queue_store";
-
-static void ensureDir(const char* path) {
-  if (!initSdCard()) {
-    Serial.println("[SD] initSdCard() failed, retrying...");
-    delay(100);
-    initSdCard();
-  }
-  if (!sd.exists(path)) {
-    if (!sd.mkdir(path)) {
-      Serial.printf("[SD] mkdir(%s) failed!\n", path);
-    } else {
-      Serial.printf("[SD] mkdir(%s) OK\n", path);
-    }
   }
 }
 
