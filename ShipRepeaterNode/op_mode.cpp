@@ -916,8 +916,8 @@ void loopOperationalMode() {
             Serial.println("[SD] Card initialized successfully.");
           }
           
-          // Initialize SD writer task for thread-safe writes
-          initSDWriter();
+          // NOTE: SD writer task removed - causes mutex crashes from AsyncWebServer callbacks
+          // All SD operations now happen in main loop context
 
           setStatusLed(STATUS_WIFI_ACTIVITY);
           Serial.println("[STATE] Executing: COLLECTOR AP");
@@ -982,27 +982,10 @@ void loopOperationalMode() {
           // -------- STATUS (heartbeats_after_measurement = 1)
           // When sensor sends a heartbeat with value=1, send STATUS command to get full status
           heartbeatManager.onStatus([](const SensorHeartbeatContext& ctx) {
+            // ONLY Serial logging - NO FreeRTOS operations from callback!
             Serial.printf("[HB] STATUS heartbeat received for SN=%s IP=%s\n",
                           ctx.sensorSn.c_str(),
                           ctx.lastIp.toString().c_str());
-
-            // Log heartbeat via queue (no direct SD access from callback)
-            time_t now;
-            time(&now);
-            struct tm* timeinfo = localtime(&now);
-            char timestamp[32];
-            if (timeinfo && timeinfo->tm_year > (2023 - 1900)) {
-              snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
-                       timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
-                       timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
-            } else {
-              snprintf(timestamp, sizeof(timestamp), "T%lu", millis());
-            }
-            String logLine = String(timestamp) + "," + ctx.sensorSn + "\n";
-            queueSDWrite("/received/heartbeat_event.csv", logLine, true);
-
-            // NO task creation from callback - causes mutex crash
-            // The sensor will send its status data via POST /api/status
             
             lastActivityMillis = millis();
           });
@@ -1010,27 +993,10 @@ void loopOperationalMode() {
           // -------- OTHER (Config / Firmware) - heartbeats_after_measurement > 1
           // When sensor sends heartbeat with value>1, check for and execute jobs
           heartbeatManager.onOther([](const SensorHeartbeatContext& ctx) {
+            // ONLY Serial logging - NO FreeRTOS operations from callback!
             Serial.printf("[HB] OTHER heartbeat received for SN=%s IP=%s\n",
                           ctx.sensorSn.c_str(),
                           ctx.lastIp.toString().c_str());
-
-            // Log heartbeat via queue (no direct SD access from callback)
-            time_t now;
-            time(&now);
-            struct tm* timeinfo = localtime(&now);
-            char timestamp[32];
-            if (timeinfo && timeinfo->tm_year > (2023 - 1900)) {
-              snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
-                       timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
-                       timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
-            } else {
-              snprintf(timestamp, sizeof(timestamp), "T%lu", millis());
-            }
-            String logLine = String(timestamp) + "," + ctx.sensorSn + "\n";
-            queueSDWrite("/received/heartbeat_event.csv", logLine, true);
-
-            // NO task creation from callback - causes mutex crash
-            // Job execution should be triggered differently
             
             lastActivityMillis = millis();
           });
@@ -1041,6 +1007,7 @@ void loopOperationalMode() {
           // Support for sensors using old API format
           
           // Legacy GET /api/heartbeat?sensor_sn=XXX&ip=YYY
+          // NOTE: NO FreeRTOS calls from callbacks - causes mutex crash
           sensorServer.on("/api/heartbeat", HTTP_GET, [](AsyncWebServerRequest *request) {
             if (!request->hasParam("sensor_sn")) {
               request->send(400, "text/plain", "Missing sensor_sn");
@@ -1050,33 +1017,16 @@ void loopOperationalMode() {
             String sensorSn = request->getParam("sensor_sn")->value();
             IPAddress remoteIp = request->client()->remoteIP();
             
+            // ONLY Serial logging - no FreeRTOS queue/task operations from callback!
             Serial.printf("[HB-LEGACY] GET /api/heartbeat from SN=%s IP=%s\n", 
                          sensorSn.c_str(), remoteIp.toString().c_str());
-            
-            // Log heartbeat to CSV via queue (no direct SD access from callback)
-            time_t now;
-            time(&now);
-            struct tm* timeinfo = localtime(&now);
-            char timestamp[32];
-            if (timeinfo && timeinfo->tm_year > (2023 - 1900)) {
-              snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
-                       timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
-                       timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
-            } else {
-              snprintf(timestamp, sizeof(timestamp), "T%lu", millis());
-            }
-            String logLine = String(timestamp) + "," + sensorSn + "\n";
-            queueSDWrite("/received/heartbeat_api.csv", logLine, true);
-            
-            // NO task creation from AsyncWebServer callback - causes mutex crash
-            // Job execution will be handled when sensor sends POST /api/status
-            // or through the /event/heartbeat POST endpoint
             
             request->send(200, "text/plain", "OK");
             lastActivityMillis = millis();
           });
 
           // Legacy POST /api/status - sensor sends status data directly
+          // NOTE: NO FreeRTOS calls from callbacks - causes mutex crash
           sensorServer.on(
             "/api/status",
             HTTP_POST,
@@ -1112,15 +1062,9 @@ void loopOperationalMode() {
               
               IPAddress remoteIp = request->client()->remoteIP();
               
-              Serial.printf("[HB-LEGACY] POST /api/status from SN=%s IP=%s\n", 
-                           sensorSn.c_str(), remoteIp.toString().c_str());
-              
-              // Save status data via queue
-              char filename[128];
-              unsigned long ts = millis();
-              snprintf(filename, sizeof(filename), "/received/status_%s_%lu.txt", 
-                      sensorSn.c_str(), ts);
-              queueSDWrite(String(filename), dataStr, false);
+              // ONLY Serial logging - no FreeRTOS queue operations from callback!
+              Serial.printf("[HB-LEGACY] POST /api/status from SN=%s IP=%s (%d bytes)\n", 
+                           sensorSn.c_str(), remoteIp.toString().c_str(), (int)len);
               
               request->send(200, "text/plain", "OK");
               lastActivityMillis = millis();
