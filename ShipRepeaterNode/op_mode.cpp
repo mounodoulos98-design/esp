@@ -940,62 +940,24 @@ void loopOperationalMode() {
                           ctx.sensorSn.c_str(),
                           ctx.lastIp.toString().c_str());
 
-            // Log heartbeat to CSV file
-            appendToHeartbeatLog(ctx.sensorSn);
+            // Log heartbeat via queue (no direct SD access from callback)
+            time_t now;
+            time(&now);
+            struct tm* timeinfo = localtime(&now);
+            char timestamp[32];
+            if (timeinfo && timeinfo->tm_year > (2023 - 1900)) {
+              snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+                       timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+                       timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+            } else {
+              snprintf(timestamp, sizeof(timestamp), "T%lu", millis());
+            }
+            String logLine = String(timestamp) + "," + ctx.sensorSn + "\n";
+            queueSDWrite("/received/heartbeat_event.csv", logLine, true);
 
-            // Send STATUS command to sensor (async in separate task to avoid blocking)
-            String sn = ctx.sensorSn;
-            String ip = ctx.lastIp.toString();
+            // NO task creation from callback - causes mutex crash
+            // The sensor will send its status data via POST /api/status
             
-            // Create a task to handle STATUS request asynchronously
-            xTaskCreate(
-              [](void* param) {
-                String* params = (String*)param;
-                String sensorIp = params[0];
-                String sensorSn = params[1];
-                
-                Serial.printf("[HB-TASK] Sending STATUS to SN=%s IP=%s\n",
-                            sensorSn.c_str(), sensorIp.c_str());
-                
-                // Wait 2 seconds before sending (like sensordaemon)
-                delay(2000);
-                
-                // Send STATUS request (using the helper from station_job_manager)
-                String extractedSn;
-                bool success = sjm_requestStatus(sensorIp, extractedSn);
-                
-                if (success) {
-                  Serial.printf("[HB-TASK] STATUS completed for SN=%s\n", sensorSn.c_str());
-                  
-                  // Store status data to queue for upload to root
-                  if (initSdCard()) {
-                    ensureDir("/received");
-                    char filename[128];
-                    unsigned long ts = millis();
-                    snprintf(filename, sizeof(filename), "/received/status_%s_%lu.txt", 
-                            sensorSn.c_str(), ts);
-                    FsFile f = sd.open(filename, O_WRITE | O_CREAT | O_TRUNC);
-                    if (f) {
-                      f.printf("SN=%s,IP=%s,Timestamp=%lu\n", 
-                              sensorSn.c_str(), sensorIp.c_str(), ts);
-                      f.close();
-                      Serial.printf("[HB-TASK] Status saved to %s\n", filename);
-                    }
-                  }
-                } else {
-                  Serial.printf("[HB-TASK] STATUS failed for SN=%s\n", sensorSn.c_str());
-                }
-                
-                delete[] params;
-                vTaskDelete(NULL);
-              },
-              "StatusTask",
-              4096,
-              new String[2]{ip, sn},
-              1,
-              NULL
-            );
-
             lastActivityMillis = millis();
           });
 
@@ -1006,42 +968,24 @@ void loopOperationalMode() {
                           ctx.sensorSn.c_str(),
                           ctx.lastIp.toString().c_str());
 
-            // Log heartbeat to CSV file
-            appendToHeartbeatLog(ctx.sensorSn);
+            // Log heartbeat via queue (no direct SD access from callback)
+            time_t now;
+            time(&now);
+            struct tm* timeinfo = localtime(&now);
+            char timestamp[32];
+            if (timeinfo && timeinfo->tm_year > (2023 - 1900)) {
+              snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+                       timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+                       timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+            } else {
+              snprintf(timestamp, sizeof(timestamp), "T%lu", millis());
+            }
+            String logLine = String(timestamp) + "," + ctx.sensorSn + "\n";
+            queueSDWrite("/received/heartbeat_event.csv", logLine, true);
 
-            // Execute jobs for this sensor asynchronously
-            String sn = ctx.sensorSn;
-            String ip = ctx.lastIp.toString();
+            // NO task creation from callback - causes mutex crash
+            // Job execution should be triggered differently
             
-            // Create a task to handle job execution asynchronously
-            xTaskCreate(
-              [](void* param) {
-                String* params = (String*)param;
-                String sensorIp = params[0];
-                String sensorSn = params[1];
-                
-                Serial.printf("[HB-TASK] Checking jobs for SN=%s IP=%s\n",
-                            sensorSn.c_str(), sensorIp.c_str());
-                
-                // Check and execute jobs (firmware takes priority, then config)
-                bool didJobs = processJobsForSN(sensorSn, sensorIp);
-                
-                if (didJobs) {
-                  Serial.printf("[HB-TASK] Jobs executed for SN=%s\n", sensorSn.c_str());
-                } else {
-                  Serial.printf("[HB-TASK] No jobs found for SN=%s\n", sensorSn.c_str());
-                }
-                
-                delete[] params;
-                vTaskDelete(NULL);
-              },
-              "JobTask",
-              8192,  // Larger stack for job execution
-              new String[2]{ip, sn},
-              1,
-              NULL
-            );
-
             lastActivityMillis = millis();
           });
 
@@ -1063,7 +1007,7 @@ void loopOperationalMode() {
             Serial.printf("[HB-LEGACY] GET /api/heartbeat from SN=%s IP=%s\n", 
                          sensorSn.c_str(), remoteIp.toString().c_str());
             
-            // Log heartbeat to CSV via queue
+            // Log heartbeat to CSV via queue (no direct SD access from callback)
             time_t now;
             time(&now);
             struct tm* timeinfo = localtime(&now);
@@ -1078,36 +1022,9 @@ void loopOperationalMode() {
             String logLine = String(timestamp) + "," + sensorSn + "\n";
             queueSDWrite("/received/heartbeat_api.csv", logLine, true);
             
-            // Check for jobs and execute them asynchronously
-            String sn = sensorSn;
-            String ip = remoteIp.toString();
-            
-            xTaskCreate(
-              [](void* param) {
-                String* params = (String*)param;
-                String sensorIp = params[0];
-                String sensorSn = params[1];
-                
-                Serial.printf("[HB-LEGACY-TASK] Checking jobs for SN=%s IP=%s\n",
-                            sensorSn.c_str(), sensorIp.c_str());
-                
-                bool didJobs = processJobsForSN(sensorSn, sensorIp);
-                
-                if (didJobs) {
-                  Serial.printf("[HB-LEGACY-TASK] Jobs executed for SN=%s\n", sensorSn.c_str());
-                } else {
-                  Serial.printf("[HB-LEGACY-TASK] No jobs found for SN=%s\n", sensorSn.c_str());
-                }
-                
-                delete[] params;
-                vTaskDelete(NULL);
-              },
-              "LegacyJobTask",
-              8192,
-              new String[2]{ip, sn},
-              1,
-              NULL
-            );
+            // NO task creation from AsyncWebServer callback - causes mutex crash
+            // Job execution will be handled when sensor sends POST /api/status
+            // or through the /event/heartbeat POST endpoint
             
             request->send(200, "text/plain", "OK");
             lastActivityMillis = millis();
