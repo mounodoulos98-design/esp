@@ -133,6 +133,19 @@ bool sjm_requestStatus(const String& ip, String& snOut) {
 }
 
 // ---------------------
+// Helper: Get jobs array from JSON document
+// Supports both {"jobs": [...]} and [...] formats
+static JsonArray getJobsArray(JsonDocument& doc) {
+    // Try {"jobs": [...]} format first
+    JsonArray arr = doc["jobs"].as<JsonArray>();
+    if (!arr.isNull()) {
+        return arr;
+    }
+    // Try root array format [...]
+    arr = doc.as<JsonArray>();
+    return arr;
+}
+
 // Βρίσκουμε jobs για συγκεκριμένο SN
 // Προτεραιότητα: FW πρώτα, μετά CONFIG
 // ---------------------
@@ -143,7 +156,7 @@ bool processJobsForSN(const String& sn, const String& ip) {
     {
         StaticJsonDocument<16384> doc;
         if (readJsonFile(FW_JOBS_PATH, doc)) {
-            JsonArray arr = doc["jobs"].as<JsonArray>();
+            JsonArray arr = getJobsArray(doc);
             if (!arr.isNull()) {
                 for (size_t i = 0; i < arr.size(); ++i) {
                     JsonObject jobObj = arr[i];
@@ -181,7 +194,7 @@ bool processJobsForSN(const String& sn, const String& ip) {
     {
         StaticJsonDocument<16384> doc;
         if (readJsonFile(CFG_JOBS_PATH, doc)) {
-            JsonArray arr = doc["jobs"].as<JsonArray>();
+            JsonArray arr = getJobsArray(doc);
             if (!arr.isNull()) {
                 for (size_t i = 0; i < arr.size(); ++i) {
                     JsonObject jobObj = arr[i];
