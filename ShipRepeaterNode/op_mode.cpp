@@ -7,7 +7,6 @@
 #include <map>
 #include <algorithm>
 #include <sys/time.h>
-#include "sensor_heartbeat_manager.h"
 
 
 
@@ -75,8 +74,6 @@ bool sdDeferredSave = false;
 State currentState;
 bool apActive = false;
 bool needToSyncTime = false;
-// Κάπου δίπλα στα άλλα singletons
-static SensorHeartbeatManager heartbeatManager;
 // Heartbeat server for sensors on port 3000
 static AsyncWebServer sensorServer(3000);
 
@@ -697,6 +694,18 @@ void decideAndGoToSleep() {
 }
 
 // =============================
+// Helper: Process Jobs for Sensor
+// =============================
+static void processJobsForSensor(const String& sn, const String& ip, const char* logPrefix) {
+  bool didJobs = sjm_processJobsForSN(sn, ip);
+  if (didJobs) {
+    Serial.printf("[%s] Jobs executed for SN=%s\n", logPrefix, sn.c_str());
+  } else {
+    Serial.printf("[%s] No jobs found for SN=%s\n", logPrefix, sn.c_str());
+  }
+}
+
+// =============================
 // Main Loop
 // =============================
 void loopOperationalMode() {
@@ -788,9 +797,6 @@ void loopOperationalMode() {
                         info.wifi_ap_staconnected.mac[5]);
 
                 Serial.printf("[AP] Station connected: %s\n", macStr);
-
-                // the real station job manager
-                sjm_addStation(String(macStr));
               }
 
               else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
@@ -798,63 +804,57 @@ void loopOperationalMode() {
               }
             });
 
-          sjm_init();
           apActive = true;
           hadStation = false;
           jobProcessedThisWindow = false;
           lastActivityMillis = millis();
 
           // ======================================================
-          //                HEARTBEAT INTEGRATION
+          //                HEARTBEAT ENDPOINT
           // ======================================================
-
-          // Sensor HTTP server on port 3000 (your actual port)
-
-
-          // ======================================================
-          //                HEARTBEAT INTEGRATION
-          // ======================================================
-
-          // ΧΡΗΣΙΜΟΠΟΙΟΥΜΕ ΤΟ GLOBAL sensorServer
-          heartbeatManager.begin(sensorServer);
-
-          // -------- STATUS (heartbeats_after_measurement = 1)
-          heartbeatManager.onStatus([](const SensorHeartbeatContext& ctx) {
-            Serial.printf("[HB] STATUS for SN=%s IP=%s\n",
-                          ctx.sensorSn.c_str(),
-                          ctx.lastIp.toString().c_str());
-
-            FsFile f = sd.open("/jobs/job.json", O_WRITE | O_CREAT | O_TRUNC);
-            if (f) {
-              f.printf("{\"type\":\"STATUS\",\"sensor_sn\":\"%s\",\"sensor_ip\":\"%s\"}",
-                       ctx.sensorSn.c_str(),
-                       ctx.lastIp.toString().c_str());
-              f.close();
+          // Sensors send GET /api/heartbeat with SN parameter
+          // Jobs from /jobs/config_jobs.json and /jobs/firmware_jobs.json are checked and executed
+          sensorServer.on("/api/heartbeat", HTTP_GET, [](AsyncWebServerRequest* request) {
+            String sn = "";
+            AsyncWebParameter* snParam = request->getParam("sn", false);
+            if (snParam) {
+              sn = snParam->value();
+            } else {
+              AsyncWebParameter* SNParam = request->getParam("SN", false);
+              if (SNParam) {
+                sn = SNParam->value();
+              }
             }
-
+            IPAddress ip = request->client()->remoteIP();
+            String ipStr = ip.toString();
+            
+            Serial.printf("[HB-LEGACY] GET /api/heartbeat from SN=%s IP=%s\n",
+                          sn.c_str(), ipStr.c_str());
+            
+            // Log heartbeat to SD (like HB-BUFFER does)
+            if (sn.length() > 0 && initSdCard()) {
+              FsFile hbLog = sd.open("/heartbeat.log", O_WRONLY | O_CREAT | O_APPEND);
+              if (hbLog) {
+                time_t now;
+                time(&now);
+                hbLog.printf("%lu,%s,%s\n", (unsigned long)now, sn.c_str(), ipStr.c_str());
+                hbLog.close();
+                Serial.printf("[HB-BUFFER] Logged heartbeat to SD: %s\n", sn.c_str());
+              }
+              
+              // Check and execute jobs
+              Serial.printf("[HB-BUFFER] Checking jobs for SN=%s IP=%s\n", sn.c_str(), ipStr.c_str());
+              processJobsForSensor(sn, ipStr, "HB-BUFFER");
+            }
+            
             lastActivityMillis = millis();
-          });
-
-          // -------- OTHER (Config / Firmware) - Option 1: δεν τρέχουμε jobs εδώ
-          heartbeatManager.onOther([](const SensorHeartbeatContext& ctx) {
-            Serial.printf("[HB] OTHER for SN=%s IP=%s\n",
-                          ctx.sensorSn.c_str(),
-                          ctx.lastIp.toString().c_str());
-            // Option 1: δεν τρέχουμε ούτε δημιουργούμε jobs εδώ.
-            // Όλα τα FW/CONFIG jobs εκτελούνται μέσα από sjm_processStations()
-            // με βάση τα JSON αρχεία στο SD.
-            lastActivityMillis = millis();
+            request->send(200, "text/plain", "OK");
           });
 
           sensorServer.begin();
           Serial.println("[HB] Heartbeat server started on :3000");
 
           // ======================================================
-        }
-
-        // ---- PROCESS JOBS FOR ANY CONNECTED SENSOR ----
-        if (hadStation) {
-          sjm_processStations();
         }
 
         // ---- TIMEOUT CHECK ----
