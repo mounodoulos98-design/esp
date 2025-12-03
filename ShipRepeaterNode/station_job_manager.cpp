@@ -19,6 +19,13 @@ static std::vector<PendingStation> g_stations;
 static const char* FW_JOBS_PATH  = "/jobs/firmware_jobs.json";
 static const char* CFG_JOBS_PATH = "/jobs/config_jobs.json";
 
+// Job cache to avoid re-reading JSON on every heartbeat
+static StaticJsonDocument<16384> g_fwJobsCache;
+static StaticJsonDocument<16384> g_cfgJobsCache;
+static bool g_fwJobsCached = false;
+static bool g_cfgJobsCached = false;
+static unsigned long g_lastJobLoadTime = 0;
+
 // ---------------------
 // Helper για SD + JSON
 // ---------------------
@@ -152,11 +159,27 @@ static JsonArray getJobsArray(JsonDocument& doc) {
 bool processJobsForSN(const String& sn, const String& ip) {
     bool didSomething = false;
 
+    // Load jobs into cache if not already loaded (only once per AP session)
+    unsigned long now = millis();
+    if (!g_fwJobsCached && (now - g_lastJobLoadTime > 1000)) {
+        g_fwJobsCached = readJsonFile(FW_JOBS_PATH, g_fwJobsCache);
+        if (!g_fwJobsCached) {
+            g_fwJobsCache.clear(); // No FW jobs
+        }
+        g_lastJobLoadTime = now;
+    }
+    if (!g_cfgJobsCached && (now - g_lastJobLoadTime > 1000)) {
+        g_cfgJobsCached = readJsonFile(CFG_JOBS_PATH, g_cfgJobsCache);
+        if (!g_cfgJobsCached) {
+            g_cfgJobsCache.clear(); // No config jobs
+        }
+        g_lastJobLoadTime = now;
+    }
+
     // 1) Firmware jobs (προτεραιότητα)
-    {
-        StaticJsonDocument<16384> doc;
-        if (readJsonFile(FW_JOBS_PATH, doc)) {
-            JsonArray arr = getJobsArray(doc);
+    if (g_fwJobsCached) {
+        StaticJsonDocument<16384>& doc = g_fwJobsCache;
+        JsonArray arr = getJobsArray(doc);
             if (!arr.isNull()) {
                 for (size_t i = 0; i < arr.size(); ++i) {
                     JsonObject jobObj = arr[i];
@@ -179,6 +202,8 @@ bool processJobsForSN(const String& sn, const String& ip) {
                             arr.remove(i);
                             if (arr.size() == 0) {
                                 sd.remove(FW_JOBS_PATH);
+                                g_fwJobsCached = false;
+                                g_fwJobsCache.clear();
                             } else {
                                 writeJsonFile(FW_JOBS_PATH, doc);
                             }
@@ -191,13 +216,11 @@ bool processJobsForSN(const String& sn, const String& ip) {
                 }
             }
         }
-    }
 
     // 2) Configuration jobs
-    {
-        StaticJsonDocument<16384> doc;
-        if (readJsonFile(CFG_JOBS_PATH, doc)) {
-            JsonArray arr = getJobsArray(doc);
+    if (g_cfgJobsCached) {
+        StaticJsonDocument<16384>& doc = g_cfgJobsCache;
+        JsonArray arr = getJobsArray(doc);
             if (!arr.isNull()) {
                 for (size_t i = 0; i < arr.size(); ++i) {
                     JsonObject jobObj = arr[i];
@@ -220,6 +243,8 @@ bool processJobsForSN(const String& sn, const String& ip) {
                             arr.remove(i);
                             if (arr.size() == 0) {
                                 sd.remove(CFG_JOBS_PATH);
+                                g_cfgJobsCached = false;
+                                g_cfgJobsCache.clear();
                             } else {
                                 writeJsonFile(CFG_JOBS_PATH, doc);
                             }
@@ -230,9 +255,18 @@ bool processJobsForSN(const String& sn, const String& ip) {
                 }
             }
         }
-    }
 
     return didSomething;
+}
+
+// Reset job cache (call when AP session starts)
+void sjm_resetJobCache() {
+    g_fwJobsCached = false;
+    g_cfgJobsCached = false;
+    g_fwJobsCache.clear();
+    g_cfgJobsCache.clear();
+    g_lastJobLoadTime = 0;
+    Serial.println("[JOBS] Cache reset");
 }
 
 // ---------------------

@@ -907,6 +907,9 @@ void loopOperationalMode() {
           // NOTE: SD writer task removed - causes mutex crashes from AsyncWebServer callbacks
           // All SD operations now happen in main loop context
 
+          // Reset job cache for new AP session
+          sjm_resetJobCache();
+
           setStatusLed(STATUS_WIFI_ACTIVITY);
           Serial.println("[STATE] Executing: COLLECTOR AP");
 
@@ -1117,9 +1120,18 @@ void loopOperationalMode() {
         processHeartbeatBuffer();
 
         // ---- TIMEOUT CHECK ----
+        // Check if any stations are currently connected - don't sleep if sensors are active
+        int numConnected = WiFi.softAPgetStationNum();
         unsigned long timeout = hadStation ? (config.collectorDataTimeoutSec * 1000UL) : (config.collectorApWindowSec * 1000UL);
 
         if (millis() - lastActivityMillis > timeout) {
+          // Don't sleep if sensors are still connected - they might be sending data
+          if (numConnected > 0) {
+            Serial.printf("[AP] %d sensor(s) still connected, extending window...\n", numConnected);
+            lastActivityMillis = millis(); // Reset timeout
+            delay(100);
+            break;
+          }
 
           if (hadStation)
             Serial.println("[AP] Inactivity timeout reached.");
