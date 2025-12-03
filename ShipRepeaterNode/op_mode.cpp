@@ -871,9 +871,10 @@ void loopOperationalMode() {
               }
             }
             IPAddress ip = request->client()->remoteIP();
+            String ipStr = ip.toString();
             
             Serial.printf("[HB-LEGACY] GET /api/heartbeat from SN=%s IP=%s\n",
-                          sn.c_str(), ip.toString().c_str());
+                          sn.c_str(), ipStr.c_str());
             
             // Log heartbeat to SD (like HB-BUFFER does)
             if (sn.length() > 0 && initSdCard()) {
@@ -881,14 +882,14 @@ void loopOperationalMode() {
               if (hbLog) {
                 time_t now;
                 time(&now);
-                hbLog.printf("%lu,%s,%s\n", (unsigned long)now, sn.c_str(), ip.toString().c_str());
+                hbLog.printf("%lu,%s,%s\n", (unsigned long)now, sn.c_str(), ipStr.c_str());
                 hbLog.close();
                 Serial.printf("[HB-BUFFER] Logged heartbeat to SD: %s\n", sn.c_str());
               }
               
               // Check and execute jobs
-              Serial.printf("[HB-BUFFER] Checking jobs for SN=%s IP=%s\n", sn.c_str(), ip.toString().c_str());
-              processJobsForSensor(sn, ip.toString(), "HB-BUFFER");
+              Serial.printf("[HB-BUFFER] Checking jobs for SN=%s IP=%s\n", sn.c_str(), ipStr.c_str());
+              processJobsForSensor(sn, ipStr, "HB-BUFFER");
             }
             
             lastActivityMillis = millis();
