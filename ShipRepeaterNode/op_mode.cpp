@@ -860,9 +860,15 @@ void loopOperationalMode() {
           // -------- LEGACY HEARTBEAT (GET /api/heartbeat)
           // Support for sensors using old firmware
           sensorServer.on("/api/heartbeat", HTTP_GET, [](AsyncWebServerRequest* request) {
-            String sn = request->getParam("sn", false) ? request->getParam("sn", false)->value() : "";
-            if (sn.length() == 0 && request->hasParam("SN", false)) {
-              sn = request->getParam("SN", false)->value();
+            String sn = "";
+            AsyncWebParameter* snParam = request->getParam("sn", false);
+            if (snParam) {
+              sn = snParam->value();
+            } else {
+              AsyncWebParameter* SNParam = request->getParam("SN", false);
+              if (SNParam) {
+                sn = SNParam->value();
+              }
             }
             IPAddress ip = request->client()->remoteIP();
             
