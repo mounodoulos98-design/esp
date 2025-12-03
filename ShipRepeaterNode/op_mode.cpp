@@ -1076,12 +1076,24 @@ void loopOperationalMode() {
             },
             nullptr,
             [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-              // Accept measurement data
-              Serial.printf("[HB-LEGACY] POST /api/measure received %d bytes (index=%d, total=%d)\n", 
-                           len, index, total);
+              // Log only start and completion to reduce Serial verbosity
+              static std::map<AsyncWebServerRequest*, bool> measureStartLogged;
               
-              // For now, just acknowledge receipt
+              if (index == 0) {
+                // First chunk - log start with sensor info
+                IPAddress remoteIp = request->client()->remoteIP();
+                Serial.printf("[HB-LEGACY] POST /api/measure started from IP=%s (total=%d bytes)\n", 
+                             remoteIp.toString().c_str(), total);
+                measureStartLogged[request] = true;
+              }
+              
+              // Accept measurement data
               if (index + len >= total) {
+                // Last chunk - log completion
+                IPAddress remoteIp = request->client()->remoteIP();
+                Serial.printf("[HB-LEGACY] POST /api/measure completed from IP=%s (%d bytes received)\n", 
+                             remoteIp.toString().c_str(), total);
+                measureStartLogged.erase(request);
                 request->send(200, "text/plain", "OK");
                 lastActivityMillis = millis();
               }
