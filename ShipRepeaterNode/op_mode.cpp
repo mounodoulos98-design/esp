@@ -1125,32 +1125,35 @@ void loopOperationalMode() {
         processHeartbeatBuffer();
 
         // ---- TIMEOUT CHECK ----
-        // Check if sensors are actively sending heartbeats (not just WiFi-connected)
+        // Check heartbeat activity every 10 seconds (frequent checks)
         int numConnected = WiFi.softAPgetStationNum();
-        unsigned long timeout = hadStation ? (config.collectorDataTimeoutSec * 1000UL) : (config.collectorApWindowSec * 1000UL);
+        const unsigned long HEARTBEAT_CHECK_INTERVAL = 10000; // Check every 10 seconds
+        const unsigned long HEARTBEAT_INACTIVITY_TIMEOUT = 15000; // 15 seconds of no heartbeats = sleep
         
-        // Use a shorter timeout (15 seconds) for checking actual heartbeat activity
-        const unsigned long HEARTBEAT_ACTIVITY_TIMEOUT = 15000; // 15 seconds
-
-        if (millis() - lastActivityMillis > timeout) {
-          // If sensors are WiFi-connected, check if they're actually sending heartbeats
-          if (numConnected > 0) {
-            unsigned long timeSinceLastHeartbeat = millis() - lastHeartbeatMillis;
-            
-            // If we received a heartbeat recently (within 15 seconds), extend the window
-            if (lastHeartbeatMillis > 0 && timeSinceLastHeartbeat < HEARTBEAT_ACTIVITY_TIMEOUT) {
-              Serial.printf("[AP] %d sensor(s) active (last heartbeat %lu sec ago), extending window...\n", 
-                           numConnected, timeSinceLastHeartbeat / 1000);
-              lastActivityMillis = millis(); // Reset timeout
-              delay(100);
-              break;
-            } else {
-              // Sensors are connected but not sending heartbeats - go to sleep
-              Serial.printf("[AP] %d sensor(s) connected but inactive for %lu sec, entering sleep.\n",
-                           numConnected, timeSinceLastHeartbeat / 1000);
-            }
+        // If sensors are connected, prioritize heartbeat-based timeout over general window timeout
+        if (numConnected > 0 && lastHeartbeatMillis > 0) {
+          unsigned long timeSinceLastHeartbeat = millis() - lastHeartbeatMillis;
+          
+          // If no heartbeat for 15+ seconds, go to sleep regardless of window timeout
+          if (timeSinceLastHeartbeat > HEARTBEAT_INACTIVITY_TIMEOUT) {
+            Serial.printf("[AP] %d sensor(s) connected but no heartbeat for %lu sec, entering sleep.\n",
+                         numConnected, timeSinceLastHeartbeat / 1000);
+            if (hadStation)
+              Serial.println("[AP] Inactivity timeout reached.");
+            stopAPMode();
+            decideAndGoToSleep();
+            break;
           }
-
+          
+          // If heartbeats are active, extend window and reset general timeout
+          if (timeSinceLastHeartbeat < HEARTBEAT_CHECK_INTERVAL) {
+            lastActivityMillis = millis(); // Keep extending as long as heartbeats come
+          }
+        }
+        
+        // Fallback: General window timeout (for when no sensors connected)
+        unsigned long timeout = hadStation ? (config.collectorDataTimeoutSec * 1000UL) : (config.collectorApWindowSec * 1000UL);
+        if (millis() - lastActivityMillis > timeout) {
           if (hadStation)
             Serial.println("[AP] Inactivity timeout reached.");
           else
