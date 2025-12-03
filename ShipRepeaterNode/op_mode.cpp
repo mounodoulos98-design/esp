@@ -1125,19 +1125,24 @@ void loopOperationalMode() {
         processHeartbeatBuffer();
 
         // ---- TIMEOUT CHECK ----
-        // Check heartbeat activity every 10 seconds (frequent checks)
+        // Check for any sensor activity (heartbeats OR data transfers) every 10 seconds
         int numConnected = WiFi.softAPgetStationNum();
-        const unsigned long HEARTBEAT_CHECK_INTERVAL = 10000; // Check every 10 seconds
-        const unsigned long HEARTBEAT_INACTIVITY_TIMEOUT = 15000; // 15 seconds of no heartbeats = sleep
+        const unsigned long ACTIVITY_CHECK_INTERVAL = 10000; // Check every 10 seconds
+        const unsigned long ACTIVITY_INACTIVITY_TIMEOUT = 15000; // 15 seconds of no activity = sleep
         
-        // If sensors are connected, prioritize heartbeat-based timeout over general window timeout
-        if (numConnected > 0 && lastHeartbeatMillis > 0) {
-          unsigned long timeSinceLastHeartbeat = millis() - lastHeartbeatMillis;
+        // If sensors are connected, check for ANY activity (not just heartbeats)
+        if (numConnected > 0) {
+          // Consider BOTH heartbeat activity AND general activity (data transfers, status, etc)
+          unsigned long timeSinceLastHeartbeat = (lastHeartbeatMillis > 0) ? (millis() - lastHeartbeatMillis) : ULONG_MAX;
+          unsigned long timeSinceLastActivity = millis() - lastActivityMillis;
           
-          // If no heartbeat for 15+ seconds, go to sleep regardless of window timeout
-          if (timeSinceLastHeartbeat > HEARTBEAT_INACTIVITY_TIMEOUT) {
-            Serial.printf("[AP] %d sensor(s) connected but no heartbeat for %lu sec, entering sleep.\n",
-                         numConnected, timeSinceLastHeartbeat / 1000);
+          // Use the most recent activity (heartbeat or data transfer)
+          unsigned long timeSinceAnyActivity = min(timeSinceLastHeartbeat, timeSinceLastActivity);
+          
+          // If no activity (heartbeat OR data transfer) for 15+ seconds, go to sleep
+          if (timeSinceAnyActivity > ACTIVITY_INACTIVITY_TIMEOUT) {
+            Serial.printf("[AP] %d sensor(s) connected but no activity for %lu sec, entering sleep.\n",
+                         numConnected, timeSinceAnyActivity / 1000);
             if (hadStation)
               Serial.println("[AP] Inactivity timeout reached.");
             stopAPMode();
@@ -1145,9 +1150,9 @@ void loopOperationalMode() {
             break;
           }
           
-          // If heartbeats are active, extend window and reset general timeout
-          if (timeSinceLastHeartbeat < HEARTBEAT_CHECK_INTERVAL) {
-            lastActivityMillis = millis(); // Keep extending as long as heartbeats come
+          // If any activity is recent, keep extending the window
+          if (timeSinceAnyActivity < ACTIVITY_CHECK_INTERVAL) {
+            lastActivityMillis = millis(); // Keep extending as long as ANY activity happens
           }
         }
         
