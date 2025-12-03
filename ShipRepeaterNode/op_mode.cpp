@@ -7,7 +7,6 @@
 #include <map>
 #include <algorithm>
 #include <sys/time.h>
-#include "sensor_heartbeat_manager.h"
 
 
 
@@ -75,8 +74,6 @@ bool sdDeferredSave = false;
 State currentState;
 bool apActive = false;
 bool needToSyncTime = false;
-// Κάπου δίπλα στα άλλα singletons
-static SensorHeartbeatManager heartbeatManager;
 // Heartbeat server for sensors on port 3000
 static AsyncWebServer sensorServer(3000);
 
@@ -800,9 +797,6 @@ void loopOperationalMode() {
                         info.wifi_ap_staconnected.mac[5]);
 
                 Serial.printf("[AP] Station connected: %s\n", macStr);
-
-                // the real station job manager
-                sjm_addStation(String(macStr));
               }
 
               else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
@@ -810,55 +804,16 @@ void loopOperationalMode() {
               }
             });
 
-          sjm_init();
           apActive = true;
           hadStation = false;
           jobProcessedThisWindow = false;
           lastActivityMillis = millis();
 
           // ======================================================
-          //                HEARTBEAT INTEGRATION
+          //                HEARTBEAT ENDPOINT
           // ======================================================
-
-          // Sensor HTTP server on port 3000 (your actual port)
-
-
-          // ======================================================
-          //                HEARTBEAT INTEGRATION
-          // ======================================================
-
-          // ΧΡΗΣΙΜΟΠΟΙΟΥΜΕ ΤΟ GLOBAL sensorServer
-          heartbeatManager.begin(sensorServer);
-
-          // -------- STATUS (heartbeats_after_measurement = 1)
-          heartbeatManager.onStatus([](const SensorHeartbeatContext& ctx) {
-            Serial.printf("[HB] STATUS for SN=%s IP=%s\n",
-                          ctx.sensorSn.c_str(),
-                          ctx.lastIp.toString().c_str());
-
-            FsFile f = sd.open("/jobs/job.json", O_WRITE | O_CREAT | O_TRUNC);
-            if (f) {
-              f.printf("{\"type\":\"STATUS\",\"sensor_sn\":\"%s\",\"sensor_ip\":\"%s\"}",
-                       ctx.sensorSn.c_str(),
-                       ctx.lastIp.toString().c_str());
-              f.close();
-            }
-
-            lastActivityMillis = millis();
-          });
-
-          // -------- OTHER (Config / Firmware) - execute jobs from config_jobs.json
-          heartbeatManager.onOther([](const SensorHeartbeatContext& ctx) {
-            Serial.printf("[HB] OTHER for SN=%s IP=%s\n",
-                          ctx.sensorSn.c_str(),
-                          ctx.lastIp.toString().c_str());
-            // Check and execute jobs from config_jobs.json and firmware_jobs.json
-            processJobsForSensor(ctx.sensorSn, ctx.lastIp.toString(), "HB");
-            lastActivityMillis = millis();
-          });
-
-          // -------- LEGACY HEARTBEAT (GET /api/heartbeat)
-          // Support for sensors using old firmware
+          // Sensors send GET /api/heartbeat with SN parameter
+          // Jobs from /jobs/config_jobs.json are checked and executed
           sensorServer.on("/api/heartbeat", HTTP_GET, [](AsyncWebServerRequest* request) {
             String sn = "";
             AsyncWebParameter* snParam = request->getParam("sn", false);
@@ -900,11 +855,6 @@ void loopOperationalMode() {
           Serial.println("[HB] Heartbeat server started on :3000");
 
           // ======================================================
-        }
-
-        // ---- PROCESS JOBS FOR ANY CONNECTED SENSOR ----
-        if (hadStation) {
-          sjm_processStations();
         }
 
         // ---- TIMEOUT CHECK ----
