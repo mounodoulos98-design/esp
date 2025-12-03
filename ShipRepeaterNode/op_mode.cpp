@@ -813,7 +813,7 @@ void loopOperationalMode() {
           //                HEARTBEAT ENDPOINT
           // ======================================================
           // Sensors send GET /api/heartbeat with SN parameter
-          // Jobs from /jobs/config_jobs.json are checked and executed
+          // Jobs from /jobs/config_jobs.json and /jobs/firmware_jobs.json are checked and executed
           sensorServer.on("/api/heartbeat", HTTP_GET, [](AsyncWebServerRequest* request) {
             String sn = "";
             AsyncWebParameter* snParam = request->getParam("sn", false);
