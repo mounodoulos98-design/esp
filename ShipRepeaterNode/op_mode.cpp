@@ -132,6 +132,7 @@ static void processHeartbeatBuffer();
 // Collector AP State (sensor intake / command execution)
 bool hadStation = false;
 unsigned long lastActivityMillis = 0;
+unsigned long lastHeartbeatMillis = 0;  // Track last actual heartbeat from any sensor
 static WiFiEventId_t stationConnectedEventId;
 
 // RTC Memory
@@ -173,6 +174,9 @@ static void processHeartbeatBuffer() {
     if (entry.hasData) {
       String sn = String((char*)entry.sensorSn);
       String ip = String((char*)entry.sensorIp);
+      
+      // Update last heartbeat time
+      lastHeartbeatMillis = millis();
       
       // Log heartbeat to SD
       if (initSdCard()) {
@@ -955,6 +959,7 @@ void loopOperationalMode() {
           hadStation = false;
           jobProcessedThisWindow = false;
           lastActivityMillis = millis();
+          lastHeartbeatMillis = 0; // Reset heartbeat tracking for new session
 
           // ======================================================
           //                HEARTBEAT INTEGRATION
@@ -1120,17 +1125,30 @@ void loopOperationalMode() {
         processHeartbeatBuffer();
 
         // ---- TIMEOUT CHECK ----
-        // Check if any stations are currently connected - don't sleep if sensors are active
+        // Check if sensors are actively sending heartbeats (not just WiFi-connected)
         int numConnected = WiFi.softAPgetStationNum();
         unsigned long timeout = hadStation ? (config.collectorDataTimeoutSec * 1000UL) : (config.collectorApWindowSec * 1000UL);
+        
+        // Use a shorter timeout (15 seconds) for checking actual heartbeat activity
+        const unsigned long HEARTBEAT_ACTIVITY_TIMEOUT = 15000; // 15 seconds
 
         if (millis() - lastActivityMillis > timeout) {
-          // Don't sleep if sensors are still connected - they might be sending data
+          // If sensors are WiFi-connected, check if they're actually sending heartbeats
           if (numConnected > 0) {
-            Serial.printf("[AP] %d sensor(s) still connected, extending window...\n", numConnected);
-            lastActivityMillis = millis(); // Reset timeout
-            delay(100);
-            break;
+            unsigned long timeSinceLastHeartbeat = millis() - lastHeartbeatMillis;
+            
+            // If we received a heartbeat recently (within 15 seconds), extend the window
+            if (lastHeartbeatMillis > 0 && timeSinceLastHeartbeat < HEARTBEAT_ACTIVITY_TIMEOUT) {
+              Serial.printf("[AP] %d sensor(s) active (last heartbeat %lu sec ago), extending window...\n", 
+                           numConnected, timeSinceLastHeartbeat / 1000);
+              lastActivityMillis = millis(); // Reset timeout
+              delay(100);
+              break;
+            } else {
+              // Sensors are connected but not sending heartbeats - go to sleep
+              Serial.printf("[AP] %d sensor(s) connected but inactive for %lu sec, entering sleep.\n",
+                           numConnected, timeSinceLastHeartbeat / 1000);
+            }
           }
 
           if (hadStation)
