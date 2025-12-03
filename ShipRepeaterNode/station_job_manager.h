@@ -15,3 +15,4 @@ struct PendingStation {
 void sjm_init();
 void sjm_addStation(const String& mac);
 void sjm_processStations();
+bool sjm_processJobsForSN(const String& sn, const String& ip);

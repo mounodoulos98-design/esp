@@ -136,7 +136,7 @@ static bool sjm_requestStatus(const String& ip, String& snOut) {
 // Βρίσκουμε jobs για συγκεκριμένο SN
 // Προτεραιότητα: FW πρώτα, μετά CONFIG
 // ---------------------
-static bool processJobsForSN(const String& sn, const String& ip) {
+bool sjm_processJobsForSN(const String& sn, const String& ip) {
     bool didSomething = false;
 
     // 1) Firmware jobs (προτεραιότητα)
@@ -324,7 +324,7 @@ void sjm_processStations() {
             continue;
         }
 
-        bool didJobs = processJobsForSN(sn, st.ip);
+        bool didJobs = sjm_processJobsForSN(sn, st.ip);
         if (didJobs) {
             Serial.printf("[SJM] Jobs processed for SN=%s (IP=%s)\n",
                           sn.c_str(), st.ip.c_str());

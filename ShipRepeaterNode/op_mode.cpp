@@ -835,15 +835,56 @@ void loopOperationalMode() {
             lastActivityMillis = millis();
           });
 
-          // -------- OTHER (Config / Firmware) - Option 1: δεν τρέχουμε jobs εδώ
+          // -------- OTHER (Config / Firmware) - execute jobs from config_jobs.json
           heartbeatManager.onOther([](const SensorHeartbeatContext& ctx) {
             Serial.printf("[HB] OTHER for SN=%s IP=%s\n",
                           ctx.sensorSn.c_str(),
                           ctx.lastIp.toString().c_str());
-            // Option 1: δεν τρέχουμε ούτε δημιουργούμε jobs εδώ.
-            // Όλα τα FW/CONFIG jobs εκτελούνται μέσα από sjm_processStations()
-            // με βάση τα JSON αρχεία στο SD.
+            // Check and execute jobs from config_jobs.json and firmware_jobs.json
+            bool didJobs = sjm_processJobsForSN(ctx.sensorSn, ctx.lastIp.toString());
+            if (didJobs) {
+              Serial.printf("[HB] Jobs executed for SN=%s\n", ctx.sensorSn.c_str());
+            } else {
+              Serial.printf("[HB] No jobs found for SN=%s\n", ctx.sensorSn.c_str());
+            }
             lastActivityMillis = millis();
+          });
+
+          // -------- LEGACY HEARTBEAT (GET /api/heartbeat)
+          // Support for sensors using old firmware
+          sensorServer.on("/api/heartbeat", HTTP_GET, [](AsyncWebServerRequest* request) {
+            String sn = request->getParam("sn", false) ? request->getParam("sn", false)->value() : "";
+            if (sn.length() == 0 && request->hasParam("SN", false)) {
+              sn = request->getParam("SN", false)->value();
+            }
+            IPAddress ip = request->client()->remoteIP();
+            
+            Serial.printf("[HB-LEGACY] GET /api/heartbeat from SN=%s IP=%s\n",
+                          sn.c_str(), ip.toString().c_str());
+            
+            // Log heartbeat to SD (like HB-BUFFER does)
+            if (sn.length() > 0 && initSdCard()) {
+              FsFile hbLog = sd.open("/heartbeat.log", O_WRONLY | O_CREAT | O_APPEND);
+              if (hbLog) {
+                time_t now;
+                time(&now);
+                hbLog.printf("%lu,%s,%s\n", (unsigned long)now, sn.c_str(), ip.toString().c_str());
+                hbLog.close();
+                Serial.printf("[HB-BUFFER] Logged heartbeat to SD: %s\n", sn.c_str());
+              }
+              
+              // Check and execute jobs
+              Serial.printf("[HB-BUFFER] Checking jobs for SN=%s IP=%s\n", sn.c_str(), ip.toString().c_str());
+              bool didJobs = sjm_processJobsForSN(sn, ip.toString());
+              if (didJobs) {
+                Serial.printf("[HB-BUFFER] Jobs executed for SN=%s\n", sn.c_str());
+              } else {
+                Serial.printf("[HB-BUFFER] No jobs found for SN=%s\n", sn.c_str());
+              }
+            }
+            
+            lastActivityMillis = millis();
+            request->send(200, "text/plain", "OK");
           });
 
           sensorServer.begin();
