@@ -697,6 +697,18 @@ void decideAndGoToSleep() {
 }
 
 // =============================
+// Helper: Process Jobs for Sensor
+// =============================
+static void processJobsForSensor(const String& sn, const String& ip, const char* logPrefix) {
+  bool didJobs = sjm_processJobsForSN(sn, ip);
+  if (didJobs) {
+    Serial.printf("[%s] Jobs executed for SN=%s\n", logPrefix, sn.c_str());
+  } else {
+    Serial.printf("[%s] No jobs found for SN=%s\n", logPrefix, sn.c_str());
+  }
+}
+
+// =============================
 // Main Loop
 // =============================
 void loopOperationalMode() {
@@ -841,12 +853,7 @@ void loopOperationalMode() {
                           ctx.sensorSn.c_str(),
                           ctx.lastIp.toString().c_str());
             // Check and execute jobs from config_jobs.json and firmware_jobs.json
-            bool didJobs = sjm_processJobsForSN(ctx.sensorSn, ctx.lastIp.toString());
-            if (didJobs) {
-              Serial.printf("[HB] Jobs executed for SN=%s\n", ctx.sensorSn.c_str());
-            } else {
-              Serial.printf("[HB] No jobs found for SN=%s\n", ctx.sensorSn.c_str());
-            }
+            processJobsForSensor(ctx.sensorSn, ctx.lastIp.toString(), "HB");
             lastActivityMillis = millis();
           });
 
@@ -875,12 +882,7 @@ void loopOperationalMode() {
               
               // Check and execute jobs
               Serial.printf("[HB-BUFFER] Checking jobs for SN=%s IP=%s\n", sn.c_str(), ip.toString().c_str());
-              bool didJobs = sjm_processJobsForSN(sn, ip.toString());
-              if (didJobs) {
-                Serial.printf("[HB-BUFFER] Jobs executed for SN=%s\n", sn.c_str());
-              } else {
-                Serial.printf("[HB-BUFFER] No jobs found for SN=%s\n", sn.c_str());
-              }
+              processJobsForSensor(sn, ip.toString(), "HB-BUFFER");
             }
             
             lastActivityMillis = millis();
