@@ -60,15 +60,16 @@ bool cu_sendConfiguration(const ConfigJob& job)
     int headerEnd = response.indexOf("\r\n\r\n");
     String body = (headerEnd >= 0) ? response.substring(headerEnd + 4) : response;
 
-    Serial.println("[CONFIG] Response body:");
-    Serial.println(body);
-
-    // Check for success in response (Python daemon checks for "OK" or "Success")
-    if (body.length() > 0 && (body.indexOf("OK") >= 0 || body.indexOf("Success") >= 0)) {
-        Serial.println("[CONFIG] SUCCESS (OK found in response)");
-        return true;
+    // Log response but don't fail based on it (matching Python daemon behavior)
+    // Python daemon logs the response but always clears the flag regardless
+    if (body.length() > 0) {
+        Serial.println("[CONFIG] Response:");
+        Serial.println(body);
+    } else {
+        Serial.println("[CONFIG] No response body received");
     }
 
-    Serial.println("[CONFIG] FAILED (no OK in response)");
-    return false;
+    // Always return true - config was sent (Python daemon behavior)
+    // If sensor is busy (uploading data), it will get the config on next attempt
+    return true;
 }

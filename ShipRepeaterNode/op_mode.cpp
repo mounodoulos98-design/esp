@@ -1122,36 +1122,37 @@ void loopOperationalMode() {
         processHeartbeatBuffer();
 
         // ---- TIMEOUT CHECK ----
-        // Check for any sensor activity (heartbeats OR data transfers) every 10 seconds
+        // Check for any sensor activity (heartbeats OR data transfers) periodically
+        // Use the configured collectorDataTimeoutSec when sensors are connected
         // Only check periodically to avoid race conditions with ongoing transfers
         static unsigned long lastTimeoutCheck = 0;
         int numConnected = WiFi.softAPgetStationNum();
         const unsigned long ACTIVITY_CHECK_INTERVAL = 10000; // Check every 10 seconds
-        const unsigned long ACTIVITY_INACTIVITY_TIMEOUT = 15000; // 15 seconds of no activity = sleep
         
         unsigned long now = millis();
         if (now - lastTimeoutCheck >= ACTIVITY_CHECK_INTERVAL) {
           lastTimeoutCheck = now;
           
-          // If sensors are connected, check for ANY activity (not just heartbeats)
+          unsigned long timeSinceLastActivity = now - lastActivityMillis;
+          unsigned long timeout;
+          
           if (numConnected > 0) {
-            // Track general activity (data transfers, status, heartbeats)
-            unsigned long timeSinceLastActivity = now - lastActivityMillis;
+            // Sensors connected - use data timeout (allows time for measurement uploads)
+            timeout = config.collectorDataTimeoutSec * 1000UL;
             
-            // If no activity for 15+ seconds, go to sleep
-            if (timeSinceLastActivity > ACTIVITY_INACTIVITY_TIMEOUT) {
+            if (timeSinceLastActivity > timeout) {
               Serial.printf("[AP] %d sensor(s) connected but no activity for %lu sec, entering sleep.\n",
                            numConnected, timeSinceLastActivity / 1000);
-              if (hadStation)
-                Serial.println("[AP] Inactivity timeout reached.");
+              Serial.println("[AP] Inactivity timeout reached.");
               stopAPMode();
               decideAndGoToSleep();
               break;
             }
           } else {
-            // No sensors connected - check general window timeout
-            unsigned long timeout = hadStation ? (config.collectorDataTimeoutSec * 1000UL) : (config.collectorApWindowSec * 1000UL);
-            if (now - lastActivityMillis > timeout) {
+            // No sensors connected - use shorter window timeout
+            timeout = hadStation ? (config.collectorDataTimeoutSec * 1000UL) : (config.collectorApWindowSec * 1000UL);
+            
+            if (timeSinceLastActivity > timeout) {
               if (hadStation)
                 Serial.println("[AP] Inactivity timeout reached.");
               else
