@@ -6,6 +6,7 @@ This repository contains the ESP32 firmware for a Ship Repeater Node that acts a
 
 - **Async Sensor Communication**: Handle multiple sensors concurrently using FreeRTOS tasks
 - **Heartbeat-Driven Architecture**: Event-driven processing based on sensor heartbeats
+- **BLE Mesh Wake-Up**: Bluetooth Low Energy beacons for efficient parent discovery and wake-up
 - **Job Execution System**: 
   - Firmware updates via Intel HEX over HTTP
   - Configuration updates via HTTP API
@@ -49,6 +50,7 @@ First boot will enter Configuration Mode. Set up the node role:
 ## Documentation
 
 - **[ASYNC_SENSOR_FLOW.md](ASYNC_SENSOR_FLOW.md)** - Complete async communication flow with diagrams
+- **[BLE_MESH_WAKEUP.md](BLE_MESH_WAKEUP.md)** - BLE mesh wake-up system for parent discovery
 - **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)** - Detailed implementation and design decisions  
 - **[EXAMPLE_JOB_FILES.md](EXAMPLE_JOB_FILES.md)** - Example job files and testing guide
 - **[README_FIXES.txt](ShipRepeaterNode/README_FIXES.txt)** - Build and timing fixes

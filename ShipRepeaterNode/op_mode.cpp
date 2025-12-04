@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <sys/time.h>
 #include "sensor_heartbeat_manager.h"
+#include "ble_mesh_beacon.h"
 
 
 
@@ -79,6 +80,10 @@ bool needToSyncTime = false;
 static SensorHeartbeatManager heartbeatManager;
 // Heartbeat server for sensors on port 3000
 static AsyncWebServer sensorServer(3000);
+
+// BLE Mesh Wake-up: Beacon for Root/Repeater, Scanner for Collector/Repeater
+static BLEBeaconManager bleBeacon;
+static BLEScannerManager bleScanner;
 
 // === Simple Memory-Based Buffer for Callback-to-Loop Communication ===
 // FreeRTOS queues cause mutex crashes when used from AsyncWebServer callbacks.
@@ -964,6 +969,13 @@ void goToDeepSleep(unsigned int seconds) {
   }
   rtc_last_sleep_duration_s = seconds;
   stopAPMode();
+  
+  // Stop BLE before deep sleep
+  if (config.bleBeaconEnabled) {
+    bleBeacon.stop();
+    Serial.println("[BLE-MESH] Stopped BLE beacon before sleep");
+  }
+  
   Serial.printf("[SLEEP] Entering deep sleep for %u seconds.\n", seconds);
   esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
   delay(200);
@@ -1043,6 +1055,13 @@ void loopOperationalMode() {
   if (config.role == ROLE_ROOT) {
     ensureWiFiAPRoot();
     ensureRootHttpServer();
+    
+    // Start BLE beacon for parent discovery (Root is always on)
+    if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
+      bleBeacon.begin(config.nodeName, 1); // 1 = Root role
+      bleBeacon.startAdvertising();
+    }
+    
     static unsigned long lastPrint = 0;
     if (millis() - lastPrint > 10000) {
       debugPrintTime("Root loop");
@@ -1055,6 +1074,13 @@ void loopOperationalMode() {
   if (config.role == ROLE_REPEATER) {
     ensureWiFiAPRepeater();
     ensureRepeaterHttpServer();
+    
+    // Start BLE beacon for parent discovery (Repeater advertises when awake)
+    if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
+      bleBeacon.begin(config.nodeName, 0); // 0 = Repeater role
+      bleBeacon.startAdvertising();
+    }
+    
     static bool tried = false;
     if (!tried) {
       tried = true;
@@ -1360,11 +1386,32 @@ void loopOperationalMode() {
       {
         static time_t state_start_time = 0;
         static bool started = false;
+        static bool bleScanned = false;
 
         if (!started) {
           setStatusLed(STATUS_SENDING_DATA);
           Serial.printf("[STATE] Executing: UPLINK APPOINTMENT (%s)\n",
                         (config.role == ROLE_REPEATER ? "REPEATER" : "COLLECTOR"));
+
+          // BLE Scan for parent discovery (Collector/Repeater finding their parent)
+          if (config.bleBeaconEnabled && !bleScanned) {
+            Serial.println("[BLE-MESH] Scanning for parent node...");
+            bleScanner.begin();
+            BLEScannerManager::ScanResult result = bleScanner.scanForParent(config.bleScanDurationSec);
+            bleScanner.stop();
+            bleScanned = true;
+            
+            if (result.found) {
+              Serial.printf("[BLE-MESH] Found parent: %s (Role: %s, RSSI: %d dBm)\n",
+                           result.nodeName.c_str(),
+                           result.nodeRole == 1 ? "Root" : "Repeater",
+                           result.rssi);
+              // Parent is now discoverable, proceed to connect via WiFi
+              // The BLE discovery confirms the parent is awake and ready
+            } else {
+              Serial.println("[BLE-MESH] No parent found via BLE, proceeding with configured uplink");
+            }
+          }
 
           time(&state_start_time);
           started = true;
@@ -1383,6 +1430,7 @@ void loopOperationalMode() {
           if (!findOldestQueueFile(still)) {
             Serial.println("[UPLINK] Queue empty → sleeping early.");
             started = false;
+            bleScanned = false; // Reset for next cycle
             decideAndGoToSleep();
             return;
           }
@@ -1399,6 +1447,7 @@ void loopOperationalMode() {
 
         Serial.printf("[UPLINK] Window finished after %d sec.\n", elapsed);
         started = false;
+        bleScanned = false; // Reset for next cycle
         decideAndGoToSleep();
         break;
       }

@@ -86,6 +86,10 @@ struct NodeConfig {
   int meshIntervalMin = MESH_APPOINTMENT_INTERVAL_M;
   int meshWindowSec = MESH_APPOINTMENT_WINDOW_S;
   bool isConfigured = false;
+  
+  // BLE Mesh Wake-up Configuration
+  bool bleBeaconEnabled = true;  // Enable BLE beacon for parent discovery (Repeater/Root)
+  int bleScanDurationSec = 5;    // Duration to scan for parent nodes (Collector/Repeater)
 };
 
 // Extern declarations

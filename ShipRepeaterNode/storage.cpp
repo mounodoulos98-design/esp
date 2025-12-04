@@ -28,6 +28,11 @@ preferences.putString("nodeName", config.nodeName);
     preferences.putInt("collWin", config.collectorApWindowSec);
     preferences.putInt("collTout", config.collectorDataTimeoutSec);
   }
+  
+  // Save BLE mesh wake-up configuration
+  preferences.putBool("bleBeacon", config.bleBeaconEnabled);
+  preferences.putInt("bleScanSec", config.bleScanDurationSec);
+  
   preferences.putBool("configured", config.isConfigured);preferences.end();
   Serial.println("[STORAGE] Configuration saved to flash.");
 }
@@ -53,6 +58,11 @@ void loadConfiguration() {
         config.collectorApWindowSec = preferences.getInt("collWin", COLLECTOR_AP_WINDOW_S);
         config.collectorDataTimeoutSec = preferences.getInt("collTout", COLLECTOR_DATA_TIMEOUT_S);
       }
+      
+      // Load BLE mesh wake-up configuration
+      config.bleBeaconEnabled = preferences.getBool("bleBeacon", true);
+      config.bleScanDurationSec = preferences.getInt("bleScanSec", 5);
+      
       Serial.println("[STORAGE] Configuration loaded from flash.");
     } else {
       Serial.println("[STORAGE] No configuration found.");
