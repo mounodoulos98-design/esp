@@ -1041,6 +1041,8 @@ void decideAndGoToSleep() {
     // Don't go to deep sleep - allows instant wake-up by collectors
     // Note: Light sleep is managed by the Arduino/ESP-IDF framework automatically
     // when CPU is idle. BLE beacon continues advertising during light sleep.
+    // Original scheduling logic removed: Repeater no longer uses scheduled uplink windows,
+    // instead stays continuously available for collectors to connect at any time.
     Serial.println("[SCHEDULER] Repeater stays active with BLE beacon (automatic light sleep)");
     return; // Don't call goToDeepSleep
   } else {
