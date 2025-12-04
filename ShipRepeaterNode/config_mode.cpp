@@ -189,6 +189,14 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
       document.getElementById('collectorSettings').style.display = (role==='collector')?'block':'none';
       document.getElementById('repeaterSettings').style.display = (role==='repeater')?'block':'none';
       document.getElementById('rootSettings').style.display = (role==='root')?'block':'none';
+      
+      // Remove 'required' attribute from hidden fields to prevent HTML5 validation errors
+      document.querySelectorAll('#collectorSettings input[required]').forEach(el => {
+        el.required = (role === 'collector');
+      });
+      document.querySelectorAll('#repeaterSettings input[required]').forEach(el => {
+        el.required = (role === 'repeater');
+      });
     }
     
     // Initialize on page load
