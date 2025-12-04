@@ -6,6 +6,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLEAdvertising.h>
+#include <BLEAdvertisementData.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 
@@ -49,12 +50,15 @@ public:
         pAdvertising->setMinPreferred(0x06);  // Min connection interval
         pAdvertising->setMaxPreferred(0x12);  // Max connection interval
         
-        // Add manufacturer data with node role
+        // Add manufacturer data with node role using BLEAdvertisementData
         // Format: [role_byte, name_bytes...]
-        std::string advData;
-        advData.push_back(nodeRole); // 0=Repeater, 1=Root
-        advData.append(nodeName.c_str());
-        pAdvertising->setManufacturerData(advData);
+        BLEAdvertisementData advData;
+        std::string mfgData;
+        mfgData.push_back(nodeRole); // 0=Repeater, 1=Root
+        mfgData.append(nodeName.c_str());
+        advData.setManufacturerData(mfgData);
+        advData.setCompleteServices(BLEUUID(BLE_MESH_SERVICE_UUID));
+        pAdvertising->setAdvertisementData(advData);
         
         isInitialized = true;
         Serial.println("[BLE-BEACON] BLE Beacon initialized");

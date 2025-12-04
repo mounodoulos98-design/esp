@@ -382,8 +382,18 @@ void ensureRootHttpServer() {
     }
     String path = "/jobs/config_jobs.json";
     if (sd.exists(path.c_str())) {
-      req->send(sd, path.c_str(), "application/json");
-      Serial.println("[ROOT] Served /jobs/config_jobs.json");
+      FsFile file = sd.open(path.c_str(), O_RDONLY);
+      if (file) {
+        String content = "";
+        while (file.available()) {
+          content += (char)file.read();
+        }
+        file.close();
+        req->send(200, "application/json", content);
+        Serial.println("[ROOT] Served /jobs/config_jobs.json");
+      } else {
+        req->send(500, "text/plain", "Failed to open file");
+      }
     } else {
       req->send(404, "text/plain", "File not found");
     }
@@ -396,14 +406,25 @@ void ensureRootHttpServer() {
     }
     String path = "/jobs/firmware_jobs.json";
     if (sd.exists(path.c_str())) {
-      req->send(sd, path.c_str(), "application/json");
-      Serial.println("[ROOT] Served /jobs/firmware_jobs.json");
+      FsFile file = sd.open(path.c_str(), O_RDONLY);
+      if (file) {
+        String content = "";
+        while (file.available()) {
+          content += (char)file.read();
+        }
+        file.close();
+        req->send(200, "application/json", content);
+        Serial.println("[ROOT] Served /jobs/firmware_jobs.json");
+      } else {
+        req->send(500, "text/plain", "Failed to open file");
+      }
     } else {
       req->send(404, "text/plain", "File not found");
     }
   });
 
   // Serve firmware hex files
+  // Note: For large files, consider using chunked response to avoid memory issues
   rootServer.on("/firmware/*", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (!initSdCard()) {
       req->send(404, "text/plain", "SD card not available");
@@ -411,8 +432,21 @@ void ensureRootHttpServer() {
     }
     String path = req->url();
     if (sd.exists(path.c_str())) {
-      req->send(sd, path.c_str(), "application/octet-stream");
-      Serial.printf("[ROOT] Served %s\n", path.c_str());
+      FsFile file = sd.open(path.c_str(), O_RDONLY);
+      if (file) {
+        // Read entire file content (works for reasonably sized files)
+        size_t fileSize = file.size();
+        String content = "";
+        content.reserve(fileSize + 1);
+        while (file.available()) {
+          content += (char)file.read();
+        }
+        file.close();
+        req->send(200, "application/octet-stream", content);
+        Serial.printf("[ROOT] Served %s (%d bytes)\n", path.c_str(), fileSize);
+      } else {
+        req->send(500, "text/plain", "Failed to open file");
+      }
     } else {
       req->send(404, "text/plain", "File not found");
     }
