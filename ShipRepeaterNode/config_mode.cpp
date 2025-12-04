@@ -149,6 +149,8 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
   </div>
 
   <script>
+    console.log('[CONFIG-JS] Script loaded');
+    
     async function syncTime() {
       const epoch = Math.floor(Date.now() / 1000);
       try {
@@ -189,15 +191,27 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
       document.getElementById('rootSettings').style.display = (role==='root')?'block':'none';
     }
     
-    // Handle form submission with visual feedback
-    document.addEventListener('DOMContentLoaded', function() {
+    // Initialize on page load
+    window.addEventListener('load', function() {
+      console.log('[CONFIG-JS] Page loaded, initializing');
       toggleRoleFields();
       
+      // Handle form submission with visual feedback
       const form = document.querySelector('form');
       const submitBtn = document.querySelector('input[type="submit"]');
       
+      if (!form || !submitBtn) {
+        console.error('[CONFIG-JS] ERROR: Form or submit button not found!');
+        console.error('[CONFIG-JS] form:', form);
+        console.error('[CONFIG-JS] submitBtn:', submitBtn);
+        return;
+      }
+      
+      console.log('[CONFIG-JS] Form handler attached');
+      
       form.addEventListener('submit', async function(e) {
         e.preventDefault();
+        console.log('Form submitted');
         
         // Disable button and show progress
         submitBtn.disabled = true;
@@ -206,19 +220,23 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
         
         try {
           const formData = new FormData(form);
+          console.log('Sending form data to /save');
+          
           const response = await fetch('/save', {
             method: 'POST',
             body: formData
           });
+          
+          console.log('Response status:', response.status);
           
           if (response.ok) {
             submitBtn.value = 'Saved! Rebooting...';
             submitBtn.style.backgroundColor = '#4CAF50';
             alert('Configuration saved successfully! Device will reboot now.');
             // Give time for user to see the message
-            setTimeout(() => {
+            setTimeout(function() {
               // Try to reconnect after reboot (30 seconds)
-              setTimeout(() => {
+              setTimeout(function() {
                 window.location.reload();
               }, 30000);
             }, 2000);
