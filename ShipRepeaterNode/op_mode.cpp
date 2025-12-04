@@ -512,12 +512,20 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
     Serial.println("[TIME] STA connect failed");
     return false;
   }
+  // Auto-detect parent IP if not configured (use gateway IP from DHCP)
+  String targetHost = config.uplinkHost;
+  if (targetHost.length() == 0 || targetHost == "Auto" || targetHost == "auto") {
+    IPAddress gateway = WiFi.gatewayIP();
+    targetHost = gateway.toString();
+    Serial.printf("[TIME] Auto-detected parent IP: %s (gateway)\n", targetHost.c_str());
+  }
+  
   WiFiClient client;
-  if (!client.connect(config.uplinkHost.c_str(), config.uplinkPort)) {
+  if (!client.connect(targetHost.c_str(), config.uplinkPort)) {
     Serial.println("[TIME] Connect host failed");
     return false;
   }
-  client.print(String("GET /time HTTP/1.1\r\nHost: ") + config.uplinkHost + "\r\nConnection: close\r\n\r\n");
+  client.print(String("GET /time HTTP/1.1\r\nHost: ") + targetHost + "\r\nConnection: close\r\n\r\n");
   unsigned long t0 = millis();
   while (client.connected() && !client.available() && millis() - t0 < 3000) delay(10);
   String resp = "";
@@ -587,16 +595,24 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
     return false;
   }
 
+  // Auto-detect parent IP if not configured (use gateway IP from DHCP)
+  String targetHost = config.uplinkHost;
+  if (targetHost.length() == 0 || targetHost == "Auto" || targetHost == "auto") {
+    IPAddress gateway = WiFi.gatewayIP();
+    targetHost = gateway.toString();
+    Serial.printf("[HTTP UP] Auto-detected parent IP: %s (gateway)\n", targetHost.c_str());
+  }
+  
   WiFiClient client;
-  Serial.printf("[HTTP UP] Connecting to %s:%d...\n", config.uplinkHost.c_str(), config.uplinkPort);
-  if (!client.connect(config.uplinkHost.c_str(), config.uplinkPort)) {
+  Serial.printf("[HTTP UP] Connecting to %s:%d...\n", targetHost.c_str(), config.uplinkPort);
+  if (!client.connect(targetHost.c_str(), config.uplinkPort)) {
     Serial.println("[HTTP UP] Connect failed");
     f.close();
     return false;
   }
 
   String boundary = "----esp32bound" + String(millis());
-  String head = "POST /ingest HTTP/1.1\r\nHost: " + config.uplinkHost + "\r\n";
+  String head = "POST /ingest HTTP/1.1\r\nHost: " + targetHost + "\r\n";
   head += "Connection: close\r\nContent-Type: multipart/form-data; boundary=" + boundary + "\r\n";
   String pre = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"" + basename + "\"\r\nContent-Type: application/octet-stream\r\n\r\n";
   String post = "\r\n--" + boundary + "--\r\n";
@@ -642,11 +658,19 @@ bool downloadFileFromRoot(const String& remotePath, const String& localPath) {
     return false;
   }
 
+  // Auto-detect parent IP if not configured (use gateway IP from DHCP)
+  String targetHost = config.uplinkHost;
+  if (targetHost.length() == 0 || targetHost == "Auto" || targetHost == "auto") {
+    IPAddress gateway = WiFi.gatewayIP();
+    targetHost = gateway.toString();
+    Serial.printf("[DOWNLOAD] Auto-detected parent IP: %s (gateway)\n", targetHost.c_str());
+  }
+  
   WiFiClient client;
   Serial.printf("[DOWNLOAD] Fetching http://%s:%d%s...\n", 
-                config.uplinkHost.c_str(), config.uplinkPort, remotePath.c_str());
+                targetHost.c_str(), config.uplinkPort, remotePath.c_str());
   
-  if (!client.connect(config.uplinkHost.c_str(), config.uplinkPort)) {
+  if (!client.connect(targetHost.c_str(), config.uplinkPort)) {
     Serial.println("[DOWNLOAD] Connect failed");
     return false;
   }

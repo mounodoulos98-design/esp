@@ -73,20 +73,26 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
         <input type="number" id="bleScanDurationSec" name="bleScanDurationSec" value="5" min="1" max="30">
         <div class="muted">Recommended: 5 seconds. Longer = more reliable, higher power</div>
         
-        <h3>Uplink (Send Data To)</h3>
+        <h3>Parent Node (Where to Send Data)</h3>
+        <div class="muted">Connect to Repeater or Root to upload collected sensor data</div>
         <div class="row">
           <div style="flex:2">
-            <label for="uplinkSSID">Uplink SSID:</label>
-            <input type="text" id="uplinkSSID" name="uplinkSSID" placeholder="Repeater_AP or Root_AP">
+            <label for="uplinkSSID">Parent WiFi SSID:</label>
+            <input type="text" id="uplinkSSID" name="uplinkSSID" placeholder="Repeater_AP" required>
           </div>
           <div style="flex:1;align-self:end">
-            <button type="button" onclick="scanWiFi('uplinkSSID')">Scan</button>
+            <button type="button" onclick="scanWiFi('uplinkSSID')">Scan WiFi</button>
           </div>
         </div>
         <select id="wifiList" style="width:100%;margin-top:5px;display:none;"></select>
-        <label for="uplinkPASS">Uplink Password:</label><input type="text" id="uplinkPASS" name="uplinkPASS">
-        <label for="uplinkHost">Uplink Host/IP:</label><input type="text" id="uplinkHost" name="uplinkHost" placeholder="192.168.10.1">
-        <label for="uplinkPort">Uplink Port:</label><input type="number" id="uplinkPort" name="uplinkPort" value="8080">
+        <label for="uplinkPASS">Parent WiFi Password:</label>
+        <input type="text" id="uplinkPASS" name="uplinkPASS" placeholder="(leave empty if open)">
+        
+        <div class="muted" style="margin-top:10px">📡 With BLE enabled, parent IP is auto-discovered. Without BLE, set manually:</div>
+        <label for="uplinkHost">Parent IP Address (optional with BLE):</label>
+        <input type="text" id="uplinkHost" name="uplinkHost" placeholder="Auto: 192.168.20.1 or 192.168.10.1">
+        <label for="uplinkPort">Parent HTTP Port:</label>
+        <input type="number" id="uplinkPort" name="uplinkPort" value="8080">
       </div>
 
       <!-- REPEATER -->
@@ -103,20 +109,24 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
         </label>
         <div class="muted">Power: ~20-30 mA. Allows instant wake-up when Collector connects.</div>
         
-        <h3>Uplink to Root</h3>
+        <h3>Parent Node (Forward Data To Root)</h3>
+        <div class="muted">Connect to Root to forward data from Collectors</div>
         <div class="row">
           <div style="flex:2">
-            <label for="uplinkSSID_r">Uplink SSID:</label>
-            <input type="text" id="uplinkSSID_r" name="uplinkSSID" placeholder="Root_AP">
+            <label for="uplinkSSID_r">Root WiFi SSID:</label>
+            <input type="text" id="uplinkSSID_r" name="uplinkSSID" placeholder="Root_AP" required>
           </div>
           <div style="flex:1;align-self:end">
-            <button type="button" onclick="scanWiFi('uplinkSSID_r')">Scan</button>
+            <button type="button" onclick="scanWiFi('uplinkSSID_r')">Scan WiFi</button>
           </div>
         </div>
         <select id="wifiList_r" style="width:100%;margin-top:5px;display:none;"></select>
-        <label for="uplinkPASS_r">Uplink Password:</label><input type="text" id="uplinkPASS_r" name="uplinkPASS">
-        <label for="uplinkHost_r">Uplink Host:</label><input type="text" id="uplinkHost_r" name="uplinkHost">
-        <label for="uplinkPort_r">Uplink Port:</label><input type="number" id="uplinkPort_r" name="uplinkPort" value="8080">
+        <label for="uplinkPASS_r">Root WiFi Password:</label>
+        <input type="text" id="uplinkPASS_r" name="uplinkPASS" placeholder="(leave empty if open)">
+        <label for="uplinkHost_r">Root IP Address:</label>
+        <input type="text" id="uplinkHost_r" name="uplinkHost" placeholder="192.168.10.1" required>
+        <label for="uplinkPort_r">Root HTTP Port:</label>
+        <input type="number" id="uplinkPort_r" name="uplinkPort" value="8080">
       </div>
 
       <!-- ROOT -->
