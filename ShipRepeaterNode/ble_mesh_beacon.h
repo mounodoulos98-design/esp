@@ -127,7 +127,7 @@ public:
         
         // Find the strongest signal with our service UUID
         int bestRSSI = -999;
-        BLEAdvertisedDevice* bestDevice = nullptr;
+        int bestIndex = -1;
         
         for (int i = 0; i < count; i++) {
             BLEAdvertisedDevice device = foundDevices.getDevice(i);
@@ -140,24 +140,21 @@ public:
                 
                 if (rssi > bestRSSI) {
                     bestRSSI = rssi;
-                    // Free previous best device before allocating new one
-                    if (bestDevice != nullptr) {
-                        delete bestDevice;
-                    }
-                    bestDevice = new BLEAdvertisedDevice(device);
+                    bestIndex = i;
                 }
             }
         }
         
-        if (bestDevice) {
+        if (bestIndex >= 0) {
+            BLEAdvertisedDevice bestDevice = foundDevices.getDevice(bestIndex);
             result.found = true;
-            result.nodeName = String(bestDevice->getName().c_str());
+            result.nodeName = String(bestDevice.getName().c_str());
             result.rssi = bestRSSI;
-            result.address = String(bestDevice->getAddress().toString().c_str());
+            result.address = String(bestDevice.getAddress().toString().c_str());
             
             // Try to extract role from manufacturer data
-            if (bestDevice->haveManufacturerData()) {
-                std::string mfgData = bestDevice->getManufacturerData();
+            if (bestDevice.haveManufacturerData()) {
+                std::string mfgData = bestDevice.getManufacturerData();
                 if (mfgData.length() > 0) {
                     result.nodeRole = mfgData[0];
                 }
@@ -165,8 +162,6 @@ public:
             
             Serial.printf("[BLE-SCAN] Selected parent: %s (RSSI: %d)\n", 
                          result.nodeName.c_str(), result.rssi);
-            
-            delete bestDevice;
         } else {
             Serial.println("[BLE-SCAN] No mesh nodes found");
         }
