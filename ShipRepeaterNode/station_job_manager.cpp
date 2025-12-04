@@ -160,20 +160,21 @@ bool processJobsForSN(const String& sn, const String& ip) {
     bool didSomething = false;
 
     // Load jobs into cache if not already loaded (only once per AP session)
-    unsigned long now = millis();
-    if (!g_fwJobsCached && (now - g_lastJobLoadTime > 1000)) {
+    if (!g_fwJobsCached && g_lastJobLoadTime == 0) {
         g_fwJobsCached = readJsonFile(FW_JOBS_PATH, g_fwJobsCache);
         if (!g_fwJobsCached) {
             g_fwJobsCache.clear(); // No FW jobs
         }
-        g_lastJobLoadTime = now;
     }
-    if (!g_cfgJobsCached && (now - g_lastJobLoadTime > 1000)) {
+    if (!g_cfgJobsCached && g_lastJobLoadTime == 0) {
         g_cfgJobsCached = readJsonFile(CFG_JOBS_PATH, g_cfgJobsCache);
         if (!g_cfgJobsCached) {
             g_cfgJobsCache.clear(); // No config jobs
         }
-        g_lastJobLoadTime = now;
+    }
+    // Mark that we've attempted to load jobs (set after both attempts)
+    if (g_lastJobLoadTime == 0) {
+        g_lastJobLoadTime = millis();
     }
 
     // 1) Firmware jobs (προτεραιότητα)
