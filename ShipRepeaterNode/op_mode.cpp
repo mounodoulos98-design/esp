@@ -1141,7 +1141,9 @@ void loopOperationalMode() {
     // Repeater uses continuous BLE beacon with light sleep (not deep sleep)
     // This allows collectors to find and wake it at any time
     if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
-      bleBeacon.begin(config.apSSID, config.nodeName, 0); // 0 = Repeater role
+      // Use actual AP SSID (same logic as ensureWiFiAPRepeater)
+      String actualAPSSID = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
+      bleBeacon.begin(actualAPSSID, config.nodeName, 0); // 0 = Repeater role
       bleBeacon.startAdvertising();
       Serial.println("[BLE-MESH] Repeater BLE beacon active (continuous with light sleep)");
     }
