@@ -42,6 +42,9 @@ void loadConfiguration() {
   if (preferences.begin(PREF_NAMESPACE, true)) {
     config.isConfigured = preferences.getBool("configured", false);
     if (config.isConfigured) {
+      config.apSSID = preferences.getString("apSSID", "");
+      config.apPASS = preferences.getString("apPASS", "");
+      config.apIP = preferences.getString("apIP", "");
       config.nodeName = preferences.getString("nodeName", "DefaultNode");
       config.role = preferences.getInt("role", ROLE_REPEATER);
       config.meshIntervalMin = preferences.getInt("meshInt", MESH_APPOINTMENT_INTERVAL_M);
