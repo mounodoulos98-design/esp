@@ -62,6 +62,17 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
         </div>
         <label for="collectorDataTimeoutSec">Data Timeout (sec):</label>
         <input type="number" id="collectorDataTimeoutSec" name="collectorDataTimeoutSec" value="120">
+        
+        <h3>BLE Parent Discovery</h3>
+        <div class="muted">Use BLE to find Repeater/Root before WiFi connection (power efficient)</div>
+        <label>
+          <input type="checkbox" id="bleBeaconEnabled" name="bleBeaconEnabled" value="1" checked>
+          Enable BLE scanning for parent discovery
+        </label>
+        <label for="bleScanDurationSec">BLE Scan Duration (sec):</label>
+        <input type="number" id="bleScanDurationSec" name="bleScanDurationSec" value="5" min="1" max="30">
+        <div class="muted">Recommended: 5 seconds. Longer = more reliable, higher power</div>
+        
         <h3>Uplink (Send Data To)</h3>
         <div class="row">
           <div style="flex:2">
@@ -83,6 +94,15 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
         <h3>Repeater Settings</h3>
         <label for="apSSID">Repeater AP SSID (for collectors):</label><input type="text" id="apSSID" name="apSSID" placeholder="Repeater_AP">
         <label for="apPASS">Repeater AP Password:</label><input type="text" id="apPASS" name="apPASS" placeholder="Password">
+        
+        <h3>BLE Beacon (for Child Discovery)</h3>
+        <div class="muted">Advertise BLE beacon so Collectors can find this Repeater</div>
+        <label>
+          <input type="checkbox" id="bleBeaconEnabled_r" name="bleBeaconEnabled" value="1" checked>
+          Enable BLE beacon advertising (continuous, light sleep)
+        </label>
+        <div class="muted">Power: ~20-30 mA. Allows instant wake-up when Collector connects.</div>
+        
         <h3>Uplink to Root</h3>
         <div class="row">
           <div style="flex:2">
@@ -105,6 +125,13 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
         <label for="apSSID_root">Root AP SSID:</label><input type="text" id="apSSID_root" name="apSSID" placeholder="Root_AP">
         <label for="apPASS_root">Root AP Password:</label><input type="text" id="apPASS_root" name="apPASS">
         <label for="uplinkPort_root">HTTP Port:</label><input type="number" id="uplinkPort_root" name="uplinkPort" value="8080">
+        
+        <h3>BLE Configuration</h3>
+        <div class="muted">Root is always on via WiFi. BLE beacon not needed.</div>
+        <label>
+          <input type="checkbox" id="bleBeaconEnabled_root" name="bleBeaconEnabled" value="0">
+          Enable BLE beacon (not recommended for Root)
+        </label>
       </div>
 
       <input type="submit" value="Save and Reboot">
@@ -216,6 +243,12 @@ void startConfigurationMode() {
       config.uplinkPASS = request->getParam("uplinkPASS",true)->value();
       config.uplinkHost = request->getParam("uplinkHost",true)->value();
       config.uplinkPort = request->getParam("uplinkPort",true)->value().toInt();
+      
+      // BLE configuration for Collector (scanning for parent)
+      config.bleBeaconEnabled = request->hasParam("bleBeaconEnabled",true);
+      if(request->hasParam("bleScanDurationSec",true)) {
+        config.bleScanDurationSec = request->getParam("bleScanDurationSec",true)->value().toInt();
+      }
     } else if(roleStr=="repeater"){
       config.role = ROLE_REPEATER;
       config.apSSID = request->getParam("apSSID",true)->value();
@@ -224,11 +257,17 @@ void startConfigurationMode() {
       config.uplinkPASS = request->getParam("uplinkPASS",true)->value();
       config.uplinkHost = request->getParam("uplinkHost",true)->value();
       config.uplinkPort = request->getParam("uplinkPort",true)->value().toInt();
+      
+      // BLE configuration for Repeater (beacon advertising)
+      config.bleBeaconEnabled = request->hasParam("bleBeaconEnabled",true);
     } else {
       config.role = ROLE_ROOT;
       config.apSSID = request->getParam("apSSID",true)->value();
       config.apPASS = request->getParam("apPASS",true)->value();
       config.uplinkPort = request->getParam("uplinkPort",true)->value().toInt();
+      
+      // BLE configuration for Root (typically disabled)
+      config.bleBeaconEnabled = request->hasParam("bleBeaconEnabled",true);
     }
 
     config.isConfigured = true;
