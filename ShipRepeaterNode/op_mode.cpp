@@ -348,7 +348,7 @@ void ensureWiFiAPRoot() {
 }
 
 // =============================
-// ROOT: HTTP Server (/health, /time, /ingest)
+// ROOT: HTTP Server (/health, /time, /ingest, /jobs, /firmware)
 // =============================
 static bool rootHttpActive = false;
 static AsyncWebServer rootServer(8080);
@@ -369,6 +369,50 @@ void ensureRootHttpServer() {
     req->send(200, "application/json", json);
   });
 
+  // Serve jobs files for collectors
+  rootServer.on("/jobs/config_jobs.json", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!initSdCard()) {
+      req->send(404, "text/plain", "SD card not available");
+      return;
+    }
+    String path = "/jobs/config_jobs.json";
+    if (sd.exists(path.c_str())) {
+      req->send(sd, path.c_str(), "application/json");
+      Serial.println("[ROOT] Served /jobs/config_jobs.json");
+    } else {
+      req->send(404, "text/plain", "File not found");
+    }
+  });
+
+  rootServer.on("/jobs/firmware_jobs.json", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!initSdCard()) {
+      req->send(404, "text/plain", "SD card not available");
+      return;
+    }
+    String path = "/jobs/firmware_jobs.json";
+    if (sd.exists(path.c_str())) {
+      req->send(sd, path.c_str(), "application/json");
+      Serial.println("[ROOT] Served /jobs/firmware_jobs.json");
+    } else {
+      req->send(404, "text/plain", "File not found");
+    }
+  });
+
+  // Serve firmware hex files
+  rootServer.on("/firmware/*", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!initSdCard()) {
+      req->send(404, "text/plain", "SD card not available");
+      return;
+    }
+    String path = req->url();
+    if (sd.exists(path.c_str())) {
+      req->send(sd, path.c_str(), "application/octet-stream");
+      Serial.printf("[ROOT] Served %s\n", path.c_str());
+    } else {
+      req->send(404, "text/plain", "File not found");
+    }
+  });
+
   // Multipart/form-data upload to /ingest
   rootServer.on(
     "/ingest", HTTP_POST,
@@ -381,17 +425,19 @@ void ensureRootHttpServer() {
         snprintf(name, sizeof(name), "%lu_", (unsigned long)millis());
         current = String(RECEIVED_DIR) + "/" + name + filename;
         upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+        Serial.printf("[ROOT] Receiving file: %s\n", current.c_str());
       }
       if (upFile) { upFile.write(data, len); }
       if (final) {
         if (upFile) upFile.close();
         request->send(200, "text/plain", "OK");
+        Serial.printf("[ROOT] Saved file: %s\n", current.c_str());
       }
     });
 
   rootServer.begin();
   rootHttpActive = true;
-  Serial.println("[ROOT] HTTP server started on :8080 (/health, /time, /ingest)");
+  Serial.println("[ROOT] HTTP server started on :8080 (/health, /time, /ingest, /jobs, /firmware)");
 }
 
 void ensureWiFiAPRepeater() {
@@ -542,15 +588,152 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
   return true;
 }
 
+// Collector: Download file from root server
+// =============================
+bool downloadFileFromRoot(const String& remotePath, const String& localPath) {
+  if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("[DOWNLOAD] Connecting STA to %s...\n", config.uplinkSSID.c_str());
+    WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(200); }
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[DOWNLOAD] STA connect failed");
+    return false;
+  }
+
+  WiFiClient client;
+  Serial.printf("[DOWNLOAD] Fetching http://%s:%d%s...\n", 
+                config.uplinkHost.c_str(), config.uplinkPort, remotePath.c_str());
+  
+  if (!client.connect(config.uplinkHost.c_str(), config.uplinkPort)) {
+    Serial.println("[DOWNLOAD] Connect failed");
+    return false;
+  }
+
+  String request = String("GET ") + remotePath + " HTTP/1.1\r\n";
+  request += "Host: " + config.uplinkHost + "\r\n";
+  request += "Connection: close\r\n\r\n";
+  client.print(request);
+
+  // Wait for response
+  unsigned long t0 = millis();
+  while (client.connected() && !client.available() && millis() - t0 < 5000) {
+    delay(10);
+  }
+  
+  if (!client.available()) {
+    Serial.println("[DOWNLOAD] No response");
+    client.stop();
+    return false;
+  }
+
+  // Read headers
+  String line;
+  int contentLength = -1;
+  bool is404 = false;
+  while (client.available()) {
+    line = client.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("HTTP/")) {
+      if (line.indexOf("404") > 0) is404 = true;
+    }
+    if (line.startsWith("Content-Length:")) {
+      contentLength = line.substring(15).toInt();
+    }
+    if (line.length() == 0) break; // End of headers
+  }
+
+  if (is404) {
+    Serial.printf("[DOWNLOAD] File not found: %s\n", remotePath.c_str());
+    client.stop();
+    return false;
+  }
+
+  // Download body to file
+  if (!initSdCard()) {
+    client.stop();
+    return false;
+  }
+
+  // Ensure directory exists
+  int lastSlash = localPath.lastIndexOf('/');
+  if (lastSlash > 0) {
+    String dir = localPath.substring(0, lastSlash);
+    ensureDir(dir.c_str());
+  }
+
+  FsFile f = sd.open(localPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+  if (!f) {
+    Serial.printf("[DOWNLOAD] Cannot create %s\n", localPath.c_str());
+    client.stop();
+    return false;
+  }
+
+  int bytesReceived = 0;
+  while (client.connected() || client.available()) {
+    if (client.available()) {
+      uint8_t buf[512];
+      int len = client.read(buf, sizeof(buf));
+      if (len > 0) {
+        f.write(buf, len);
+        bytesReceived += len;
+      }
+    }
+    delay(1);
+  }
+  
+  f.close();
+  client.stop();
+  
+  Serial.printf("[DOWNLOAD] Downloaded %s (%d bytes) -> %s\n", 
+                remotePath.c_str(), bytesReceived, localPath.c_str());
+  return bytesReceived > 0;
+}
+
+// Collector: Sync jobs from root
+// =============================
+static void syncJobsFromRoot() {
+  if (config.role != ROLE_COLLECTOR) return;
+  
+  Serial.println("[SYNC] Syncing jobs from root...");
+  
+  // Download config jobs
+  bool cfgOk = downloadFileFromRoot("/jobs/config_jobs.json", "/jobs/config_jobs.json");
+  if (cfgOk) {
+    Serial.println("[SYNC] Config jobs updated");
+  }
+  
+  // Download firmware jobs
+  bool fwOk = downloadFileFromRoot("/jobs/firmware_jobs.json", "/jobs/firmware_jobs.json");
+  if (fwOk) {
+    Serial.println("[SYNC] Firmware jobs updated");
+  }
+  
+  // Reset job cache to force reload
+  resetJobCache();
+}
+
+// Collector: Upload queue and sync jobs
+// =============================
 void processQueue() {
   // For COLLECTOR: uplink via HTTP
   if (config.role == ROLE_COLLECTOR) {
     String oldest;
-    if (!findOldestQueueFile(oldest)) return;
+    if (!findOldestQueueFile(oldest)) {
+      // No files in queue - sync jobs from root
+      syncJobsFromRoot();
+      return;
+    }
+    
     if (!initSdCard()) return;
     String base = oldest.substring(String(QUEUE_DIR).length() + 1);
     bool ok = uploadFileToRoot(oldest, base);
-    if (ok && initSdCard()) { sd.remove(oldest.c_str()); }
+    if (ok && initSdCard()) { 
+      sd.remove(oldest.c_str());
+      Serial.printf("[QUEUE] Removed uploaded file: %s\n", oldest.c_str());
+    }
     return;
   }
 }

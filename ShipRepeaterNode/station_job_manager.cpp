@@ -194,6 +194,22 @@ bool processJobsForSN(const String& sn, const String& ip) {
                         fw.totalTimeoutMs = jobObj["timeout_ms"] | (8UL * 60UL * 1000UL);
 
                         Serial.printf("[JOBS] Found FW job for SN=%s\n", sn.c_str());
+                        
+                        // For COLLECTOR: ensure firmware file is downloaded from root
+                        extern NodeConfig config;
+                        extern bool downloadFileFromRoot(const String& remotePath, const String& localPath);
+                        if (config.role == ROLE_COLLECTOR) {
+                            if (!sd.exists(fw.hexPath.c_str())) {
+                                Serial.printf("[JOBS] Firmware file not found, downloading from root: %s\n", fw.hexPath.c_str());
+                                bool downloaded = downloadFileFromRoot(fw.hexPath, fw.hexPath);
+                                if (!downloaded) {
+                                    Serial.printf("[JOBS] FAIL: Cannot download firmware file %s\n", fw.hexPath.c_str());
+                                    return false;
+                                }
+                                Serial.printf("[JOBS] Firmware file downloaded successfully\n");
+                            }
+                        }
+                        
                         bool ok = executeFirmwareJob(fw);
                         Serial.printf("[JOBS] FW job result for SN=%s -> %s\n",
                                       sn.c_str(), ok ? "OK" : "FAIL");
@@ -268,6 +284,11 @@ void sjm_resetJobCache() {
     g_cfgJobsCache.clear();
     g_lastJobLoadTime = 0;
     Serial.println("[JOBS] Cache reset");
+}
+
+// Alias for compatibility
+void resetJobCache() {
+    sjm_resetJobCache();
 }
 
 // ---------------------
