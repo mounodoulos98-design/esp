@@ -20,13 +20,26 @@ public:
         Serial.println("[BLE-BEACON] Initializing BLE Beacon...");
         
         // Initialize BLE
-        BLEDevice::init(nodeName.c_str());
+        try {
+            BLEDevice::init(nodeName.c_str());
+        } catch (...) {
+            Serial.println("[BLE-BEACON] ERROR: Failed to initialize BLE");
+            return;
+        }
         
         // Create BLE Server (needed for advertising)
         pServer = BLEDevice::createServer();
+        if (!pServer) {
+            Serial.println("[BLE-BEACON] ERROR: Failed to create BLE server");
+            return;
+        }
         
         // Get advertising object
         pAdvertising = BLEDevice::getAdvertising();
+        if (!pAdvertising) {
+            Serial.println("[BLE-BEACON] ERROR: Failed to get advertising object");
+            return;
+        }
         
         // Add service UUID to advertisement
         pAdvertising->addServiceUUID(BLE_MESH_SERVICE_UUID);
@@ -99,10 +112,21 @@ public:
         String address;
     };
 
-    void begin() {
+    void begin(const String& scannerName = "MeshScanner") {
         Serial.println("[BLE-SCAN] Initializing BLE Scanner...");
-        BLEDevice::init("MeshScanner");  // Descriptive name for debugging
+        try {
+            BLEDevice::init(scannerName.c_str());  // Use unique name for debugging
+        } catch (...) {
+            Serial.println("[BLE-SCAN] ERROR: Failed to initialize BLE");
+            return;
+        }
+        
         pBLEScan = BLEDevice::getScan();
+        if (!pBLEScan) {
+            Serial.println("[BLE-SCAN] ERROR: Failed to get BLE scan object");
+            return;
+        }
+        
         pBLEScan->setActiveScan(true);
         pBLEScan->setInterval(100);
         pBLEScan->setWindow(99);

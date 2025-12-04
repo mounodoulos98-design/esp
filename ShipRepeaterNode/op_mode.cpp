@@ -1037,9 +1037,11 @@ void decideAndGoToSleep() {
       sleep_for = time_to_next_ap;
     }
   } else if (config.role == ROLE_REPEATER) {
-    // REPEATER → stays awake with light sleep and BLE beacon active
+    // REPEATER → stays awake with BLE beacon active
     // Don't go to deep sleep - allows instant wake-up by collectors
-    Serial.println("[SCHEDULER] Repeater stays active with BLE beacon (light sleep mode)");
+    // Note: Light sleep is managed by the Arduino/ESP-IDF framework automatically
+    // when CPU is idle. BLE beacon continues advertising during light sleep.
+    Serial.println("[SCHEDULER] Repeater stays active with BLE beacon (automatic light sleep)");
     return; // Don't call goToDeepSleep
   } else {
     // ROOT → always on, should never reach here
@@ -1400,7 +1402,8 @@ void loopOperationalMode() {
           // BLE Scan for parent discovery (Collector/Repeater finding their parent)
           if (config.bleBeaconEnabled && !bleScanned) {
             Serial.println("[BLE-MESH] Scanning for parent node...");
-            bleScanner.begin();
+            String scannerName = config.nodeName + "_Scanner";
+            bleScanner.begin(scannerName);
             BLEScannerManager::ScanResult result = bleScanner.scanForParent(config.bleScanDurationSec);
             bleScanner.stop();
             bleScanned = true;
