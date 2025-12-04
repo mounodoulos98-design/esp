@@ -6,7 +6,6 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLEAdvertising.h>
-#include <BLEAdvertisementData.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 
