@@ -1141,7 +1141,7 @@ void loopOperationalMode() {
     // Repeater uses continuous BLE beacon with light sleep (not deep sleep)
     // This allows collectors to find and wake it at any time
     if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
-      bleBeacon.begin(config.nodeName, 0); // 0 = Repeater role
+      bleBeacon.begin(config.apSSID, config.nodeName, 0); // 0 = Repeater role
       bleBeacon.startAdvertising();
       Serial.println("[BLE-MESH] Repeater BLE beacon active (continuous with light sleep)");
     }
@@ -1469,12 +1469,13 @@ void loopOperationalMode() {
             bleScanned = true;
             
             if (result.found) {
-              Serial.printf("[BLE-MESH] Found parent: %s (Role: %s, RSSI: %d dBm)\n",
-                           result.nodeName.c_str(),
+              Serial.printf("[BLE-MESH] Found parent SSID: %s (Role: %s, RSSI: %d dBm)\n",
+                           result.apSSID.c_str(),
                            result.nodeRole == 1 ? "Root" : "Repeater",
                            result.rssi);
-              // Parent is now discoverable, proceed to connect via WiFi
-              // The BLE discovery confirms the parent is awake and ready
+              // Override uplinkSSID with discovered AP SSID from BLE
+              config.uplinkSSID = result.apSSID;
+              Serial.printf("[BLE-MESH] Using discovered AP SSID for WiFi: %s\n", config.uplinkSSID.c_str());
             } else {
               Serial.println("[BLE-MESH] No parent found via BLE, proceeding with configured uplink");
             }
