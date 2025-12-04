@@ -33,8 +33,8 @@ public:
         
         // Set advertising parameters
         pAdvertising->setScanResponse(true);
-        pAdvertising->setMinPreferred(0x06);
-        pAdvertising->setMinPreferred(0x12);
+        pAdvertising->setMinPreferred(0x06);  // Min connection interval
+        pAdvertising->setMaxPreferred(0x12);  // Max connection interval
         
         // Add manufacturer data with node role
         // Format: [role_byte, name_bytes...]
@@ -101,7 +101,7 @@ public:
 
     void begin() {
         Serial.println("[BLE-SCAN] Initializing BLE Scanner...");
-        BLEDevice::init("");
+        BLEDevice::init("MeshScanner");  // Descriptive name for debugging
         pBLEScan = BLEDevice::getScan();
         pBLEScan->setActiveScan(true);
         pBLEScan->setInterval(100);

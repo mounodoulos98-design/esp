@@ -1036,10 +1036,15 @@ void decideAndGoToSleep() {
       rtc_next_state = STATE_COLLECTOR_AP;
       sleep_for = time_to_next_ap;
     }
+  } else if (config.role == ROLE_REPEATER) {
+    // REPEATER → stays awake with light sleep and BLE beacon active
+    // Don't go to deep sleep - allows instant wake-up by collectors
+    Serial.println("[SCHEDULER] Repeater stays active with BLE beacon (light sleep mode)");
+    return; // Don't call goToDeepSleep
   } else {
-    // REPEATER or ROOT → focus on uplink cadence
-    rtc_next_state = STATE_MESH_APPOINTMENT;
-    sleep_for = time_to_next_uplink;
+    // ROOT → always on, should never reach here
+    Serial.println("[SCHEDULER] Root should always be active");
+    return;
   }
 
   goToDeepSleep(sleep_for);
@@ -1056,11 +1061,7 @@ void loopOperationalMode() {
     ensureWiFiAPRoot();
     ensureRootHttpServer();
     
-    // Start BLE beacon for parent discovery (Root is always on)
-    if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
-      bleBeacon.begin(config.nodeName, 1); // 1 = Root role
-      bleBeacon.startAdvertising();
-    }
+    // Root doesn't need BLE - always on and accessible via WiFi
     
     static unsigned long lastPrint = 0;
     if (millis() - lastPrint > 10000) {
@@ -1075,10 +1076,12 @@ void loopOperationalMode() {
     ensureWiFiAPRepeater();
     ensureRepeaterHttpServer();
     
-    // Start BLE beacon for parent discovery (Repeater advertises when awake)
+    // Repeater uses continuous BLE beacon with light sleep (not deep sleep)
+    // This allows collectors to find and wake it at any time
     if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
       bleBeacon.begin(config.nodeName, 0); // 0 = Repeater role
       bleBeacon.startAdvertising();
+      Serial.println("[BLE-MESH] Repeater BLE beacon active (continuous with light sleep)");
     }
     
     static bool tried = false;
@@ -1086,7 +1089,8 @@ void loopOperationalMode() {
       tried = true;
       syncTimeFromUplink(5000);
     }
-    // keep idle; scheduling handled by decideAndGoToSleep()
+    // Repeater stays in light sleep with BLE beacon active
+    // No deep sleep - allows instant wake-up when collector connects
   }
 
   // NON-ROOT STATE MACHINE

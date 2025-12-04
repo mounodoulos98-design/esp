@@ -2,7 +2,7 @@
 
 ## Overview
 
-The BLE (Bluetooth Low Energy) mesh wake-up system enables efficient power management in the mesh network by allowing child nodes (Collectors and Repeaters) to discover and wake up their parent nodes before establishing WiFi connections.
+The BLE (Bluetooth Low Energy) mesh wake-up system enables efficient power management in the mesh network by allowing child nodes (Collectors) to discover and wake up their parent nodes (Repeaters) before establishing WiFi connections.
 
 ## Architecture
 
@@ -10,19 +10,22 @@ The BLE (Bluetooth Low Energy) mesh wake-up system enables efficient power manag
 
 1. **Root Node**
    - Always powered on
-   - Acts as BLE beacon (advertises continuously)
+   - **No BLE beacon** - always accessible via WiFi
    - Receives data from Repeaters and Collectors
    - Provides jobs and firmware updates
 
 2. **Repeater Node**
-   - Sleeps between scheduled windows
-   - Acts as BLE beacon when awake (advertises itself)
-   - Scans for parent (Root or another Repeater) before connecting
+   - **Light sleep with continuous BLE beacon** (not deep sleep)
+   - Acts as BLE beacon continuously (advertises itself 24/7)
+   - Allows instant wake-up when Collector needs to connect
    - Forwards data from Collectors to Root
 
 3. **Collector Node**
-   - Sleeps between sensor collection and uplink windows
-   - Scans for parent (Repeater or Root) before connecting
+   - Deep sleep between sensor collection and uplink windows
+   - Scans for parent (Repeater) via BLE before connecting
+   - Two modes:
+     - **Scheduled uplink**: Wake at scheduled time, scan for parent, connect
+     - **On-demand**: Light sleep + scan until parent found, then wake and send
    - Collects sensor data via WiFi AP
    - Sends data to parent via WiFi mesh
 
@@ -70,23 +73,23 @@ The BLE wake-up mechanism provides several power benefits:
 │                         ROOT NODE                            │
 │  - Always ON                                                 │
 │  - WiFi AP active                                            │
-│  - BLE Beacon advertising (Role: 1)                          │
+│  - NO BLE beacon (always accessible via WiFi)                │
 └─────────────────────────────────────────────────────────────┘
                               ▲
-                              │ BLE scan discovers Root
                               │ WiFi connection established
+                              │ (no BLE scan needed)
                               │
 ┌─────────────────────────────────────────────────────────────┐
 │                       REPEATER NODE                          │
-│  Cycle:                                                      │
-│  1. Wake up on schedule                                      │
-│  2. Start WiFi AP                                            │
-│  3. Start BLE Beacon advertising (Role: 0)                   │
-│  4. Scan for parent (Root) via BLE                           │
-│  5. Connect to parent via WiFi                               │
-│  6. Forward collected data                                   │
-│  7. Stop BLE beacon                                          │
-│  8. Go to deep sleep                                         │
+│  Continuous Operation:                                       │
+│  1. WiFi AP always active                                    │
+│  2. BLE Beacon advertising continuously (Role: 0)            │
+│  3. Light sleep mode (instant wake-up)                       │
+│  4. When Collector connects:                                 │
+│     - Wake from light sleep                                  │
+│     - Receive data via WiFi                                  │
+│     - Forward to Root                                        │
+│     - Return to light sleep with BLE active                  │
 └─────────────────────────────────────────────────────────────┘
                               ▲
                               │ BLE scan discovers Repeater
@@ -94,20 +97,27 @@ The BLE wake-up mechanism provides several power benefits:
                               │
 ┌─────────────────────────────────────────────────────────────┐
 │                      COLLECTOR NODE                          │
-│  Cycle:                                                      │
+│  Sensor Collection Cycle:                                    │
 │  1. Wake up for sensor collection                            │
 │  2. Start WiFi AP for sensors                                │
 │  3. Collect sensor data                                      │
 │  4. Store data to SD card                                    │
 │  5. Go to deep sleep                                         │
 │                                                              │
-│  Uplink Cycle:                                               │
+│  Uplink Cycle (Scheduled):                                   │
 │  1. Wake up on schedule                                      │
-│  2. Scan for parent (Repeater/Root) via BLE                  │
+│  2. Scan for parent (Repeater) via BLE                       │
 │  3. Connect to parent via WiFi                               │
 │  4. Upload queued data                                       │
 │  5. Receive jobs/firmware                                    │
 │  6. Go to deep sleep                                         │
+│                                                              │
+│  Uplink Cycle (On-Demand):                                   │
+│  1. Enter light sleep after data collection                  │
+│  2. Scan for parent (Repeater) via BLE                       │
+│  3. When found, connect via WiFi                             │
+│  4. Upload data immediately                                  │
+│  5. Go to deep sleep                                         │
 └─────────────────────────────────────────────────────────────┘
                               ▲
                               │ WiFi AP connection
@@ -131,11 +141,11 @@ config.bleScanDurationSec = 5;   // BLE scan duration in seconds
 
 ### BLE Beacon Behavior by Role
 
-| Role      | Advertises BLE Beacon | Scans for Parent |
-|-----------|----------------------|------------------|
-| Root      | ✅ Always            | ❌ No            |
-| Repeater  | ✅ When awake        | ✅ Yes           |
-| Collector | ❌ No                | ✅ Yes           |
+| Role      | Advertises BLE Beacon | Scans for Parent | Sleep Mode    |
+|-----------|----------------------|------------------|---------------|
+| Root      | ❌ No                | ❌ No            | Always awake  |
+| Repeater  | ✅ Continuously      | ❌ No            | Light sleep   |
+| Collector | ❌ No                | ✅ Yes           | Deep sleep    |
 
 ## Implementation Details
 
