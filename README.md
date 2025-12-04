@@ -51,6 +51,7 @@ First boot will enter Configuration Mode. Set up the node role:
 
 - **[ASYNC_SENSOR_FLOW.md](ASYNC_SENSOR_FLOW.md)** - Complete async communication flow with diagrams
 - **[BLE_MESH_WAKEUP.md](BLE_MESH_WAKEUP.md)** - BLE mesh wake-up system for parent discovery
+- **[BLE_TESTING_GUIDE.md](BLE_TESTING_GUIDE.md)** - Step-by-step BLE testing and configuration guide
 - **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)** - Detailed implementation and design decisions  
 - **[EXAMPLE_JOB_FILES.md](EXAMPLE_JOB_FILES.md)** - Example job files and testing guide
 - **[README_FIXES.txt](ShipRepeaterNode/README_FIXES.txt)** - Build and timing fixes
