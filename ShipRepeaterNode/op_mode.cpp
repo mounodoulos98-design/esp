@@ -1087,6 +1087,9 @@ void loopOperationalMode() {
               // Log only start and completion to reduce Serial verbosity
               static std::map<AsyncWebServerRequest*, bool> measureStartLogged;
               
+              // Update activity timestamp on EVERY chunk to prevent timeout during long uploads
+              lastActivityMillis = millis();
+              
               if (index == 0) {
                 // First chunk - log start with sensor info
                 IPAddress remoteIp = request->client()->remoteIP();
@@ -1103,7 +1106,6 @@ void loopOperationalMode() {
                              remoteIp.toString().c_str(), total);
                 measureStartLogged.erase(request);
                 request->send(200, "text/plain", "OK");
-                lastActivityMillis = millis();
               }
             }
           );
@@ -1132,27 +1134,18 @@ void loopOperationalMode() {
         
         // If sensors are connected, check for ANY activity (not just heartbeats)
         if (numConnected > 0) {
-          // Consider BOTH heartbeat activity AND general activity (data transfers, status, etc)
-          unsigned long timeSinceLastHeartbeat = (lastHeartbeatMillis > 0) ? (millis() - lastHeartbeatMillis) : ULONG_MAX;
+          // Track general activity (data transfers, status, heartbeats)
           unsigned long timeSinceLastActivity = millis() - lastActivityMillis;
           
-          // Use the most recent activity (heartbeat or data transfer)
-          unsigned long timeSinceAnyActivity = min(timeSinceLastHeartbeat, timeSinceLastActivity);
-          
-          // If no activity (heartbeat OR data transfer) for 15+ seconds, go to sleep
-          if (timeSinceAnyActivity > ACTIVITY_INACTIVITY_TIMEOUT) {
+          // If no activity for 15+ seconds, go to sleep
+          if (timeSinceLastActivity > ACTIVITY_INACTIVITY_TIMEOUT) {
             Serial.printf("[AP] %d sensor(s) connected but no activity for %lu sec, entering sleep.\n",
-                         numConnected, timeSinceAnyActivity / 1000);
+                         numConnected, timeSinceLastActivity / 1000);
             if (hadStation)
               Serial.println("[AP] Inactivity timeout reached.");
             stopAPMode();
             decideAndGoToSleep();
             break;
-          }
-          
-          // If any activity is recent, keep extending the window
-          if (timeSinceAnyActivity < ACTIVITY_CHECK_INTERVAL) {
-            lastActivityMillis = millis(); // Keep extending as long as ANY activity happens
           }
         }
         
