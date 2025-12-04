@@ -1080,13 +1080,16 @@ void loopOperationalMode() {
             "/api/measure",
             HTTP_POST,
             [](AsyncWebServerRequest *request) {
-              request->send(400, "text/plain", "Expected binary data");
+              // This is called AFTER all body chunks are received
+              IPAddress remoteIp = request->client()->remoteIP();
+              Serial.printf("[HB-LEGACY] POST /api/measure completed from IP=%s\n", 
+                           remoteIp.toString().c_str());
+              request->send(200, "text/plain", "OK");
+              lastActivityMillis = millis();
             },
             nullptr,
             [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-              // Log only start and completion to reduce Serial verbosity
-              static std::map<AsyncWebServerRequest*, bool> measureStartLogged;
-              
+              // This is called for each chunk of data received
               // Update activity timestamp on EVERY chunk to prevent timeout during long uploads
               lastActivityMillis = millis();
               
@@ -1095,18 +1098,10 @@ void loopOperationalMode() {
                 IPAddress remoteIp = request->client()->remoteIP();
                 Serial.printf("[HB-LEGACY] POST /api/measure started from IP=%s (total=%d bytes)\n", 
                              remoteIp.toString().c_str(), total);
-                measureStartLogged[request] = true;
               }
               
-              // Accept measurement data
-              if (index + len >= total) {
-                // Last chunk - log completion
-                IPAddress remoteIp = request->client()->remoteIP();
-                Serial.printf("[HB-LEGACY] POST /api/measure completed from IP=%s (%d bytes received)\n", 
-                             remoteIp.toString().c_str(), total);
-                measureStartLogged.erase(request);
-                request->send(200, "text/plain", "OK");
-              }
+              // Just receive the data - don't send response here
+              // The response is sent in the main handler above after all chunks are received
             }
           );
 
