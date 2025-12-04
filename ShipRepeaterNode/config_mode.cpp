@@ -188,7 +188,53 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
       document.getElementById('repeaterSettings').style.display = (role==='repeater')?'block':'none';
       document.getElementById('rootSettings').style.display = (role==='root')?'block':'none';
     }
-    window.addEventListener('load', toggleRoleFields);
+    
+    // Handle form submission with visual feedback
+    document.addEventListener('DOMContentLoaded', function() {
+      toggleRoleFields();
+      
+      const form = document.querySelector('form');
+      const submitBtn = document.querySelector('input[type="submit"]');
+      
+      form.addEventListener('submit', async function(e) {
+        e.preventDefault();
+        
+        // Disable button and show progress
+        submitBtn.disabled = true;
+        submitBtn.value = 'Saving...';
+        submitBtn.style.backgroundColor = '#999';
+        
+        try {
+          const formData = new FormData(form);
+          const response = await fetch('/save', {
+            method: 'POST',
+            body: formData
+          });
+          
+          if (response.ok) {
+            submitBtn.value = 'Saved! Rebooting...';
+            submitBtn.style.backgroundColor = '#4CAF50';
+            alert('Configuration saved successfully! Device will reboot now.');
+            // Give time for user to see the message
+            setTimeout(() => {
+              // Try to reconnect after reboot (30 seconds)
+              setTimeout(() => {
+                window.location.reload();
+              }, 30000);
+            }, 2000);
+          } else {
+            const error = await response.text();
+            throw new Error(error || 'Save failed');
+          }
+        } catch (error) {
+          console.error('Save error:', error);
+          alert('Error saving configuration: ' + error.message);
+          submitBtn.disabled = false;
+          submitBtn.value = 'Save and Reboot';
+          submitBtn.style.backgroundColor = '#4CAF50';
+        }
+      });
+    });
   </script>
 </body>
 </html>
@@ -240,50 +286,67 @@ void startConfigurationMode() {
   });
 
   server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request){
+    Serial.println("[CONFIG] Received save request");
+    
+    // Validate required parameters
+    if(!request->hasParam("nodeName",true) || !request->hasParam("role",true)) {
+      Serial.println("[CONFIG] ERROR: Missing required parameters");
+      request->send(400,"text/plain","ERROR: Missing node name or role");
+      return;
+    }
+    
     config.nodeName = request->getParam("nodeName",true)->value();
     String roleStr = request->getParam("role",true)->value();
+    Serial.printf("[CONFIG] Role: %s, Name: %s\n", roleStr.c_str(), config.nodeName.c_str());
 
     if(roleStr=="collector"){
       config.role = ROLE_COLLECTOR;
-      config.sensorAP_SSID = request->getParam("sensorAP_SSID",true)->value();
-      config.collectorApCycleSec = request->getParam("collectorApCycleSec",true)->value().toInt();
-      config.collectorApWindowSec = request->getParam("collectorApWindowSec",true)->value().toInt();
-      config.collectorDataTimeoutSec = request->getParam("collectorDataTimeoutSec",true)->value().toInt();
-      config.uplinkSSID = request->getParam("uplinkSSID",true)->value();
-      config.uplinkPASS = request->getParam("uplinkPASS",true)->value();
-      config.uplinkHost = request->getParam("uplinkHost",true)->value();
-      config.uplinkPort = request->getParam("uplinkPort",true)->value().toInt();
+      if(request->hasParam("sensorAP_SSID",true)) config.sensorAP_SSID = request->getParam("sensorAP_SSID",true)->value();
+      if(request->hasParam("collectorApCycleSec",true)) config.collectorApCycleSec = request->getParam("collectorApCycleSec",true)->value().toInt();
+      if(request->hasParam("collectorApWindowSec",true)) config.collectorApWindowSec = request->getParam("collectorApWindowSec",true)->value().toInt();
+      if(request->hasParam("collectorDataTimeoutSec",true)) config.collectorDataTimeoutSec = request->getParam("collectorDataTimeoutSec",true)->value().toInt();
+      if(request->hasParam("uplinkSSID",true)) config.uplinkSSID = request->getParam("uplinkSSID",true)->value();
+      if(request->hasParam("uplinkPASS",true)) config.uplinkPASS = request->getParam("uplinkPASS",true)->value();
+      if(request->hasParam("uplinkHost",true)) config.uplinkHost = request->getParam("uplinkHost",true)->value();
+      if(request->hasParam("uplinkPort",true)) config.uplinkPort = request->getParam("uplinkPort",true)->value().toInt();
       
       // BLE configuration for Collector (scanning for parent)
       config.bleBeaconEnabled = request->hasParam("bleBeaconEnabled",true);
       if(request->hasParam("bleScanDurationSec",true)) {
         config.bleScanDurationSec = request->getParam("bleScanDurationSec",true)->value().toInt();
       }
+      Serial.printf("[CONFIG] Collector config: BLE=%d, Scan=%ds\n", config.bleBeaconEnabled, config.bleScanDurationSec);
     } else if(roleStr=="repeater"){
       config.role = ROLE_REPEATER;
-      config.apSSID = request->getParam("apSSID",true)->value();
-      config.apPASS = request->getParam("apPASS",true)->value();
-      config.uplinkSSID = request->getParam("uplinkSSID",true)->value();
-      config.uplinkPASS = request->getParam("uplinkPASS",true)->value();
-      config.uplinkHost = request->getParam("uplinkHost",true)->value();
-      config.uplinkPort = request->getParam("uplinkPort",true)->value().toInt();
+      if(request->hasParam("apSSID",true)) config.apSSID = request->getParam("apSSID",true)->value();
+      if(request->hasParam("apPASS",true)) config.apPASS = request->getParam("apPASS",true)->value();
+      if(request->hasParam("uplinkSSID",true)) config.uplinkSSID = request->getParam("uplinkSSID",true)->value();
+      if(request->hasParam("uplinkPASS",true)) config.uplinkPASS = request->getParam("uplinkPASS",true)->value();
+      if(request->hasParam("uplinkHost",true)) config.uplinkHost = request->getParam("uplinkHost",true)->value();
+      if(request->hasParam("uplinkPort",true)) config.uplinkPort = request->getParam("uplinkPort",true)->value().toInt();
       
       // BLE configuration for Repeater (beacon advertising)
       config.bleBeaconEnabled = request->hasParam("bleBeaconEnabled",true);
+      Serial.printf("[CONFIG] Repeater config: BLE=%d\n", config.bleBeaconEnabled);
     } else {
       config.role = ROLE_ROOT;
-      config.apSSID = request->getParam("apSSID",true)->value();
-      config.apPASS = request->getParam("apPASS",true)->value();
-      config.uplinkPort = request->getParam("uplinkPort",true)->value().toInt();
+      if(request->hasParam("apSSID",true)) config.apSSID = request->getParam("apSSID",true)->value();
+      if(request->hasParam("apPASS",true)) config.apPASS = request->getParam("apPASS",true)->value();
+      if(request->hasParam("uplinkPort",true)) config.uplinkPort = request->getParam("uplinkPort",true)->value().toInt();
       
       // BLE configuration for Root (typically disabled)
       config.bleBeaconEnabled = request->hasParam("bleBeaconEnabled",true);
+      Serial.printf("[CONFIG] Root config: BLE=%d\n", config.bleBeaconEnabled);
     }
 
     config.isConfigured = true;
+    Serial.println("[CONFIG] Saving configuration to flash...");
     saveConfiguration();
+    
     time_t now; time(&now);
     if(now>1700000000) persistRtcTime(now);
+    
+    Serial.println("[CONFIG] Sending success response and rebooting...");
     request->send(200,"text/plain","Settings saved. Rebooting...");
     delay(1000);
     ESP.restart();
