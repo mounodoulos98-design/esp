@@ -26,9 +26,7 @@ bool cu_sendConfiguration(const ConfigJob& job)
         query += String(key) + "=" + value + "&";
     }
 
-    // 2-second wait before sending, mirroring python daemon's "wait_for_commands" behavior
-    delay(2000);
-
+    // Simple HTTP GET with 5-second timeout (matching Python daemon)
     WiFiClient client;
     String request =
         String("GET ") + query + " HTTP/1.1\r\n" +
@@ -45,6 +43,7 @@ bool cu_sendConfiguration(const ConfigJob& job)
 
     client.print(request);
 
+    // Wait for response with 5-second timeout (matching Python daemon)
     unsigned long start = millis();
     String response;
     while (millis() - start < 5000UL) {
@@ -52,22 +51,25 @@ bool cu_sendConfiguration(const ConfigJob& job)
             char c = client.read();
             response += c;
         }
-        if (!client.connected()) break;
-        delay(1);
+        if (!client.connected() && response.length() > 0) break;
+        delay(10);
     }
     client.stop();
 
+    // Extract body from response
     int headerEnd = response.indexOf("\r\n\r\n");
     String body = (headerEnd >= 0) ? response.substring(headerEnd + 4) : response;
 
-    Serial.println("[CONFIG] Response body:");
-    Serial.println(body);
-
-    if (body.indexOf("OK") >= 0) {
-        Serial.println("[CONFIG] SUCCESS (OK found in response)");
-        return true;
+    // Log response but don't fail based on it (matching Python daemon behavior)
+    // Python daemon logs the response but always clears the flag regardless
+    if (body.length() > 0) {
+        Serial.println("[CONFIG] Response:");
+        Serial.println(body);
+    } else {
+        Serial.println("[CONFIG] No response body received");
     }
 
-    Serial.println("[CONFIG] FAILED (no OK in response)");
-    return false;
+    // Always return true - config was sent (Python daemon behavior)
+    // If sensor is busy (uploading data), it will get the config on next attempt
+    return true;
 }

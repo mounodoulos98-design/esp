@@ -19,6 +19,13 @@ static std::vector<PendingStation> g_stations;
 static const char* FW_JOBS_PATH  = "/jobs/firmware_jobs.json";
 static const char* CFG_JOBS_PATH = "/jobs/config_jobs.json";
 
+// Job cache to avoid re-reading JSON on every heartbeat
+static StaticJsonDocument<16384> g_fwJobsCache;
+static StaticJsonDocument<16384> g_cfgJobsCache;
+static bool g_fwJobsCached = false;
+static bool g_cfgJobsCached = false;
+static unsigned long g_lastJobLoadTime = 0;
+
 // ---------------------
 // Helper για SD + JSON
 // ---------------------
@@ -58,7 +65,7 @@ static bool writeJsonFile(const char* path, StaticJsonDocument<16384>& doc) {
 //   - GET /api?command=STATUS&datetime=<ms>&
 //   - Παίρνουμε S/N από το body
 // ---------------------
-static bool sjm_requestStatus(const String& ip, String& snOut) {
+bool sjm_requestStatus(const String& ip, String& snOut) {
     if (ip.length() == 0 || ip == "0.0.0.0") return false;
 
     // Wait 2s πριν το STATUS, όπως ο daemon
@@ -133,17 +140,47 @@ static bool sjm_requestStatus(const String& ip, String& snOut) {
 }
 
 // ---------------------
+// Helper: Get jobs array from JSON document
+// Supports both {"jobs": [...]} and [...] formats
+static JsonArray getJobsArray(JsonDocument& doc) {
+    // Try {"jobs": [...]} format first
+    JsonArray arr = doc["jobs"].as<JsonArray>();
+    if (!arr.isNull()) {
+        return arr;
+    }
+    // Try root array format [...]
+    arr = doc.as<JsonArray>();
+    return arr;
+}
+
 // Βρίσκουμε jobs για συγκεκριμένο SN
 // Προτεραιότητα: FW πρώτα, μετά CONFIG
 // ---------------------
-static bool processJobsForSN(const String& sn, const String& ip) {
+bool processJobsForSN(const String& sn, const String& ip) {
     bool didSomething = false;
 
+    // Load jobs into cache if not already loaded (only once per AP session)
+    if (!g_fwJobsCached && g_lastJobLoadTime == 0) {
+        g_fwJobsCached = readJsonFile(FW_JOBS_PATH, g_fwJobsCache);
+        if (!g_fwJobsCached) {
+            g_fwJobsCache.clear(); // No FW jobs
+        }
+    }
+    if (!g_cfgJobsCached && g_lastJobLoadTime == 0) {
+        g_cfgJobsCached = readJsonFile(CFG_JOBS_PATH, g_cfgJobsCache);
+        if (!g_cfgJobsCached) {
+            g_cfgJobsCache.clear(); // No config jobs
+        }
+    }
+    // Mark that we've attempted to load jobs (set after both attempts)
+    if (g_lastJobLoadTime == 0) {
+        g_lastJobLoadTime = millis();
+    }
+
     // 1) Firmware jobs (προτεραιότητα)
-    {
-        StaticJsonDocument<16384> doc;
-        if (readJsonFile(FW_JOBS_PATH, doc)) {
-            JsonArray arr = doc["jobs"].as<JsonArray>();
+    if (g_fwJobsCached) {
+        StaticJsonDocument<16384>& doc = g_fwJobsCache;
+        JsonArray arr = getJobsArray(doc);
             if (!arr.isNull()) {
                 for (size_t i = 0; i < arr.size(); ++i) {
                     JsonObject jobObj = arr[i];
@@ -157,17 +194,38 @@ static bool processJobsForSN(const String& sn, const String& ip) {
                         fw.totalTimeoutMs = jobObj["timeout_ms"] | (8UL * 60UL * 1000UL);
 
                         Serial.printf("[JOBS] Found FW job for SN=%s\n", sn.c_str());
+                        
+                        // For COLLECTOR: ensure firmware file is downloaded from root
+                        extern NodeConfig config;
+                        extern bool downloadFileFromRoot(const String& remotePath, const String& localPath);
+                        if (config.role == ROLE_COLLECTOR) {
+                            if (!sd.exists(fw.hexPath.c_str())) {
+                                Serial.printf("[JOBS] Firmware file not found, downloading from root: %s\n", fw.hexPath.c_str());
+                                bool downloaded = downloadFileFromRoot(fw.hexPath, fw.hexPath);
+                                if (!downloaded) {
+                                    Serial.printf("[JOBS] FAIL: Cannot download firmware file %s\n", fw.hexPath.c_str());
+                                    return false;
+                                }
+                                Serial.printf("[JOBS] Firmware file downloaded successfully\n");
+                            }
+                        }
+                        
                         bool ok = executeFirmwareJob(fw);
                         Serial.printf("[JOBS] FW job result for SN=%s -> %s\n",
                                       sn.c_str(), ok ? "OK" : "FAIL");
 
-                        arr.remove(i);
-                        if (arr.size() == 0) {
-                            sd.remove(FW_JOBS_PATH);
-                        } else {
-                            writeJsonFile(FW_JOBS_PATH, doc);
+                        // Only remove job on success
+                        if (ok) {
+                            arr.remove(i);
+                            if (arr.size() == 0) {
+                                sd.remove(FW_JOBS_PATH);
+                                g_fwJobsCached = false;
+                                g_fwJobsCache.clear();
+                            } else {
+                                writeJsonFile(FW_JOBS_PATH, doc);
+                            }
                         }
-                        didSomething = true;
+                        didSomething = ok;
 
                         // Αν υπήρχε FW job, δεν κάνουμε CONFIG στο ίδιο window
                         return didSomething;
@@ -175,13 +233,11 @@ static bool processJobsForSN(const String& sn, const String& ip) {
                 }
             }
         }
-    }
 
     // 2) Configuration jobs
-    {
-        StaticJsonDocument<16384> doc;
-        if (readJsonFile(CFG_JOBS_PATH, doc)) {
-            JsonArray arr = doc["jobs"].as<JsonArray>();
+    if (g_cfgJobsCached) {
+        StaticJsonDocument<16384>& doc = g_cfgJobsCache;
+        JsonArray arr = getJobsArray(doc);
             if (!arr.isNull()) {
                 for (size_t i = 0; i < arr.size(); ++i) {
                     JsonObject jobObj = arr[i];
@@ -199,21 +255,40 @@ static bool processJobsForSN(const String& sn, const String& ip) {
                         Serial.printf("[JOBS] CONFIG job result for SN=%s -> %s\n",
                                       sn.c_str(), ok ? "OK" : "FAIL");
 
-                        arr.remove(i);
-                        if (arr.size() == 0) {
-                            sd.remove(CFG_JOBS_PATH);
-                        } else {
-                            writeJsonFile(CFG_JOBS_PATH, doc);
+                        // Only remove job on success
+                        if (ok) {
+                            arr.remove(i);
+                            if (arr.size() == 0) {
+                                sd.remove(CFG_JOBS_PATH);
+                                g_cfgJobsCached = false;
+                                g_cfgJobsCache.clear();
+                            } else {
+                                writeJsonFile(CFG_JOBS_PATH, doc);
+                            }
                         }
-                        didSomething = true;
+                        didSomething = ok;
                         break;
                     }
                 }
             }
         }
-    }
 
     return didSomething;
+}
+
+// Reset job cache (call when AP session starts)
+void sjm_resetJobCache() {
+    g_fwJobsCached = false;
+    g_cfgJobsCached = false;
+    g_fwJobsCache.clear();
+    g_cfgJobsCache.clear();
+    g_lastJobLoadTime = 0;
+    Serial.println("[JOBS] Cache reset");
+}
+
+// Alias for compatibility
+void resetJobCache() {
+    sjm_resetJobCache();
 }
 
 // ---------------------

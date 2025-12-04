@@ -15,3 +15,9 @@ struct PendingStation {
 void sjm_init();
 void sjm_addStation(const String& mac);
 void sjm_processStations();
+void sjm_resetJobCache();  // Reset job cache when AP session starts
+void resetJobCache();      // Alias for sjm_resetJobCache for compatibility
+
+// Helper functions for async heartbeat-driven job execution
+bool sjm_requestStatus(const String& ip, String& snOut);
+bool processJobsForSN(const String& sn, const String& ip);
