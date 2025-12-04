@@ -33,7 +33,8 @@ preferences.putString("nodeName", config.nodeName);
   preferences.putBool("bleBeacon", config.bleBeaconEnabled);
   preferences.putInt("bleScanSec", config.bleScanDurationSec);
   
-  preferences.putBool("configured", config.isConfigured);preferences.end();
+  preferences.putBool("configured", config.isConfigured);
+  preferences.end();
   Serial.println("[STORAGE] Configuration saved to flash.");
 }
 

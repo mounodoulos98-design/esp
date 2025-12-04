@@ -140,6 +140,10 @@ public:
                 
                 if (rssi > bestRSSI) {
                     bestRSSI = rssi;
+                    // Free previous best device before allocating new one
+                    if (bestDevice != nullptr) {
+                        delete bestDevice;
+                    }
                     bestDevice = new BLEAdvertisedDevice(device);
                 }
             }
