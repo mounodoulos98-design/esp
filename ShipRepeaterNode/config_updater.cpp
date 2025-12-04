@@ -26,65 +26,49 @@ bool cu_sendConfiguration(const ConfigJob& job)
         query += String(key) + "=" + value + "&";
     }
 
-    // Try up to 2 times (like Python daemon retry logic)
-    for (int attempt = 1; attempt <= 2; attempt++) {
-        if (attempt > 1) {
-            Serial.printf("[CONFIG] Retry attempt %d/2\n", attempt);
-            delay(2000); // Wait before retry
-        } else {
-            // 2-second wait before first attempt, mirroring python daemon's "wait_for_commands" behavior
-            delay(2000);
-        }
+    // Simple HTTP GET with 5-second timeout (matching Python daemon)
+    WiFiClient client;
+    String request =
+        String("GET ") + query + " HTTP/1.1\r\n" +
+        "Host: " + job.sensorIp + "\r\n" +
+        "Connection: close\r\n\r\n";
 
-        WiFiClient client;
-        String request =
-            String("GET ") + query + " HTTP/1.1\r\n" +
-            "Host: " + job.sensorIp + "\r\n" +
-            "Connection: close\r\n\r\n";
+    Serial.printf("[CONFIG] HTTP GET http://%s%s\n",
+                  job.sensorIp.c_str(), query.c_str());
 
-        Serial.printf("[CONFIG] HTTP GET http://%s%s\n",
-                      job.sensorIp.c_str(), query.c_str());
-
-        if (!client.connect(job.sensorIp.c_str(), 80)) {
-            Serial.println("[CONFIG] ERROR: Cannot connect to sensor");
-            if (attempt == 2) return false;
-            continue; // Try again
-        }
-
-        client.print(request);
-
-        // Wait longer for response (8 seconds like Python daemon uses for some commands)
-        unsigned long start = millis();
-        String response;
-        while (millis() - start < 8000UL) {
-            while (client.available()) {
-                char c = client.read();
-                response += c;
-            }
-            if (!client.connected() && response.length() > 0) break;
-            delay(10); // Small delay to let more data arrive
-        }
-        client.stop();
-
-        // Allow sensor time to process
-        delay(500);
-
-        int headerEnd = response.indexOf("\r\n\r\n");
-        String body = (headerEnd >= 0) ? response.substring(headerEnd + 4) : response;
-
-        Serial.println("[CONFIG] Response body:");
-        Serial.println(body);
-
-        if (body.length() > 0 && (body.indexOf("OK") >= 0 || body.indexOf("Success") >= 0)) {
-            Serial.println("[CONFIG] SUCCESS (OK found in response)");
-            return true;
-        }
-        
-        if (attempt < 2) {
-            Serial.println("[CONFIG] No valid response, will retry...");
-        }
+    if (!client.connect(job.sensorIp.c_str(), 80)) {
+        Serial.println("[CONFIG] ERROR: Cannot connect to sensor");
+        return false;
     }
 
-    Serial.println("[CONFIG] FAILED after 2 attempts");
+    client.print(request);
+
+    // Wait for response with 5-second timeout (matching Python daemon)
+    unsigned long start = millis();
+    String response;
+    while (millis() - start < 5000UL) {
+        while (client.available()) {
+            char c = client.read();
+            response += c;
+        }
+        if (!client.connected() && response.length() > 0) break;
+        delay(10);
+    }
+    client.stop();
+
+    // Extract body from response
+    int headerEnd = response.indexOf("\r\n\r\n");
+    String body = (headerEnd >= 0) ? response.substring(headerEnd + 4) : response;
+
+    Serial.println("[CONFIG] Response body:");
+    Serial.println(body);
+
+    // Check for success in response (Python daemon checks for "OK" or "Success")
+    if (body.length() > 0 && (body.indexOf("OK") >= 0 || body.indexOf("Success") >= 0)) {
+        Serial.println("[CONFIG] SUCCESS (OK found in response)");
+        return true;
+    }
+
+    Serial.println("[CONFIG] FAILED (no OK in response)");
     return false;
 }
