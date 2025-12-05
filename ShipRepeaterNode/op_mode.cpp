@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <sys/time.h>
 #include "sensor_heartbeat_manager.h"
+#include "ble_mesh_beacon.h"
 
 
 
@@ -79,6 +80,10 @@ bool needToSyncTime = false;
 static SensorHeartbeatManager heartbeatManager;
 // Heartbeat server for sensors on port 3000
 static AsyncWebServer sensorServer(3000);
+
+// BLE Mesh Wake-up: Beacon for Root/Repeater, Scanner for Collector/Repeater
+static BLEBeaconManager bleBeacon;
+static BLEScannerManager bleScanner;
 
 // === Simple Memory-Based Buffer for Callback-to-Loop Communication ===
 // FreeRTOS queues cause mutex crashes when used from AsyncWebServer callbacks.
@@ -377,8 +382,18 @@ void ensureRootHttpServer() {
     }
     String path = "/jobs/config_jobs.json";
     if (sd.exists(path.c_str())) {
-      req->send(sd, path.c_str(), "application/json");
-      Serial.println("[ROOT] Served /jobs/config_jobs.json");
+      FsFile file = sd.open(path.c_str(), O_RDONLY);
+      if (file) {
+        String content = "";
+        while (file.available()) {
+          content += (char)file.read();
+        }
+        file.close();
+        req->send(200, "application/json", content);
+        Serial.println("[ROOT] Served /jobs/config_jobs.json");
+      } else {
+        req->send(500, "text/plain", "Failed to open file");
+      }
     } else {
       req->send(404, "text/plain", "File not found");
     }
@@ -391,14 +406,25 @@ void ensureRootHttpServer() {
     }
     String path = "/jobs/firmware_jobs.json";
     if (sd.exists(path.c_str())) {
-      req->send(sd, path.c_str(), "application/json");
-      Serial.println("[ROOT] Served /jobs/firmware_jobs.json");
+      FsFile file = sd.open(path.c_str(), O_RDONLY);
+      if (file) {
+        String content = "";
+        while (file.available()) {
+          content += (char)file.read();
+        }
+        file.close();
+        req->send(200, "application/json", content);
+        Serial.println("[ROOT] Served /jobs/firmware_jobs.json");
+      } else {
+        req->send(500, "text/plain", "Failed to open file");
+      }
     } else {
       req->send(404, "text/plain", "File not found");
     }
   });
 
   // Serve firmware hex files
+  // Note: For large files, consider using chunked response to avoid memory issues
   rootServer.on("/firmware/*", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (!initSdCard()) {
       req->send(404, "text/plain", "SD card not available");
@@ -406,8 +432,21 @@ void ensureRootHttpServer() {
     }
     String path = req->url();
     if (sd.exists(path.c_str())) {
-      req->send(sd, path.c_str(), "application/octet-stream");
-      Serial.printf("[ROOT] Served %s\n", path.c_str());
+      FsFile file = sd.open(path.c_str(), O_RDONLY);
+      if (file) {
+        // Read entire file content (works for reasonably sized files)
+        size_t fileSize = file.size();
+        String content = "";
+        content.reserve(fileSize + 1);
+        while (file.available()) {
+          content += (char)file.read();
+        }
+        file.close();
+        req->send(200, "application/octet-stream", content);
+        Serial.printf("[ROOT] Served %s (%d bytes)\n", path.c_str(), fileSize);
+      } else {
+        req->send(500, "text/plain", "Failed to open file");
+      }
     } else {
       req->send(404, "text/plain", "File not found");
     }
@@ -473,12 +512,20 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
     Serial.println("[TIME] STA connect failed");
     return false;
   }
+  // Auto-detect parent IP if not configured (use gateway IP from DHCP)
+  String targetHost = config.uplinkHost;
+  if (targetHost.length() == 0 || targetHost == "Auto" || targetHost == "auto") {
+    IPAddress gateway = WiFi.gatewayIP();
+    targetHost = gateway.toString();
+    Serial.printf("[TIME] Auto-detected parent IP: %s (gateway)\n", targetHost.c_str());
+  }
+  
   WiFiClient client;
-  if (!client.connect(config.uplinkHost.c_str(), config.uplinkPort)) {
+  if (!client.connect(targetHost.c_str(), config.uplinkPort)) {
     Serial.println("[TIME] Connect host failed");
     return false;
   }
-  client.print(String("GET /time HTTP/1.1\r\nHost: ") + config.uplinkHost + "\r\nConnection: close\r\n\r\n");
+  client.print(String("GET /time HTTP/1.1\r\nHost: ") + targetHost + "\r\nConnection: close\r\n\r\n");
   unsigned long t0 = millis();
   while (client.connected() && !client.available() && millis() - t0 < 3000) delay(10);
   String resp = "";
@@ -548,16 +595,24 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
     return false;
   }
 
+  // Auto-detect parent IP if not configured (use gateway IP from DHCP)
+  String targetHost = config.uplinkHost;
+  if (targetHost.length() == 0 || targetHost == "Auto" || targetHost == "auto") {
+    IPAddress gateway = WiFi.gatewayIP();
+    targetHost = gateway.toString();
+    Serial.printf("[HTTP UP] Auto-detected parent IP: %s (gateway)\n", targetHost.c_str());
+  }
+  
   WiFiClient client;
-  Serial.printf("[HTTP UP] Connecting to %s:%d...\n", config.uplinkHost.c_str(), config.uplinkPort);
-  if (!client.connect(config.uplinkHost.c_str(), config.uplinkPort)) {
+  Serial.printf("[HTTP UP] Connecting to %s:%d...\n", targetHost.c_str(), config.uplinkPort);
+  if (!client.connect(targetHost.c_str(), config.uplinkPort)) {
     Serial.println("[HTTP UP] Connect failed");
     f.close();
     return false;
   }
 
   String boundary = "----esp32bound" + String(millis());
-  String head = "POST /ingest HTTP/1.1\r\nHost: " + config.uplinkHost + "\r\n";
+  String head = "POST /ingest HTTP/1.1\r\nHost: " + targetHost + "\r\n";
   head += "Connection: close\r\nContent-Type: multipart/form-data; boundary=" + boundary + "\r\n";
   String pre = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"" + basename + "\"\r\nContent-Type: application/octet-stream\r\n\r\n";
   String post = "\r\n--" + boundary + "--\r\n";
@@ -603,11 +658,19 @@ bool downloadFileFromRoot(const String& remotePath, const String& localPath) {
     return false;
   }
 
+  // Auto-detect parent IP if not configured (use gateway IP from DHCP)
+  String targetHost = config.uplinkHost;
+  if (targetHost.length() == 0 || targetHost == "Auto" || targetHost == "auto") {
+    IPAddress gateway = WiFi.gatewayIP();
+    targetHost = gateway.toString();
+    Serial.printf("[DOWNLOAD] Auto-detected parent IP: %s (gateway)\n", targetHost.c_str());
+  }
+  
   WiFiClient client;
   Serial.printf("[DOWNLOAD] Fetching http://%s:%d%s...\n", 
-                config.uplinkHost.c_str(), config.uplinkPort, remotePath.c_str());
+                targetHost.c_str(), config.uplinkPort, remotePath.c_str());
   
-  if (!client.connect(config.uplinkHost.c_str(), config.uplinkPort)) {
+  if (!client.connect(targetHost.c_str(), config.uplinkPort)) {
     Serial.println("[DOWNLOAD] Connect failed");
     return false;
   }
@@ -964,6 +1027,13 @@ void goToDeepSleep(unsigned int seconds) {
   }
   rtc_last_sleep_duration_s = seconds;
   stopAPMode();
+  
+  // Stop BLE before deep sleep
+  if (config.bleBeaconEnabled) {
+    bleBeacon.stop();
+    Serial.println("[BLE-MESH] Stopped BLE beacon before sleep");
+  }
+  
   Serial.printf("[SLEEP] Entering deep sleep for %u seconds.\n", seconds);
   esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
   delay(200);
@@ -1024,10 +1094,19 @@ void decideAndGoToSleep() {
       rtc_next_state = STATE_COLLECTOR_AP;
       sleep_for = time_to_next_ap;
     }
+  } else if (config.role == ROLE_REPEATER) {
+    // REPEATER → stays awake with BLE beacon active
+    // Don't go to deep sleep - allows instant wake-up by collectors
+    // Note: Light sleep is managed by the Arduino/ESP-IDF framework automatically
+    // when CPU is idle. BLE beacon continues advertising during light sleep.
+    // Original scheduling logic removed: Repeater no longer uses scheduled uplink windows,
+    // instead stays continuously available for collectors to connect at any time.
+    Serial.println("[SCHEDULER] Repeater stays active with BLE beacon (automatic light sleep)");
+    return; // Don't call goToDeepSleep
   } else {
-    // REPEATER or ROOT → focus on uplink cadence
-    rtc_next_state = STATE_MESH_APPOINTMENT;
-    sleep_for = time_to_next_uplink;
+    // ROOT → always on, should never reach here
+    Serial.println("[SCHEDULER] Root should always be active");
+    return;
   }
 
   goToDeepSleep(sleep_for);
@@ -1043,6 +1122,9 @@ void loopOperationalMode() {
   if (config.role == ROLE_ROOT) {
     ensureWiFiAPRoot();
     ensureRootHttpServer();
+    
+    // Root doesn't need BLE - always on and accessible via WiFi
+    
     static unsigned long lastPrint = 0;
     if (millis() - lastPrint > 10000) {
       debugPrintTime("Root loop");
@@ -1055,12 +1137,24 @@ void loopOperationalMode() {
   if (config.role == ROLE_REPEATER) {
     ensureWiFiAPRepeater();
     ensureRepeaterHttpServer();
+    
+    // Repeater uses continuous BLE beacon with light sleep (not deep sleep)
+    // This allows collectors to find and wake it at any time
+    if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
+      // Use actual AP SSID (same logic as ensureWiFiAPRepeater)
+      String actualAPSSID = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
+      bleBeacon.begin(actualAPSSID, config.nodeName, 0); // 0 = Repeater role
+      bleBeacon.startAdvertising();
+      Serial.println("[BLE-MESH] Repeater BLE beacon active (continuous with light sleep)");
+    }
+    
     static bool tried = false;
     if (!tried) {
       tried = true;
       syncTimeFromUplink(5000);
     }
-    // keep idle; scheduling handled by decideAndGoToSleep()
+    // Repeater stays in light sleep with BLE beacon active
+    // No deep sleep - allows instant wake-up when collector connects
   }
 
   // NON-ROOT STATE MACHINE
@@ -1360,11 +1454,34 @@ void loopOperationalMode() {
       {
         static time_t state_start_time = 0;
         static bool started = false;
+        static bool bleScanned = false;
 
         if (!started) {
           setStatusLed(STATUS_SENDING_DATA);
           Serial.printf("[STATE] Executing: UPLINK APPOINTMENT (%s)\n",
                         (config.role == ROLE_REPEATER ? "REPEATER" : "COLLECTOR"));
+
+          // BLE Scan for parent discovery (Collector/Repeater finding their parent)
+          if (config.bleBeaconEnabled && !bleScanned) {
+            Serial.println("[BLE-MESH] Scanning for parent node...");
+            String scannerName = config.nodeName + "_Scanner";
+            bleScanner.begin(scannerName);
+            BLEScannerManager::ScanResult result = bleScanner.scanForParent(config.bleScanDurationSec);
+            bleScanner.stop();
+            bleScanned = true;
+            
+            if (result.found) {
+              Serial.printf("[BLE-MESH] Found parent SSID: %s (Role: %s, RSSI: %d dBm)\n",
+                           result.apSSID.c_str(),
+                           result.nodeRole == 1 ? "Root" : "Repeater",
+                           result.rssi);
+              // Override uplinkSSID with discovered AP SSID from BLE
+              config.uplinkSSID = result.apSSID;
+              Serial.printf("[BLE-MESH] Using discovered AP SSID for WiFi: %s\n", config.uplinkSSID.c_str());
+            } else {
+              Serial.println("[BLE-MESH] No parent found via BLE, proceeding with configured uplink");
+            }
+          }
 
           time(&state_start_time);
           started = true;
@@ -1383,6 +1500,7 @@ void loopOperationalMode() {
           if (!findOldestQueueFile(still)) {
             Serial.println("[UPLINK] Queue empty → sleeping early.");
             started = false;
+            bleScanned = false; // Reset for next cycle
             decideAndGoToSleep();
             return;
           }
@@ -1399,6 +1517,7 @@ void loopOperationalMode() {
 
         Serial.printf("[UPLINK] Window finished after %d sec.\n", elapsed);
         started = false;
+        bleScanned = false; // Reset for next cycle
         decideAndGoToSleep();
         break;
       }
