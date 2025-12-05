@@ -4,6 +4,11 @@ This repository contains the ESP32 firmware for a Ship Repeater Node that acts a
 
 ## Features
 
+- **Dynamic WiFi AP Control** ⚡ **NEW!**: 
+  - Repeater WiFi AP OFF by default (light sleep)
+  - BLE wake-up signal to start WiFi AP on demand
+  - 50-70% power savings vs always-on AP
+  - Queue-based transfer (no timeout, complete data transfer)
 - **Async Sensor Communication**: Handle multiple sensors concurrently using FreeRTOS tasks
 - **Heartbeat-Driven Architecture**: Event-driven processing based on sensor heartbeats
 - **BLE Mesh Wake-Up**: Bluetooth Low Energy beacons for efficient parent discovery and wake-up
@@ -49,6 +54,7 @@ First boot will enter Configuration Mode. Set up the node role:
 
 ## Documentation
 
+- **[DYNAMIC_WIFI_AP_IMPLEMENTATION.md](DYNAMIC_WIFI_AP_IMPLEMENTATION.md)** - **NEW!** Dynamic WiFi AP control with light sleep (50-70% power savings)
 - **[ASYNC_SENSOR_FLOW.md](ASYNC_SENSOR_FLOW.md)** - Complete async communication flow with diagrams
 - **[BLE_MESH_WAKEUP.md](BLE_MESH_WAKEUP.md)** - BLE mesh wake-up system for parent discovery
 - **[BLE_TESTING_GUIDE.md](BLE_TESTING_GUIDE.md)** - Step-by-step BLE testing and configuration guide
