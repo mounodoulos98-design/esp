@@ -925,6 +925,9 @@ static void syncJobsFromRoot() {
   
   Serial.println("[SYNC] Syncing jobs from root...");
   
+  // Reset watchdog before potentially long downloads
+  esp_task_wdt_reset();
+  
   // Download config jobs
   bool cfgOk = downloadFileFromRoot("/jobs/config_jobs.json", "/jobs/config_jobs.json");
   if (cfgOk) {
@@ -955,6 +958,9 @@ void uploadAllQueuedFiles() {
   
   // Upload ALL files in queue until empty
   while (findOldestQueueFile(oldest)) {
+    // Reset watchdog to prevent timeout during long upload sessions
+    esp_task_wdt_reset();
+    
     if (!initSdCard()) {
       Serial.println("[QUEUE-UPLOAD] SD card access failed");
       break;
