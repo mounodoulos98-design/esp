@@ -30,7 +30,7 @@ struct TransferFlags {
 // Helper functions for protocol implementation
 
 // Count files in queue directory
-static int countQueueFiles() {
+static inline int countQueueFiles() {
     extern SdFat sd;
     extern bool initSdCard();
     
@@ -55,7 +55,7 @@ static int countQueueFiles() {
 }
 
 // Check if jobs exist for collector
-static int countJobsForCollector() {
+static inline int countJobsForCollector() {
     extern SdFat sd;
     extern bool initSdCard();
     

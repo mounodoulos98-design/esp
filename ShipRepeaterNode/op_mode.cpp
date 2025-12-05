@@ -89,6 +89,11 @@ static BLEScannerManager bleScanner;
 static bool repeaterWiFiAPActive = false;
 static unsigned long repeaterAPStartTime = 0;
 
+// Repeater WiFi AP timeouts (configurable)
+#define REPEATER_NO_CLIENT_TIMEOUT_MS 30000   // 30 seconds
+#define REPEATER_MAX_AP_TIME_MS 300000        // 5 minutes
+#define REPEATER_AP_STARTUP_DELAY_MS 3000     // 3 seconds
+
 // Forward declarations for Repeater WiFi control
 void startRepeaterWiFiAP();
 void ensureRepeaterHttpServer();
@@ -944,6 +949,8 @@ void uploadAllQueuedFiles() {
   Serial.println("[QUEUE-UPLOAD] Starting queue-based file upload...");
   
   int filesUploaded = 0;
+  int filesSkipped = 0;
+  const int MAX_RETRY = 3;  // Retry failed uploads up to 3 times
   String oldest;
   
   // Upload ALL files in queue until empty
@@ -954,22 +961,34 @@ void uploadAllQueuedFiles() {
     }
     
     String base = oldest.substring(String(QUEUE_DIR).length() + 1);
-    Serial.printf("[QUEUE-UPLOAD] Uploading file %d: %s\n", filesUploaded + 1, base.c_str());
+    Serial.printf("[QUEUE-UPLOAD] Uploading file %d: %s\n", filesUploaded + filesSkipped + 1, base.c_str());
     
-    bool ok = uploadFileToRoot(oldest, base);
+    bool ok = false;
+    for (int retry = 0; retry < MAX_RETRY && !ok; retry++) {
+      if (retry > 0) {
+        Serial.printf("[QUEUE-UPLOAD] Retry attempt %d/%d for: %s\n", retry, MAX_RETRY - 1, base.c_str());
+        delay(1000);  // Wait 1 second before retry
+      }
+      ok = uploadFileToRoot(oldest, base);
+    }
+    
     if (ok && initSdCard()) { 
       sd.remove(oldest.c_str());
       filesUploaded++;
       Serial.printf("[QUEUE-UPLOAD] Successfully uploaded and removed: %s\n", oldest.c_str());
     } else {
-      Serial.printf("[QUEUE-UPLOAD] Failed to upload: %s\n", oldest.c_str());
-      break; // Stop on first failure
+      filesSkipped++;
+      Serial.printf("[QUEUE-UPLOAD] Failed to upload after %d attempts: %s (continuing with next file)\n", 
+                    MAX_RETRY, oldest.c_str());
+      // Continue with next file instead of breaking
+      // Note: Failed file remains in queue for next cycle
     }
     
     delay(100); // Small delay between uploads
   }
   
-  Serial.printf("[QUEUE-UPLOAD] Queue upload complete. Files uploaded: %d\n", filesUploaded);
+  Serial.printf("[QUEUE-UPLOAD] Queue upload complete. Files uploaded: %d, skipped: %d\n", 
+                filesUploaded, filesSkipped);
 }
 
 // Collector: Upload queue and sync jobs (legacy function, now calls queue-based upload)
@@ -1351,14 +1370,11 @@ void loopOperationalMode() {
       int numClients = WiFi.softAPgetStationNum();
       unsigned long apRunTime = millis() - repeaterAPStartTime;
       
-      // Stop AP if no clients for 30 seconds OR if running for more than 5 minutes
-      const unsigned long NO_CLIENT_TIMEOUT = 30000;  // 30 seconds
-      const unsigned long MAX_AP_TIME = 300000;       // 5 minutes
-      
-      if (numClients == 0 && apRunTime > NO_CLIENT_TIMEOUT) {
+      // Stop AP if no clients for timeout OR if running for max time
+      if (numClients == 0 && apRunTime > REPEATER_NO_CLIENT_TIMEOUT_MS) {
         Serial.println("[REPEATER] No clients connected, stopping WiFi AP");
         stopRepeaterWiFiAP();
-      } else if (apRunTime > MAX_AP_TIME) {
+      } else if (apRunTime > REPEATER_MAX_AP_TIME_MS) {
         Serial.println("[REPEATER] Max AP time exceeded, stopping WiFi AP");
         stopRepeaterWiFiAP();
       }
@@ -1692,7 +1708,7 @@ void loopOperationalMode() {
                 if (bleScanner.sendWakeupSignal(result.address)) {
                   Serial.println("[BLE-WAKEUP] Wake-up signal sent successfully, waiting for WiFi AP...");
                   // Wait for WiFi AP to start (give Repeater time to bring up AP)
-                  delay(3000);
+                  delay(REPEATER_AP_STARTUP_DELAY_MS);
                 } else {
                   Serial.println("[BLE-WAKEUP] Failed to send wake-up signal");
                 }
