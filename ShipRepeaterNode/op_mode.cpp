@@ -94,6 +94,9 @@ static unsigned long repeaterAPStartTime = 0;
 #define REPEATER_MAX_AP_TIME_MS 300000        // 5 minutes
 #define REPEATER_AP_STARTUP_DELAY_MS 3000     // 3 seconds
 
+// Uplink window maximum duration (configurable)
+#define UPLINK_MAX_WINDOW_MS 300000           // 5 minutes max for uplink operations
+
 // Forward declarations for Repeater WiFi control
 void startRepeaterWiFiAP();
 void ensureRepeaterHttpServer();
@@ -956,22 +959,31 @@ static void syncJobsFromRoot() {
   resetJobCache();
 }
 
-// Collector: Upload ALL queued files (queue-based, not timeout-based)
+// Collector: Upload ALL queued files (queue-based with timeout)
 // =============================
-void uploadAllQueuedFiles() {
+void uploadAllQueuedFiles(unsigned long maxDurationMs = 0) {
   if (config.role != ROLE_COLLECTOR) return;
   
   Serial.println("[QUEUE-UPLOAD] Starting queue-based file upload...");
   
+  unsigned long startTime = millis();
   int filesUploaded = 0;
   int filesSkipped = 0;
   const int MAX_RETRY = 3;  // Retry failed uploads up to 3 times
   String oldest;
   
-  // Upload ALL files in queue until empty
+  // Upload ALL files in queue until empty OR timeout reached
   while (findOldestQueueFile(oldest)) {
     // Reset watchdog to prevent timeout during long upload sessions
     esp_task_wdt_reset();
+    
+    // Check if we've exceeded the maximum duration
+    if (maxDurationMs > 0 && (millis() - startTime) > maxDurationMs) {
+      Serial.printf("[QUEUE-UPLOAD] Max duration reached (%lu ms), stopping upload session\n", maxDurationMs);
+      Serial.printf("[QUEUE-UPLOAD] Uploaded %d files, skipped %d files\n", filesUploaded, filesSkipped);
+      Serial.println("[QUEUE-UPLOAD] Remaining files will be uploaded in next cycle");
+      return;
+    }
     
     if (!initSdCard()) {
       Serial.println("[QUEUE-UPLOAD] SD card access failed");
@@ -988,6 +1000,12 @@ void uploadAllQueuedFiles() {
         delay(1000);  // Wait 1 second before retry
       }
       ok = uploadFileToRoot(oldest, base);
+      
+      // Check timeout even during retries
+      if (maxDurationMs > 0 && (millis() - startTime) > maxDurationMs) {
+        Serial.println("[QUEUE-UPLOAD] Timeout reached during retry, aborting");
+        break;
+      }
     }
     
     if (ok && initSdCard()) { 
@@ -1393,7 +1411,10 @@ void loopOperationalMode() {
         Serial.println("[REPEATER] No clients connected, stopping WiFi AP");
         stopRepeaterWiFiAP();
       } else if (apRunTime > REPEATER_MAX_AP_TIME_MS) {
-        Serial.println("[REPEATER] Max AP time exceeded, stopping WiFi AP");
+        Serial.printf("[REPEATER] Max AP time exceeded (%lu ms), stopping WiFi AP\n", apRunTime);
+        if (numClients > 0) {
+          Serial.printf("[REPEATER] Warning: Force stopping with %d client(s) still connected\n", numClients);
+        }
         stopRepeaterWiFiAP();
       }
     }
@@ -1754,25 +1775,49 @@ void loopOperationalMode() {
         }
 
         if (config.role == ROLE_COLLECTOR) {
-          // Queue-based upload: Upload ALL files until queue is empty
-          uploadAllQueuedFiles();
+          // Check elapsed time before starting upload
+          time_t now;
+          time(&now);
+          int elapsed = now - state_start_time;
+          unsigned long elapsedMs = (unsigned long)elapsed * 1000;
           
-          // After uploading, sync jobs from parent
-          syncJobsFromRoot();
+          // Calculate remaining time for upload operations
+          unsigned long remainingTimeMs = (elapsedMs < UPLINK_MAX_WINDOW_MS) ? 
+                                          (UPLINK_MAX_WINDOW_MS - elapsedMs) : 0;
           
-          // Check if queue is truly empty
-          String still;
-          if (!findOldestQueueFile(still)) {
-            Serial.println("[UPLINK] Queue empty and jobs synced → sleeping early.");
+          if (remainingTimeMs < 10000) {
+            Serial.printf("[UPLINK] Insufficient time remaining (%lu ms), skipping upload\n", remainingTimeMs);
             started = false;
-            bleScanned = false; // Reset for next cycle
+            bleScanned = false;
             decideAndGoToSleep();
             return;
-          } else {
-            Serial.println("[UPLINK] Warning: Queue still has files after upload attempt");
           }
+          
+          // Queue-based upload with timeout (use 80% of remaining time for uploads)
+          unsigned long uploadTimeoutMs = (remainingTimeMs * 80) / 100;
+          Serial.printf("[UPLINK] Starting upload with timeout: %lu ms\n", uploadTimeoutMs);
+          uploadAllQueuedFiles(uploadTimeoutMs);
+          
+          // After uploading, sync jobs from parent (if time permits)
+          time(&now);
+          elapsed = now - state_start_time;
+          elapsedMs = (unsigned long)elapsed * 1000;
+          
+          if (elapsedMs < UPLINK_MAX_WINDOW_MS) {
+            syncJobsFromRoot();
+          } else {
+            Serial.println("[UPLINK] Timeout reached, skipping job sync");
+          }
+          
+          // Always exit after upload attempt (success or timeout)
+          Serial.println("[UPLINK] Upload session complete → sleeping.");
+          started = false;
+          bleScanned = false; // Reset for next cycle
+          decideAndGoToSleep();
+          return;
         }
 
+        // For REPEATER role (no upload operations)
         time_t now;
         time(&now);
         int elapsed = now - state_start_time;
