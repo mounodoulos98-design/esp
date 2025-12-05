@@ -14,10 +14,15 @@ The BLE (Bluetooth Low Energy) mesh wake-up system enables efficient power manag
    - Receives data from Repeaters and Collectors
    - Provides jobs and firmware updates
 
-2. **Repeater Node**
+2. **Repeater Node** ⚡ **UPDATED with Dynamic WiFi AP Control**
    - **Light sleep with continuous BLE beacon** (not deep sleep)
-   - Acts as BLE beacon continuously (advertises itself 24/7)
-   - Allows instant wake-up when Collector needs to connect
+   - **WiFi AP OFF by default** - only turns ON when needed
+   - BLE beacon advertises continuously (acts as wake-up trigger)
+   - Collector sends BLE write to wake-up characteristic
+   - Repeater wakes up and starts WiFi AP
+   - WiFi AP stays active until transfers complete
+   - WiFi AP shuts down after timeout → back to light sleep
+   - **Power savings: 50-70% reduction vs always-on AP**
    - Forwards data from Collectors to Root
 
 3. **Collector Node**
@@ -81,15 +86,22 @@ The BLE wake-up mechanism provides several power benefits:
                               │
 ┌─────────────────────────────────────────────────────────────┐
 │                       REPEATER NODE                          │
-│  Continuous Operation:                                       │
-│  1. WiFi AP always active                                    │
+│  Default State (Light Sleep):                                │
+│  1. WiFi AP: OFF (power saving)                             │
 │  2. BLE Beacon advertising continuously (Role: 0)            │
-│  3. Light sleep mode (instant wake-up)                       │
-│  4. When Collector connects:                                 │
-│     - Wake from light sleep                                  │
-│     - Receive data via WiFi                                  │
-│     - Forward to Root                                        │
-│     - Return to light sleep with BLE active                  │
+│  3. Light sleep mode (instant wake-up capability)            │
+│  4. Power consumption: ~10-15 mA                             │
+│                                                              │
+│  When Collector Sends BLE Wake-up:                          │
+│  1. Receive BLE write to wake-up characteristic              │
+│  2. Start WiFi AP                                           │
+│  3. Start HTTP server                                       │
+│  4. Receive data via WiFi from Collector                     │
+│  5. Send jobs/firmware back to Collector                     │
+│  6. Wait for all transfers to complete                       │
+│  7. Detect no clients for 30s                               │
+│  8. Stop WiFi AP → return to light sleep                     │
+│  9. Power consumption while active: ~110-145 mA              │
 └─────────────────────────────────────────────────────────────┘
                               ▲
                               │ BLE scan discovers Repeater
@@ -152,23 +164,37 @@ config.bleScanDurationSec = 5;   // BLE scan duration in seconds
 ### BLE Beacon Manager (`ble_mesh_beacon.h`)
 
 - **Class**: `BLEBeaconManager`
-- **Purpose**: Advertise node presence for discovery
+- **Purpose**: Advertise node presence for discovery and enable wake-up
 - **Used by**: Root and Repeater nodes
 - **Methods**:
-  - `begin(nodeName, nodeRole)` - Initialize BLE beacon
+  - `begin(apSSID, nodeName, nodeRole, wakeupCallback)` - Initialize BLE beacon with optional wake-up callback
   - `startAdvertising()` - Start advertising
   - `stopAdvertising()` - Stop advertising
   - `stop()` - Deinitialize BLE
+- **New Features** ⚡:
+  - Wake-up characteristic (UUID: `beb5483e-36e1-4688-b7f5-ea07361b26a8`)
+  - Write-only characteristic for Collectors to send wake-up signal
+  - Callback interface for handling wake-up requests
+  - Dynamic WiFi AP control integration
 
 ### BLE Scanner Manager (`ble_mesh_beacon.h`)
 
 - **Class**: `BLEScannerManager`
-- **Purpose**: Discover parent nodes
+- **Purpose**: Discover parent nodes and send wake-up signals
 - **Used by**: Collector and Repeater nodes
 - **Methods**:
-  - `begin()` - Initialize BLE scanner
-  - `scanForParent(duration)` - Scan and return best parent
+  - `begin(scannerName)` - Initialize BLE scanner
+  - `scanForParent(duration)` - Scan and return best parent with address
+  - `sendWakeupSignal(address)` - **NEW!** Send BLE wake-up signal to parent Repeater
   - `stop()` - Deinitialize BLE
+- **Wake-up Protocol** ⚡:
+  1. Scan for parent Repeater
+  2. Get Repeater's BLE address from scan result
+  3. Connect to Repeater via BLE
+  4. Write 0x01 to wake-up characteristic
+  5. Disconnect BLE
+  6. Wait 3 seconds for WiFi AP to start
+  7. Connect to Repeater via WiFi
 
 ### Integration Points
 

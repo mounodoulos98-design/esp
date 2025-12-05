@@ -8,15 +8,41 @@
 #include <BLEAdvertising.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <BLEClient.h>
 
 // BLE Service UUID for mesh node identification
 #define BLE_MESH_SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+// BLE Characteristic UUID for wake-up signal
+#define BLE_WAKEUP_CHAR_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+// Callback interface for wake-up events
+class BLEWakeupCallback {
+public:
+    virtual void onWakeupRequest() = 0;
+};
+
+// BLE Characteristic callback handler
+class WakeupCharacteristicCallbacks : public BLECharacteristicCallbacks {
+public:
+    WakeupCharacteristicCallbacks(BLEWakeupCallback* cb) : callback(cb) {}
+    
+    void onWrite(BLECharacteristic* pCharacteristic) override {
+        std::string value = pCharacteristic->getValue();
+        if (value.length() > 0 && value[0] == 0x01 && callback) {
+            Serial.println("[BLE-WAKEUP] Wake-up signal received!");
+            callback->onWakeupRequest();
+        }
+    }
+    
+private:
+    BLEWakeupCallback* callback;
+};
 
 // BLE Beacon Manager for Repeaters/Root
 // Advertises the node's presence so children can discover and wake it up
 class BLEBeaconManager {
 public:
-    void begin(const String& apSSID, const String& nodeName, uint8_t nodeRole) {
+    void begin(const String& apSSID, const String& nodeName, uint8_t nodeRole, BLEWakeupCallback* wakeupCb = nullptr) {
         Serial.println("[BLE-BEACON] Initializing BLE Beacon...");
         
         // Initialize BLE
@@ -33,6 +59,28 @@ public:
             Serial.println("[BLE-BEACON] ERROR: Failed to create BLE server");
             return;
         }
+        
+        // Create BLE Service for wake-up
+        BLEService* pService = pServer->createService(BLE_MESH_SERVICE_UUID);
+        if (!pService) {
+            Serial.println("[BLE-BEACON] ERROR: Failed to create BLE service");
+            return;
+        }
+        
+        // Create wake-up characteristic (writable by Collector to wake Repeater)
+        if (wakeupCb != nullptr && nodeRole == 0) { // Only for Repeater role
+            pWakeupChar = pService->createCharacteristic(
+                BLE_WAKEUP_CHAR_UUID,
+                BLECharacteristic::PROPERTY_WRITE
+            );
+            if (pWakeupChar) {
+                pWakeupChar->setCallbacks(new WakeupCharacteristicCallbacks(wakeupCb));
+                Serial.println("[BLE-BEACON] Wake-up characteristic created");
+            }
+        }
+        
+        // Start the service
+        pService->start();
         
         // Get advertising object
         pAdvertising = BLEDevice::getAdvertising();
@@ -100,6 +148,7 @@ public:
 private:
     BLEServer* pServer = nullptr;
     BLEAdvertising* pAdvertising = nullptr;
+    BLECharacteristic* pWakeupChar = nullptr;
     bool isInitialized = false;
     bool isAdvertising = false;
 };
@@ -226,6 +275,75 @@ public:
         
         pBLEScan->clearResults();
         return result;
+    }
+
+    // Send wake-up signal to a discovered parent (Repeater)
+    // Returns true if signal was sent successfully
+    bool sendWakeupSignal(const String& deviceAddress) {
+        if (!isInitialized) {
+            Serial.println("[BLE-WAKEUP] Error: Scanner not initialized");
+            return false;
+        }
+        
+        Serial.printf("[BLE-WAKEUP] Connecting to device %s to send wake-up signal...\n", 
+                     deviceAddress.c_str());
+        
+        BLEAddress bleAddress(deviceAddress.c_str());
+        BLEClient* pClient = BLEDevice::createClient();
+        
+        if (!pClient) {
+            Serial.println("[BLE-WAKEUP] Failed to create BLE client");
+            return false;
+        }
+        
+        // Connect to the device
+        if (!pClient->connect(bleAddress)) {
+            Serial.println("[BLE-WAKEUP] Failed to connect to device");
+            delete pClient;
+            return false;
+        }
+        
+        Serial.println("[BLE-WAKEUP] Connected to device");
+        
+        // Get the service
+        BLERemoteService* pRemoteService = pClient->getService(BLE_MESH_SERVICE_UUID);
+        if (!pRemoteService) {
+            Serial.println("[BLE-WAKEUP] Failed to find service");
+            pClient->disconnect();
+            delete pClient;
+            return false;
+        }
+        
+        // Get the characteristic
+        BLERemoteCharacteristic* pRemoteChar = pRemoteService->getCharacteristic(BLE_WAKEUP_CHAR_UUID);
+        if (!pRemoteChar) {
+            Serial.println("[BLE-WAKEUP] Failed to find wake-up characteristic");
+            pClient->disconnect();
+            delete pClient;
+            return false;
+        }
+        
+        // Check if characteristic is writable
+        if (!pRemoteChar->canWrite()) {
+            Serial.println("[BLE-WAKEUP] Characteristic not writable");
+            pClient->disconnect();
+            delete pClient;
+            return false;
+        }
+        
+        // Send wake-up signal (write 0x01)
+        uint8_t wakeupValue = 0x01;
+        pRemoteChar->writeValue(&wakeupValue, 1, true);
+        Serial.println("[BLE-WAKEUP] Wake-up signal sent!");
+        
+        // Wait a moment for the write to complete
+        delay(500);
+        
+        // Disconnect
+        pClient->disconnect();
+        delete pClient;
+        
+        return true;
     }
 
     void stop() {
