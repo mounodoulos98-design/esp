@@ -608,6 +608,8 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
 
 void ensureRepeaterHttpServer() {
   if (repeaterHttpActive) return;
+  
+  // Time endpoint
   rptServer.on("/time", HTTP_GET, [](AsyncWebServerRequest* req) {
     time_t now;
     time(&now);
@@ -615,9 +617,113 @@ void ensureRepeaterHttpServer() {
     String json = String("{\"epoch\":") + String((unsigned long)now) + "}";
     req->send(200, "application/json", json);
   });
+  
+  // Job endpoints - serve jobs to Collectors (same as Root)
+  rptServer.on("/jobs/config_jobs.json", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!initSdCard()) {
+      req->send(404, "text/plain", "SD card not available");
+      return;
+    }
+    String path = "/jobs/config_jobs.json";
+    if (sd.exists(path.c_str())) {
+      FsFile file = sd.open(path.c_str(), O_RDONLY);
+      if (file) {
+        String content = "";
+        while (file.available()) {
+          content += (char)file.read();
+        }
+        file.close();
+        req->send(200, "application/json", content);
+        Serial.println("[REPEATER] Served /jobs/config_jobs.json to Collector");
+      } else {
+        req->send(500, "text/plain", "Failed to open file");
+      }
+    } else {
+      req->send(404, "text/plain", "File not found");
+    }
+  });
+
+  rptServer.on("/jobs/firmware_jobs.json", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!initSdCard()) {
+      req->send(404, "text/plain", "SD card not available");
+      return;
+    }
+    String path = "/jobs/firmware_jobs.json";
+    if (sd.exists(path.c_str())) {
+      FsFile file = sd.open(path.c_str(), O_RDONLY);
+      if (file) {
+        String content = "";
+        while (file.available()) {
+          content += (char)file.read();
+        }
+        file.close();
+        req->send(200, "application/json", content);
+        Serial.println("[REPEATER] Served /jobs/firmware_jobs.json to Collector");
+      } else {
+        req->send(500, "text/plain", "Failed to open file");
+      }
+    } else {
+      req->send(404, "text/plain", "File not found");
+    }
+  });
+
+  // Serve firmware hex files to Collectors
+  rptServer.on("/firmware/*", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!initSdCard()) {
+      req->send(404, "text/plain", "SD card not available");
+      return;
+    }
+    String path = req->url();
+    if (sd.exists(path.c_str())) {
+      FsFile file = sd.open(path.c_str(), O_RDONLY);
+      if (file) {
+        size_t fileSize = file.size();
+        String content = "";
+        content.reserve(fileSize + 1);
+        while (file.available()) {
+          content += (char)file.read();
+        }
+        file.close();
+        req->send(200, "application/octet-stream", content);
+        Serial.printf("[REPEATER] Served %s to Collector (%d bytes)\n", path.c_str(), fileSize);
+      } else {
+        req->send(500, "text/plain", "Failed to open file");
+      }
+    } else {
+      req->send(404, "text/plain", "File not found");
+    }
+  });
+  
+  // Multipart/form-data upload endpoint for Collectors to send data
+  rptServer.on(
+    "/ingest", HTTP_POST,
+    [](AsyncWebServerRequest* request) {},
+    [](AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final) {
+      static FsFile upFile;
+      static String current;
+      if (index == 0) {
+        if (!initSdCard()) {
+          Serial.println("[REPEATER] SD card init failed for upload");
+          return;
+        }
+        ensureDir(RECEIVED_DIR);
+        char name[64];
+        snprintf(name, sizeof(name), "%lu_", (unsigned long)millis());
+        current = String(RECEIVED_DIR) + "/" + name + filename;
+        upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+        Serial.printf("[REPEATER] Receiving file from Collector: %s\n", current.c_str());
+      }
+      if (upFile) { upFile.write(data, len); }
+      if (final) {
+        if (upFile) upFile.close();
+        request->send(200, "text/plain", "OK");
+        Serial.printf("[REPEATER] Saved file from Collector: %s\n", current.c_str());
+      }
+    });
+  
   rptServer.begin();
   repeaterHttpActive = true;
-  Serial.println("[REPEATER] HTTP /time ready on :8080");
+  Serial.println("[REPEATER] HTTP server ready on :8080 (/time, /jobs, /firmware, /ingest)");
 }
 
 // =============================
@@ -830,7 +936,43 @@ static void syncJobsFromRoot() {
   resetJobCache();
 }
 
-// Collector: Upload queue and sync jobs
+// Collector: Upload ALL queued files (queue-based, not timeout-based)
+// =============================
+void uploadAllQueuedFiles() {
+  if (config.role != ROLE_COLLECTOR) return;
+  
+  Serial.println("[QUEUE-UPLOAD] Starting queue-based file upload...");
+  
+  int filesUploaded = 0;
+  String oldest;
+  
+  // Upload ALL files in queue until empty
+  while (findOldestQueueFile(oldest)) {
+    if (!initSdCard()) {
+      Serial.println("[QUEUE-UPLOAD] SD card access failed");
+      break;
+    }
+    
+    String base = oldest.substring(String(QUEUE_DIR).length() + 1);
+    Serial.printf("[QUEUE-UPLOAD] Uploading file %d: %s\n", filesUploaded + 1, base.c_str());
+    
+    bool ok = uploadFileToRoot(oldest, base);
+    if (ok && initSdCard()) { 
+      sd.remove(oldest.c_str());
+      filesUploaded++;
+      Serial.printf("[QUEUE-UPLOAD] Successfully uploaded and removed: %s\n", oldest.c_str());
+    } else {
+      Serial.printf("[QUEUE-UPLOAD] Failed to upload: %s\n", oldest.c_str());
+      break; // Stop on first failure
+    }
+    
+    delay(100); // Small delay between uploads
+  }
+  
+  Serial.printf("[QUEUE-UPLOAD] Queue upload complete. Files uploaded: %d\n", filesUploaded);
+}
+
+// Collector: Upload queue and sync jobs (legacy function, now calls queue-based upload)
 // =============================
 void processQueue() {
   // For COLLECTOR: uplink via HTTP
@@ -1578,15 +1720,22 @@ void loopOperationalMode() {
         }
 
         if (config.role == ROLE_COLLECTOR) {
-          processQueue();
-
+          // Queue-based upload: Upload ALL files until queue is empty
+          uploadAllQueuedFiles();
+          
+          // After uploading, sync jobs from parent
+          syncJobsFromRoot();
+          
+          // Check if queue is truly empty
           String still;
           if (!findOldestQueueFile(still)) {
-            Serial.println("[UPLINK] Queue empty → sleeping early.");
+            Serial.println("[UPLINK] Queue empty and jobs synced → sleeping early.");
             started = false;
             bleScanned = false; // Reset for next cycle
             decideAndGoToSleep();
             return;
+          } else {
+            Serial.println("[UPLINK] Warning: Queue still has files after upload attempt");
           }
         }
 
