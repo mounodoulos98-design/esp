@@ -563,7 +563,11 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
     Serial.printf("[TIME] STA to %s...\n", config.uplinkSSID.c_str());
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeout_ms) { delay(200); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeout_ms) {
+      delay(200);
+      // Reset watchdog during WiFi connection attempt to prevent timeout
+      esp_task_wdt_reset();
+    }
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[TIME] STA connect failed");
@@ -750,7 +754,11 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
     Serial.printf("[UPLINK] Connecting STA to %s...\n", config.uplinkSSID.c_str());
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(200); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+      delay(200);
+      // Reset watchdog during WiFi connection attempt to prevent timeout
+      esp_task_wdt_reset();
+    }
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[UPLINK] STA connect failed");
@@ -814,7 +822,11 @@ bool downloadFileFromRoot(const String& remotePath, const String& localPath) {
     Serial.printf("[DOWNLOAD] Connecting STA to %s...\n", config.uplinkSSID.c_str());
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(200); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+      delay(200);
+      // Reset watchdog during WiFi connection attempt to prevent timeout
+      esp_task_wdt_reset();
+    }
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[DOWNLOAD] STA connect failed");
