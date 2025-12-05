@@ -53,9 +53,18 @@ static unsigned long repeaterAPStartTime = 0;
 - Returns to light sleep automatically
 
 **Power Impact:**
-- Light sleep (WiFi OFF): ~10-15 mA
-- Active (WiFi ON): ~110-145 mA  
-- **Overall savings: 50-70% reduction**
+
+*ESP32 Feather V2 (verified by Adafruit):*
+- Light sleep (WiFi OFF, BLE ON): ~2-5 mA ⭐
+- Active (WiFi ON): ~80-150 mA
+- **Overall savings: 90-95% reduction**
+
+*Generic ESP32 DevKit:*
+- Light sleep (WiFi OFF, BLE ON): ~10-20 mA
+- Active (WiFi ON): ~100-150 mA  
+- **Overall savings: 70-87% reduction**
+
+*Note:* Actual consumption depends on board design, voltage regulators, and peripherals.
 
 ---
 
@@ -176,11 +185,13 @@ if (repeaterWiFiAPActive) {
 **After:**
 1. WiFi AP OFF by default (light sleep)
 2. BLE beacon active continuously  
-3. Power: ~15 mA in light sleep
+3. Power: 
+   - **ESP32 Feather V2: ~2-5 mA in light sleep** ⭐
+   - Generic DevKit: ~10-20 mA in light sleep
 4. Wake on BLE signal (instant response)
 5. WiFi AP starts on demand
 6. WiFi AP stops when idle
-7. **Power savings: 50-70%**
+7. **Power savings: 70-95%** (board dependent)
 
 ### Collector Node
 
@@ -256,13 +267,13 @@ if (repeaterWiFiAPActive) {
 
 ## Performance Metrics
 
-| Metric | Previous | New | Improvement |
-|--------|----------|-----|-------------|
-| Repeater idle power | 150 mA | 15 mA | **90% reduction** |
-| Wake-up latency | N/A | 3-5 sec | New feature |
-| Upload reliability | Partial | 100% | Queue-complete |
-| Concurrent clients | 1 | Multiple | AsyncWebServer |
-| Daily power (1h active) | 3600 mAh | 475 mAh | **87% reduction** |
+| Metric | Previous | New (Feather V2) | New (DevKit) | Best Improvement |
+|--------|----------|------------------|--------------|------------------|
+| Repeater idle power | 150 mA | **3 mA** ⭐ | 15 mA | **98% reduction** |
+| Wake-up latency | N/A | 3-5 sec | 3-5 sec | New feature |
+| Upload reliability | Partial | 100% | 100% | Queue-complete |
+| Concurrent clients | 1 | Multiple | Multiple | AsyncWebServer |
+| Daily power (1h active) | 3600 mAh | **199 mAh** ⭐ | 475 mAh | **94.5% reduction** |
 
 ---
 

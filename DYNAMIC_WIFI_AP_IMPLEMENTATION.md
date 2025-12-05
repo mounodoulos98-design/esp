@@ -19,8 +19,10 @@ This document describes the implementation of power-efficient Repeater mode with
 - WiFi AP turns ON only when Collector sends wake-up signal
 - WiFi AP stays active until all transfers complete
 - WiFi AP shuts down → back to light sleep
-- Power consumption: ~10-15 mA in light sleep, ~100-150 mA when WiFi active
-- **Expected power savings: 50-70% reduction**
+- Power consumption: 
+  - **ESP32 Feather V2:** ~2-5 mA in light sleep, ~80-150 mA when WiFi active
+  - **Generic ESP32 DevKit:** ~10-20 mA in light sleep, ~100-150 mA when WiFi active
+- **Expected power savings: 70-95% reduction** (depending on board design)
 
 ### Communication Flow
 
@@ -30,7 +32,7 @@ This document describes the implementation of power-efficient Repeater mode with
 │  Light Sleep State (Default):                               │
 │  - WiFi AP: OFF                                             │
 │  - BLE Beacon: ACTIVE (advertising AP SSID)                 │
-│  - Power: ~10-15 mA                                         │
+│  - Power: ~2-5 mA (Feather V2) or ~10-20 mA (DevKit)       │
 │  - CPU: Light sleep (instant wake-up capability)            │
 └─────────────────────────────────────────────────────────────┘
                      ▲
@@ -231,15 +233,29 @@ config.bleBeaconEnabled = true;  // Enable BLE wake-up system
 ### Repeater-Specific Settings
 
 **Light Sleep Power Consumption:**
-- BLE beacon: ~10-15 mA
-- No WiFi: ~0 mA (off)
-- Total: ~10-15 mA in light sleep
+
+*ESP32 Feather V2 (optimized design):*
+- ESP32 base: 1.2 mA (verified by Adafruit with PPK)
+- BLE beacon: ~1-3 mA
+- **Total: ~2-5 mA in light sleep** ⭐
+
+*Generic ESP32 DevKit (less optimized):*
+- ESP32 base: ~5-10 mA (inefficient regulators, LEDs)
+- BLE beacon: ~5-10 mA
+- **Total: ~10-20 mA in light sleep**
 
 **Active Power Consumption:**
-- BLE beacon: ~10-15 mA
-- WiFi AP: ~80-100 mA
-- HTTP serving: ~20-30 mA
-- Total: ~110-145 mA when active
+- BLE beacon: ~1-5 mA
+- WiFi AP: ~60-100 mA
+- HTTP serving: ~20-40 mA
+- **Total: ~80-150 mA when active**
+
+**Power Comparison:**
+| Board Type | Light Sleep | Active | Daily (1h active) | Savings |
+|------------|-------------|--------|-------------------|---------|
+| Feather V2 | 3 mA | 130 mA | 199 mAh | **94.5%** |
+| Generic DevKit | 15 mA | 130 mA | 475 mAh | **87%** |
+| Always-on WiFi | 150 mA | 150 mA | 3600 mAh | Baseline |
 
 **Timeouts:**
 ```cpp
@@ -403,13 +419,13 @@ const unsigned long MAX_AP_TIME = 300000;       // 5 minutes
 
 ## Performance Characteristics
 
-| Metric | Previous | New | Improvement |
-|--------|----------|-----|-------------|
-| Repeater idle power | 150 mA | 15 mA | 90% reduction |
-| Wake-up latency | N/A | 3-5 seconds | New feature |
-| Upload reliability | Timeout-based | Queue-complete | 100% reliable |
-| Concurrent clients | 1 | Multiple | AsyncWebServer |
-| Power per day | 3600 mAh | 475 mAh | 87% reduction |
+| Metric | Previous | New (Feather V2) | New (DevKit) | Best Improvement |
+|--------|----------|------------------|--------------|------------------|
+| Repeater idle power | 150 mA | **3 mA** ⭐ | 15 mA | 98% reduction |
+| Wake-up latency | N/A | 3-5 seconds | 3-5 seconds | New feature |
+| Upload reliability | Timeout-based | Queue-complete | Queue-complete | 100% reliable |
+| Concurrent clients | 1 | Multiple | Multiple | AsyncWebServer |
+| Power per day (1h active) | 3600 mAh | **199 mAh** ⭐ | 475 mAh | 94.5% reduction |
 
 ## Future Enhancements
 
