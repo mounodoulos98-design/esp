@@ -85,6 +85,27 @@ static AsyncWebServer sensorServer(3000);
 static BLEBeaconManager bleBeacon;
 static BLEScannerManager bleScanner;
 
+// Repeater dynamic WiFi AP control
+static bool repeaterWiFiAPActive = false;
+static unsigned long repeaterAPStartTime = 0;
+
+// Forward declarations for Repeater WiFi control
+void startRepeaterWiFiAP();
+void ensureRepeaterHttpServer();
+
+// BLE Wake-up callback for Repeater
+class RepeaterWakeupCallback : public BLEWakeupCallback {
+public:
+    void onWakeupRequest() override {
+        Serial.println("[REPEATER-WAKEUP] Wake-up request received via BLE");
+        // Start WiFi AP when wake-up signal received
+        startRepeaterWiFiAP();
+        ensureRepeaterHttpServer();
+    }
+};
+
+static RepeaterWakeupCallback repeaterWakeupCb;
+
 // === Simple Memory-Based Buffer for Callback-to-Loop Communication ===
 // FreeRTOS queues cause mutex crashes when used from AsyncWebServer callbacks.
 // This uses simple volatile arrays that are safe to write from any context.
@@ -477,6 +498,37 @@ void ensureRootHttpServer() {
   rootServer.begin();
   rootHttpActive = true;
   Serial.println("[ROOT] HTTP server started on :8080 (/health, /time, /ingest, /jobs, /firmware)");
+}
+
+// Start Repeater WiFi AP (dynamic control)
+void startRepeaterWiFiAP() {
+  if (repeaterWiFiAPActive) return;
+  
+  String ssid = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
+  String pass = config.apPASS;
+  String ipStr = config.apIP.length() ? config.apIP : String("192.168.20.1");
+  bool ok = safeBringUpAP(ssid, pass, ipStr, "REPEATER");
+  
+  if (ok) {
+    repeaterWiFiAPActive = true;
+    repeaterAPStartTime = millis();
+    Serial.printf("[REPEATER] WiFi AP started: %s | IP=%s\n", 
+                  ssid.c_str(), WiFi.softAPIP().toString().c_str());
+  } else {
+    Serial.println("[REPEATER] Failed to start WiFi AP!");
+  }
+}
+
+// Stop Repeater WiFi AP (dynamic control)
+void stopRepeaterWiFiAP() {
+  if (!repeaterWiFiAPActive) return;
+  
+  WiFi.softAPdisconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_OFF);
+  repeaterWiFiAPActive = false;
+  
+  Serial.println("[REPEATER] WiFi AP stopped, entering light sleep mode");
 }
 
 void ensureWiFiAPRepeater() {
@@ -1135,26 +1187,44 @@ void loopOperationalMode() {
 
   // REPEATER
   if (config.role == ROLE_REPEATER) {
-    ensureWiFiAPRepeater();
-    ensureRepeaterHttpServer();
-    
-    // Repeater uses continuous BLE beacon with light sleep (not deep sleep)
-    // This allows collectors to find and wake it at any time
+    // Initialize BLE beacon with wake-up callback (only once)
     if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
       // Use actual AP SSID (same logic as ensureWiFiAPRepeater)
       String actualAPSSID = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
-      bleBeacon.begin(actualAPSSID, config.nodeName, 0); // 0 = Repeater role
+      bleBeacon.begin(actualAPSSID, config.nodeName, 0, &repeaterWakeupCb); // 0 = Repeater role, with callback
       bleBeacon.startAdvertising();
-      Serial.println("[BLE-MESH] Repeater BLE beacon active (continuous with light sleep)");
+      Serial.println("[BLE-MESH] Repeater BLE beacon active (WiFi AP OFF by default)");
     }
     
-    static bool tried = false;
-    if (!tried) {
-      tried = true;
+    // Sync time once at startup (before WiFi AP is turned off)
+    static bool timeSynced = false;
+    if (!timeSynced) {
       syncTimeFromUplink(5000);
+      timeSynced = true;
     }
-    // Repeater stays in light sleep with BLE beacon active
-    // No deep sleep - allows instant wake-up when collector connects
+    
+    // Check if WiFi AP should be stopped after transfer completion
+    // WiFi AP is started by wake-up callback and should stop when no clients connected
+    if (repeaterWiFiAPActive) {
+      int numClients = WiFi.softAPgetStationNum();
+      unsigned long apRunTime = millis() - repeaterAPStartTime;
+      
+      // Stop AP if no clients for 30 seconds OR if running for more than 5 minutes
+      const unsigned long NO_CLIENT_TIMEOUT = 30000;  // 30 seconds
+      const unsigned long MAX_AP_TIME = 300000;       // 5 minutes
+      
+      if (numClients == 0 && apRunTime > NO_CLIENT_TIMEOUT) {
+        Serial.println("[REPEATER] No clients connected, stopping WiFi AP");
+        stopRepeaterWiFiAP();
+      } else if (apRunTime > MAX_AP_TIME) {
+        Serial.println("[REPEATER] Max AP time exceeded, stopping WiFi AP");
+        stopRepeaterWiFiAP();
+      }
+    }
+    
+    // Repeater stays in light sleep with BLE beacon active when WiFi AP is off
+    // No deep sleep - allows instant wake-up when collector sends BLE signal
+    return;
   }
 
   // NON-ROOT STATE MACHINE
@@ -1467,20 +1537,34 @@ void loopOperationalMode() {
             String scannerName = config.nodeName + "_Scanner";
             bleScanner.begin(scannerName);
             BLEScannerManager::ScanResult result = bleScanner.scanForParent(config.bleScanDurationSec);
-            bleScanner.stop();
-            bleScanned = true;
             
             if (result.found) {
               Serial.printf("[BLE-MESH] Found parent SSID: %s (Role: %s, RSSI: %d dBm)\n",
                            result.apSSID.c_str(),
                            result.nodeRole == 1 ? "Root" : "Repeater",
                            result.rssi);
+              
+              // If parent is Repeater (role=0), send wake-up signal to start WiFi AP
+              if (result.nodeRole == 0) {
+                Serial.println("[BLE-WAKEUP] Parent is Repeater, sending wake-up signal...");
+                if (bleScanner.sendWakeupSignal(result.address)) {
+                  Serial.println("[BLE-WAKEUP] Wake-up signal sent successfully, waiting for WiFi AP...");
+                  // Wait for WiFi AP to start (give Repeater time to bring up AP)
+                  delay(3000);
+                } else {
+                  Serial.println("[BLE-WAKEUP] Failed to send wake-up signal");
+                }
+              }
+              
               // Override uplinkSSID with discovered AP SSID from BLE
               config.uplinkSSID = result.apSSID;
               Serial.printf("[BLE-MESH] Using discovered AP SSID for WiFi: %s\n", config.uplinkSSID.c_str());
             } else {
               Serial.println("[BLE-MESH] No parent found via BLE, proceeding with configured uplink");
             }
+            
+            bleScanner.stop();
+            bleScanned = true;
           }
 
           time(&state_start_time);
