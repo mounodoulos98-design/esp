@@ -13,8 +13,9 @@ void saveConfiguration() {
   preferences.putString("apIP", config.apIP);
 preferences.putString("nodeName", config.nodeName);
   preferences.putInt("role", config.role);
-  preferences.putInt("meshInt", config.meshIntervalMin);
-  preferences.putInt("meshWin", config.meshWindowSec);
+  preferences.putInt("uplinkInt", config.uplinkIntervalMin);
+  preferences.putInt("uplinkWin", config.uplinkWindowSec);
+  preferences.putInt("uplinkMax", config.uplinkMaxWindowSec);
   // uplink
   preferences.putString("uplinkSSID", config.uplinkSSID);
   preferences.putString("uplinkPASS", config.uplinkPASS);
@@ -47,8 +48,9 @@ void loadConfiguration() {
       config.apIP = preferences.getString("apIP", "");
       config.nodeName = preferences.getString("nodeName", "DefaultNode");
       config.role = preferences.getInt("role", ROLE_REPEATER);
-      config.meshIntervalMin = preferences.getInt("meshInt", MESH_APPOINTMENT_INTERVAL_M);
-      config.meshWindowSec = preferences.getInt("meshWin", MESH_APPOINTMENT_WINDOW_S);
+      config.uplinkIntervalMin = preferences.getInt("uplinkInt", UPLINK_INTERVAL_M);
+      config.uplinkWindowSec = preferences.getInt("uplinkWin", UPLINK_WINDOW_S);
+      config.uplinkMaxWindowSec = preferences.getInt("uplinkMax", UPLINK_MAX_WINDOW_MS / 1000);
       // uplink
       config.uplinkSSID = preferences.getString("uplinkSSID", ROOT_AP_SSID);
       config.uplinkPASS = preferences.getString("uplinkPASS", ROOT_AP_PASSWORD);

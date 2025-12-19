@@ -44,8 +44,9 @@
 #define TCP_SERVER_PORT         3000
 
 // Timing Defaults
-#define MESH_APPOINTMENT_INTERVAL_M 15
-#define MESH_APPOINTMENT_WINDOW_S   60
+#define UPLINK_INTERVAL_M           15      // How often to sync with Repeater/Root (minutes)
+#define UPLINK_WINDOW_S             60      // Repeater AP window duration (seconds)
+#define UPLINK_MAX_WINDOW_MS        300000  // Maximum uplink session duration (5 minutes)
 #define COLLECTOR_AP_CYCLE_S        120
 #define COLLECTOR_AP_WINDOW_S       1200
 #define COLLECTOR_DATA_TIMEOUT_S    1200
@@ -61,7 +62,7 @@
 enum UplinkRoute { UPLINK_DIRECT, UPLINK_VIA_REPEATER };
 enum NodeRole { ROLE_REPEATER, ROLE_COLLECTOR, ROLE_ROOT };
 enum Status { STATUS_BOOTING, STATUS_CONFIG_MODE, STATUS_OPERATIONAL_IDLE, STATUS_WIFI_ACTIVITY, STATUS_RECEIVING_DATA, STATUS_SENDING_DATA, STATUS_ERROR, STATUS_SLEEPING };
-enum State { STATE_INITIAL, STATE_COLLECTOR_AP, STATE_MESH_APPOINTMENT };
+enum State { STATE_INITIAL, STATE_COLLECTOR_AP, STATE_UPLINK };
 
 // Configuration Structure
 struct NodeConfig {
@@ -83,8 +84,9 @@ struct NodeConfig {
   int collectorApCycleSec = COLLECTOR_AP_CYCLE_S;
   int collectorApWindowSec = COLLECTOR_AP_WINDOW_S;
   int collectorDataTimeoutSec = COLLECTOR_DATA_TIMEOUT_S;
-  int meshIntervalMin = MESH_APPOINTMENT_INTERVAL_M;
-  int meshWindowSec = MESH_APPOINTMENT_WINDOW_S;
+  int uplinkIntervalMin = UPLINK_INTERVAL_M;
+  int uplinkWindowSec = UPLINK_WINDOW_S;
+  int uplinkMaxWindowSec = UPLINK_MAX_WINDOW_MS / 1000; // Convert from MS to seconds for web config
   bool isConfigured = false;
   
   // BLE Mesh Wake-up Configuration
