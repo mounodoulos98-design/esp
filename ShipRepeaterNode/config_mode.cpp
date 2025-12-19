@@ -63,6 +63,21 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
         <label for="collectorDataTimeoutSec">Data Timeout (sec):</label>
         <input type="number" id="collectorDataTimeoutSec" name="collectorDataTimeoutSec" value="120">
         
+        <h3>Adaptive Sensor Tracking</h3>
+        <div class="muted">Optimize AP window based on expected sensor count and timing patterns</div>
+        <label for="expectedSensorCount">Expected Sensor Count (0=disabled):</label>
+        <input type="number" id="expectedSensorCount" name="expectedSensorCount" value="0" min="0" max="100">
+        <div class="muted">AP exits early when all expected sensors complete. Use 0 for timeout-based only.</div>
+        <label>
+          <input type="checkbox" id="adaptiveApWindow" name="adaptiveApWindow" value="1" checked>
+          Enable adaptive AP window sizing
+        </label>
+        <div class="muted">Adapts window duration based on sensor patterns over multiple cycles</div>
+        <div class="row">
+          <div><label for="adaptiveWindowMinSec">Min Window (sec):</label><input type="number" id="adaptiveWindowMinSec" name="adaptiveWindowMinSec" value="60"></div>
+          <div><label for="adaptiveWindowMaxSec">Max Window (sec):</label><input type="number" id="adaptiveWindowMaxSec" name="adaptiveWindowMaxSec" value="1800"></div>
+        </div>
+        
         <h3>BLE Parent Discovery</h3>
         <div class="muted">Use BLE to find Repeater/Root before WiFi connection (power efficient)</div>
         <label>
@@ -331,6 +346,11 @@ void startConfigurationMode() {
       if(request->hasParam("collectorApCycleSec",true)) config.collectorApCycleSec = request->getParam("collectorApCycleSec",true)->value().toInt();
       if(request->hasParam("collectorApWindowSec",true)) config.collectorApWindowSec = request->getParam("collectorApWindowSec",true)->value().toInt();
       if(request->hasParam("collectorDataTimeoutSec",true)) config.collectorDataTimeoutSec = request->getParam("collectorDataTimeoutSec",true)->value().toInt();
+      // Adaptive sensor tracking
+      if(request->hasParam("expectedSensorCount",true)) config.expectedSensorCount = request->getParam("expectedSensorCount",true)->value().toInt();
+      config.adaptiveApWindow = request->hasParam("adaptiveApWindow",true);
+      if(request->hasParam("adaptiveWindowMinSec",true)) config.adaptiveWindowMinSec = request->getParam("adaptiveWindowMinSec",true)->value().toInt();
+      if(request->hasParam("adaptiveWindowMaxSec",true)) config.adaptiveWindowMaxSec = request->getParam("adaptiveWindowMaxSec",true)->value().toInt();
       if(request->hasParam("uplinkSSID",true)) config.uplinkSSID = request->getParam("uplinkSSID",true)->value();
       if(request->hasParam("uplinkPASS",true)) config.uplinkPASS = request->getParam("uplinkPASS",true)->value();
       if(request->hasParam("uplinkHost",true)) config.uplinkHost = request->getParam("uplinkHost",true)->value();

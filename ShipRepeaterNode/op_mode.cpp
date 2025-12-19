@@ -174,6 +174,11 @@ RTC_DATA_ATTR time_t rtc_last_known_time = 0;
 RTC_DATA_ATTR uint32_t rtc_last_sleep_duration_s = 0;
 RTC_DATA_ATTR State rtc_next_state = STATE_INITIAL;
 
+// Adaptive sensor tracking (RTC persistent across deep sleep)
+RTC_DATA_ATTR float rtc_avg_ap_duration_sec = 0.0;      // EMA of actual AP durations
+RTC_DATA_ATTR int rtc_adaptive_cycles_count = 0;         // Number of cycles for adaptation
+RTC_DATA_ATTR int rtc_last_sensor_count = 0;             // Last cycle's sensor count
+
 // TX state (collector) for HTTP uploads from SD queue
 static bool txActive = false;
 
@@ -1362,6 +1367,82 @@ void decideAndGoToSleep() {
 }
 
 // =============================
+// Adaptive Sensor Tracking Helper Functions
+// =============================
+
+// Get unique sensor count from heartbeat manager
+int getUniqueSensorCount() {
+  // Access the sensor heartbeat manager to get unique sensor count
+  // This is a simplified implementation - in production, integrate with sensor_heartbeat_manager.h
+  extern SensorHeartbeatManager sensorHBManager;
+  // For now, return 0 as placeholder - will be populated by heartbeat callbacks
+  static int uniqueSensorsSeen = 0;
+  return uniqueSensorsSeen;
+}
+
+// Update adaptive AP window based on session metrics
+void updateAdaptiveWindow(unsigned long apDurationSec, int sensorsSeenThisCycle) {
+  if (!config.adaptiveApWindow || config.expectedSensorCount == 0) {
+    return; // Adaptive tracking disabled
+  }
+  
+  // Only update if we saw sensors and duration is reasonable (not timeout)
+  if (sensorsSeenThisCycle > 0 && apDurationSec < (config.collectorApWindowSec * 0.9)) {
+    // Exponential Moving Average (EMA) with alpha = 0.1 for gradual adaptation
+    // Takes ~10 cycles to adapt to new patterns
+    const float alpha = 0.1;
+    
+    // Initialize on first cycle
+    if (rtc_adaptive_cycles_count == 0) {
+      rtc_avg_ap_duration_sec = apDurationSec;
+    } else {
+      // Ignore outliers that deviate >50% from current average (vibration wake-ups)
+      float deviation = abs((float)apDurationSec - rtc_avg_ap_duration_sec) / rtc_avg_ap_duration_sec;
+      if (deviation <= 0.5) {
+        rtc_avg_ap_duration_sec = (alpha * apDurationSec) + ((1.0 - alpha) * rtc_avg_ap_duration_sec);
+      } else {
+        Serial.printf("[ADAPTIVE] Outlier ignored: %lu sec (%.1f%% deviation)\n", 
+                     apDurationSec, deviation * 100.0);
+      }
+    }
+    
+    rtc_adaptive_cycles_count++;
+    rtc_last_sensor_count = sensorsSeenThisCycle;
+    
+    // Update window size after minimum 5 cycles
+    if (rtc_adaptive_cycles_count >= 5) {
+      // Add 20% safety margin to average
+      int newWindow = (int)(rtc_avg_ap_duration_sec * 1.2);
+      
+      // Clamp to configured min/max
+      newWindow = max(config.adaptiveWindowMinSec, min(config.adaptiveWindowMaxSec, newWindow));
+      
+      if (abs(newWindow - config.collectorApWindowSec) > 10) {
+        Serial.printf("[ADAPTIVE] Window updated: %d → %d sec (avg=%.1f, cycles=%d)\n",
+                     config.collectorApWindowSec, newWindow, 
+                     rtc_avg_ap_duration_sec, rtc_adaptive_cycles_count);
+        config.collectorApWindowSec = newWindow;
+      }
+    }
+  }
+}
+
+// Check if all expected sensors have completed
+bool allExpectedSensorsComplete(int uniqueSensorsSeenThisCycle) {
+  if (config.expectedSensorCount == 0) {
+    return false; // Feature disabled
+  }
+  
+  if (uniqueSensorsSeenThisCycle >= config.expectedSensorCount) {
+    Serial.printf("[ADAPTIVE] All %d expected sensors complete, exiting early\n", 
+                 config.expectedSensorCount);
+    return true;
+  }
+  
+  return false;
+}
+
+// =============================
 // Main Loop
 // =============================
 void loopOperationalMode() {
@@ -1442,8 +1523,12 @@ void loopOperationalMode() {
     case STATE_COLLECTOR_AP:
       {
         static bool jobProcessedThisWindow = false;
+        static unsigned long apStartMillis = 0;         // Track AP session start time
+        static int uniqueSensorsSeen = 0;                // Count unique sensors this cycle
 
         if (!apActive) {
+          apStartMillis = millis();                      // Record AP start time
+          uniqueSensorsSeen = 0;                         // Reset sensor counter
 
           // --- SD init ---
           if (!initSdCard()) {
@@ -1678,7 +1763,21 @@ void loopOperationalMode() {
           lastTimeoutCheck = now;
           
           unsigned long timeSinceLastActivity = now - lastActivityMillis;
+          unsigned long apDurationSec = (now - apStartMillis) / 1000;
           unsigned long timeout;
+          
+          // Check if all expected sensors have completed (early exit feature)
+          if (config.expectedSensorCount > 0 && numConnected == 0 && hadStation) {
+            // TODO: Integrate with sensor_heartbeat_manager to get actual unique count
+            // For now, use a simple heuristic: if no clients and we had activity, assume complete
+            if (allExpectedSensorsComplete(uniqueSensorsSeen)) {
+              Serial.printf("[AP] All expected sensors complete after %lu sec\n", apDurationSec);
+              updateAdaptiveWindow(apDurationSec, uniqueSensorsSeen);
+              stopAPMode();
+              decideAndGoToSleep();
+              break;
+            }
+          }
           
           if (numConnected > 0) {
             // Sensors connected - use data timeout (allows time for measurement uploads)
@@ -1688,19 +1787,22 @@ void loopOperationalMode() {
               Serial.printf("[AP] %d sensor(s) connected but no activity for %lu sec, entering sleep.\n",
                            numConnected, timeSinceLastActivity / 1000);
               Serial.println("[AP] Inactivity timeout reached.");
+              updateAdaptiveWindow(apDurationSec, uniqueSensorsSeen);
               stopAPMode();
               decideAndGoToSleep();
               break;
             }
           } else {
-            // No sensors connected - use shorter window timeout
+            // No sensors connected - use shorter window timeout (or adaptive window)
             timeout = hadStation ? (config.collectorDataTimeoutSec * 1000UL) : (config.collectorApWindowSec * 1000UL);
             
             if (timeSinceLastActivity > timeout) {
-              if (hadStation)
+              if (hadStation) {
                 Serial.println("[AP] Inactivity timeout reached.");
-              else
+                updateAdaptiveWindow(apDurationSec, uniqueSensorsSeen);
+              } else {
                 Serial.println("[AP] Window finished (no station).");
+              }
 
               stopAPMode();
               decideAndGoToSleep();

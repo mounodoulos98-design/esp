@@ -27,6 +27,11 @@ preferences.putString("nodeName", config.nodeName);
     preferences.putInt("collCyc", config.collectorApCycleSec);
     preferences.putInt("collWin", config.collectorApWindowSec);
     preferences.putInt("collTout", config.collectorDataTimeoutSec);
+    // Adaptive sensor tracking
+    preferences.putInt("expSensors", config.expectedSensorCount);
+    preferences.putBool("adaptiveAP", config.adaptiveApWindow);
+    preferences.putInt("adaptMinSec", config.adaptiveWindowMinSec);
+    preferences.putInt("adaptMaxSec", config.adaptiveWindowMaxSec);
   }
   
   // Save BLE mesh wake-up configuration
@@ -61,6 +66,11 @@ void loadConfiguration() {
         config.collectorApCycleSec = preferences.getInt("collCyc", COLLECTOR_AP_CYCLE_S);
         config.collectorApWindowSec = preferences.getInt("collWin", COLLECTOR_AP_WINDOW_S);
         config.collectorDataTimeoutSec = preferences.getInt("collTout", COLLECTOR_DATA_TIMEOUT_S);
+        // Adaptive sensor tracking
+        config.expectedSensorCount = preferences.getInt("expSensors", 0);
+        config.adaptiveApWindow = preferences.getBool("adaptiveAP", true);
+        config.adaptiveWindowMinSec = preferences.getInt("adaptMinSec", 60);
+        config.adaptiveWindowMaxSec = preferences.getInt("adaptMaxSec", 1800);
       }
       
       // Load BLE mesh wake-up configuration
