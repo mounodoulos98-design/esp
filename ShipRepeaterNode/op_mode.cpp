@@ -118,12 +118,53 @@ static RepeaterWakeupCallback repeaterWakeupCb;
 // FreeRTOS queues cause mutex crashes when used from AsyncWebServer callbacks.
 // This uses simple volatile arrays that are safe to write from any context.
 
+// Sensor heartbeat tracking (matching Python daemon heartbeats_after_measurement logic)
+struct SensorHeartbeatCounter {
+  String sensorSn;
+  int heartbeatsAfterMeasurement;  // -1=first boot, 0=just uploaded, 1=first HB after upload, >1=ready for config
+  unsigned long lastHeartbeatTime;
+};
+
+static std::vector<SensorHeartbeatCounter> sensorCounters;
+
+// Get or create heartbeat counter for sensor
+static SensorHeartbeatCounter* getOrCreateCounter(const String& sn) {
+  for (auto& counter : sensorCounters) {
+    if (counter.sensorSn == sn) {
+      return &counter;
+    }
+  }
+  
+  SensorHeartbeatCounter counter;
+  counter.sensorSn = sn;
+  counter.heartbeatsAfterMeasurement = 0;  // Start at 0, will increment on first heartbeat
+  counter.lastHeartbeatTime = millis();
+  sensorCounters.push_back(counter);
+  return &sensorCounters.back();
+}
+
+// Reset heartbeat counter when sensor uploads measurement data
+static void resetSensorCounter(const String& sn) {
+  SensorHeartbeatCounter* counter = getOrCreateCounter(sn);
+  counter->heartbeatsAfterMeasurement = 0;  // Reset to 0, next heartbeat will be #1
+  Serial.printf("[HB-COUNTER] Reset counter for SN=%s (measurement uploaded)\n", sn.c_str());
+}
+
+// Increment heartbeat counter
+static void incrementSensorCounter(const String& sn) {
+  SensorHeartbeatCounter* counter = getOrCreateCounter(sn);
+  counter->heartbeatsAfterMeasurement++;
+  counter->lastHeartbeatTime = millis();
+  Serial.printf("[HB-COUNTER] SN=%s counter=%d\n", sn.c_str(), counter->heartbeatsAfterMeasurement);
+}
+
 // Heartbeat buffer - stores pending heartbeats for SD logging and job execution
 struct HeartbeatEntry {
   char sensorSn[32];
   char sensorIp[20];
   bool hasData;
   bool needsJobCheck;
+  bool isMeasurementUpload;  // True if this is a POST /api/measure completion
   uint8_t statusData[256];
   size_t statusDataLen;
 };
@@ -135,7 +176,8 @@ static HeartbeatEntry hbBuffer[HB_BUFFER_SIZE];
 
 // Queue a heartbeat from callback (safe - no FreeRTOS calls)
 static void bufferHeartbeat(const String& sn, const String& ip, bool needsJobCheck = false, 
-                            const uint8_t* statusData = nullptr, size_t statusDataLen = 0) {
+                            const uint8_t* statusData = nullptr, size_t statusDataLen = 0, 
+                            bool isMeasurementUpload = false) {
   int nextIdx = (hbBufferWriteIdx + 1) % HB_BUFFER_SIZE;
   if (nextIdx == hbBufferReadIdx) {
     // Buffer full, drop oldest
@@ -149,6 +191,7 @@ static void bufferHeartbeat(const String& sn, const String& ip, bool needsJobChe
   entry.sensorIp[sizeof(entry.sensorIp) - 1] = '\0';
   entry.hasData = true;
   entry.needsJobCheck = needsJobCheck;
+  entry.isMeasurementUpload = isMeasurementUpload;
   
   if (statusData && statusDataLen > 0 && statusDataLen <= sizeof(entry.statusData)) {
     memcpy((void*)entry.statusData, statusData, statusDataLen);
@@ -212,6 +255,11 @@ static void processHeartbeatBuffer() {
       // Update last heartbeat time
       lastHeartbeatMillis = millis();
       
+      // Handle measurement upload completion (reset counter)
+      if (entry.isMeasurementUpload) {
+        resetSensorCounter(sn);
+      }
+      
       // Log heartbeat to SD
       if (initSdCard()) {
         ensureDir(RECEIVED_DIR);
@@ -252,14 +300,27 @@ static void processHeartbeatBuffer() {
         }
       }
       
-      // Execute jobs if needed
-      if (entry.needsJobCheck) {
-        Serial.printf("[HB-BUFFER] Checking jobs for SN=%s IP=%s\n", sn.c_str(), ip.c_str());
-        bool didJobs = processJobsForSN(sn, ip);
-        if (didJobs) {
-          Serial.printf("[HB-BUFFER] Jobs executed for SN=%s\n", sn.c_str());
+      // Increment heartbeat counter for this sensor (only for heartbeat GET requests, not measurement uploads)
+      if (entry.needsJobCheck && !entry.isMeasurementUpload) {
+        incrementSensorCounter(sn);
+        
+        // Get current counter value
+        SensorHeartbeatCounter* counter = getOrCreateCounter(sn);
+        
+        // Execute jobs based on heartbeat counter (matching Python daemon logic)
+        // Counter > 1 means sensor has finished uploading measurement and is ready for config
+        if (counter->heartbeatsAfterMeasurement > 1) {
+          Serial.printf("[HB-BUFFER] Checking jobs for SN=%s IP=%s (counter=%d)\n", 
+                       sn.c_str(), ip.c_str(), counter->heartbeatsAfterMeasurement);
+          bool didJobs = processJobsForSN(sn, ip);
+          if (didJobs) {
+            Serial.printf("[HB-BUFFER] Jobs executed for SN=%s\n", sn.c_str());
+          } else {
+            Serial.printf("[HB-BUFFER] No jobs found for SN=%s\n", sn.c_str());
+          }
         } else {
-          Serial.printf("[HB-BUFFER] No jobs found for SN=%s\n", sn.c_str());
+          Serial.printf("[HB-BUFFER] Skipping jobs for SN=%s (counter=%d, waiting for measurement upload)\n",
+                       sn.c_str(), counter->heartbeatsAfterMeasurement);
         }
       }
       
@@ -1558,13 +1619,17 @@ void loopOperationalMode() {
             
             String sensorSn = request->getParam("sensor_sn")->value();
             IPAddress remoteIp = request->client()->remoteIP();
+            String ipStr = remoteIp.toString();
+            
+            // Store IP->SN mapping for measurement upload tracking
+            recentIpToSn[ipStr] = sensorSn;
             
             // Log to Serial and buffer for main loop processing
             Serial.printf("[HB-LEGACY] GET /api/heartbeat from SN=%s IP=%s\n", 
-                         sensorSn.c_str(), remoteIp.toString().c_str());
+                         sensorSn.c_str(), ipStr.c_str());
             
             // Buffer with job check enabled - main loop will process
-            bufferHeartbeat(sensorSn, remoteIp.toString(), true);
+            bufferHeartbeat(sensorSn, ipStr, true);
             
             request->send(200, "text/plain", "OK");
             lastActivityMillis = millis();
@@ -1620,14 +1685,29 @@ void loopOperationalMode() {
           );
 
           // Legacy POST /api/measure - sensor sends measurement data
+          // Store IP->SN mapping from recent heartbeats for counter reset
+          static std::map<String, String> recentIpToSn;
+          
           sensorServer.on(
             "/api/measure",
             HTTP_POST,
             [](AsyncWebServerRequest *request) {
               // This is called AFTER all body chunks are received
               IPAddress remoteIp = request->client()->remoteIP();
-              Serial.printf("[HB-LEGACY] POST /api/measure completed from IP=%s\n", 
-                           remoteIp.toString().c_str());
+              String ipStr = remoteIp.toString();
+              
+              Serial.printf("[HB-LEGACY] POST /api/measure completed from IP=%s\n", ipStr.c_str());
+              
+              // Find sensor S/N from recent heartbeats by IP
+              auto it = recentIpToSn.find(ipStr);
+              if (it != recentIpToSn.end()) {
+                String sensorSn = it->second;
+                // Buffer measurement completion to reset counter in main loop
+                bufferHeartbeat(sensorSn, ipStr, false, nullptr, 0, true);
+                Serial.printf("[HB-LEGACY] Measurement upload completed for SN=%s, counter will reset\n", 
+                             sensorSn.c_str());
+              }
+              
               request->send(200, "text/plain", "OK");
               lastActivityMillis = millis();
             },
