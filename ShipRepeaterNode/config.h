@@ -90,12 +90,6 @@ struct NodeConfig {
   // BLE Mesh Wake-up Configuration
   bool bleBeaconEnabled = true;  // Enable BLE beacon for parent discovery (Repeater/Root)
   int bleScanDurationSec = 5;    // Duration to scan for parent nodes (Collector/Repeater)
-  
-  // Adaptive Sensor Tracking (Collector only)
-  int expectedSensorCount = 0;       // Expected number of sensors (0 = disabled, use timeout only)
-  bool adaptiveApWindow = true;      // Enable adaptive AP window sizing
-  int adaptiveWindowMinSec = 60;     // Minimum adaptive window duration
-  int adaptiveWindowMaxSec = 1800;   // Maximum adaptive window duration
 };
 
 // Extern declarations
