@@ -94,8 +94,8 @@ static unsigned long repeaterAPStartTime = 0;
 #define REPEATER_MAX_AP_TIME_MS 300000        // 5 minutes
 #define REPEATER_AP_STARTUP_DELAY_MS 3000     // 3 seconds
 
-// Uplink window maximum duration (configurable)
-#define UPLINK_MAX_WINDOW_MS 300000           // 5 minutes max for uplink operations
+// Uplink window maximum duration (now configurable via web UI)
+// Note: config.uplinkMaxWindowSec is loaded from configuration
 
 // Forward declarations for Repeater WiFi control
 void startRepeaterWiFiAP();
@@ -1239,7 +1239,7 @@ void startOperationalMode() {
   if (cause == ESP_SLEEP_WAKEUP_TIMER) {
     currentState = rtc_next_state;
     Serial.printf("[SCHEDULER] Waking up for pre-scheduled state: %s\n",
-                  (currentState == STATE_MESH_APPOINTMENT ? "UPLINK" : "AP"));
+                  (currentState == STATE_UPLINK ? "UPLINK" : "AP"));
   } else {
     currentState = STATE_INITIAL;
   }
@@ -1290,7 +1290,7 @@ void goToDeepSleep(unsigned int seconds) {
 }
 
 void printSchedulerInfo(time_t now) {
-  uint32_t uplink_interval_s = config.meshIntervalMin * 60;  // reused field as uplink interval
+  uint32_t uplink_interval_s = config.uplinkIntervalMin * 60;
   uint32_t time_to_next_uplink = uplink_interval_s - (now % uplink_interval_s);
   Serial.printf("[SCHEDULER] Next UPLINK in: %u sec.\n", time_to_next_uplink);
   if (config.role == ROLE_COLLECTOR) {
@@ -1306,7 +1306,7 @@ void decideAndGoToSleep() {
 
   if (timeinfo->tm_year < (2023 - 1900)) {
     Serial.println("[SCHEDULER] Time not set, will try to sync uplink soon.");
-    rtc_next_state = STATE_MESH_APPOINTMENT;  // reused as UPLINK window
+    rtc_next_state = STATE_UPLINK;
     goToDeepSleep(30);
     return;
   }
@@ -1314,7 +1314,7 @@ void decideAndGoToSleep() {
   Serial.println("[SCHEDULER] Deciding next action before sleeping...");
   printSchedulerInfo(now);
 
-  uint32_t uplink_interval_s = config.meshIntervalMin * 60;  // reuse field
+  uint32_t uplink_interval_s = config.uplinkIntervalMin * 60;
   uint32_t time_to_next_uplink = uplink_interval_s - (now % uplink_interval_s);
   uint32_t sleep_for;
 
@@ -1323,7 +1323,7 @@ void decideAndGoToSleep() {
 
     if (time_to_next_uplink <= time_to_next_ap) {
       // Next window is UPLINK
-      rtc_next_state = STATE_MESH_APPOINTMENT;  // treat as uplink
+      rtc_next_state = STATE_UPLINK;
       sleep_for = time_to_next_uplink;
 
       // If via repeater, wake +30s after the uplink boundary so repeater is ON
@@ -1715,9 +1715,9 @@ void loopOperationalMode() {
 
 
     // ============================================
-    // STATE_MESH_APPOINTMENT (UPLINK WINDOW)
+    // STATE_UPLINK (UPLINK WINDOW)
     // ============================================
-    case STATE_MESH_APPOINTMENT:
+    case STATE_UPLINK:
       {
         static time_t state_start_time = 0;
         static bool started = false;
@@ -1782,8 +1782,9 @@ void loopOperationalMode() {
           unsigned long elapsedMs = (unsigned long)elapsed * 1000;
           
           // Calculate remaining time for upload operations
-          unsigned long remainingTimeMs = (elapsedMs < UPLINK_MAX_WINDOW_MS) ? 
-                                          (UPLINK_MAX_WINDOW_MS - elapsedMs) : 0;
+          unsigned long uplinkMaxWindowMs = config.uplinkMaxWindowSec * 1000UL;
+          unsigned long remainingTimeMs = (elapsedMs < uplinkMaxWindowMs) ? 
+                                          (uplinkMaxWindowMs - elapsedMs) : 0;
           
           if (remainingTimeMs < 10000) {
             Serial.printf("[UPLINK] Insufficient time remaining (%lu ms), skipping upload\n", remainingTimeMs);
@@ -1803,7 +1804,8 @@ void loopOperationalMode() {
           elapsed = now - state_start_time;
           elapsedMs = (unsigned long)elapsed * 1000;
           
-          if (elapsedMs < UPLINK_MAX_WINDOW_MS) {
+          unsigned long uplinkMaxWindowMs = config.uplinkMaxWindowSec * 1000UL;
+          if (elapsedMs < uplinkMaxWindowMs) {
             syncJobsFromRoot();
           } else {
             Serial.println("[UPLINK] Timeout reached, skipping job sync");
@@ -1822,7 +1824,7 @@ void loopOperationalMode() {
         time(&now);
         int elapsed = now - state_start_time;
 
-        if (elapsed < config.meshWindowSec) {
+        if (elapsed < config.uplinkWindowSec) {
           delay(50);
           return;
         }

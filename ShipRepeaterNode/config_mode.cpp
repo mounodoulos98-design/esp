@@ -93,6 +93,14 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
         <input type="text" id="uplinkHost" name="uplinkHost" placeholder="Auto: 192.168.20.1 or 192.168.10.1">
         <label for="uplinkPort">Parent HTTP Port:</label>
         <input type="number" id="uplinkPort" name="uplinkPort" value="8080">
+        
+        <h3>Uplink Timing</h3>
+        <div class="muted">Configure when and how long the Collector connects to parent</div>
+        <div class="row">
+          <div><label for="uplinkIntervalMin">Uplink Interval (min):</label><input type="number" id="uplinkIntervalMin" name="uplinkIntervalMin" value="15" min="1"></div>
+          <div><label for="uplinkMaxWindowSec">Max Uplink Duration (sec):</label><input type="number" id="uplinkMaxWindowSec" name="uplinkMaxWindowSec" value="300" min="60"></div>
+        </div>
+        <div class="muted">Interval: How often to connect to parent. Max Duration: Maximum time for upload session.</div>
       </div>
 
       <!-- REPEATER -->
@@ -127,6 +135,14 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
         <input type="text" id="uplinkHost_r" name="uplinkHost" placeholder="192.168.10.1" required>
         <label for="uplinkPort_r">Root HTTP Port:</label>
         <input type="number" id="uplinkPort_r" name="uplinkPort" value="8080">
+        
+        <h3>Uplink Timing</h3>
+        <div class="muted">Configure when Repeater connects to Root to forward Collector data</div>
+        <div class="row">
+          <div><label for="uplinkIntervalMin_r">Uplink Interval (min):</label><input type="number" id="uplinkIntervalMin_r" name="uplinkIntervalMin" value="15" min="1"></div>
+          <div><label for="uplinkWindowSec_r">Uplink Window (sec):</label><input type="number" id="uplinkWindowSec_r" name="uplinkWindowSec" value="60" min="30"></div>
+        </div>
+        <div class="muted">Interval: How often to connect to Root. Window: How long to keep WiFi AP on for Collectors during uplink.</div>
       </div>
 
       <!-- ROOT -->
@@ -335,6 +351,8 @@ void startConfigurationMode() {
       if(request->hasParam("uplinkPASS",true)) config.uplinkPASS = request->getParam("uplinkPASS",true)->value();
       if(request->hasParam("uplinkHost",true)) config.uplinkHost = request->getParam("uplinkHost",true)->value();
       if(request->hasParam("uplinkPort",true)) config.uplinkPort = request->getParam("uplinkPort",true)->value().toInt();
+      if(request->hasParam("uplinkIntervalMin",true)) config.uplinkIntervalMin = request->getParam("uplinkIntervalMin",true)->value().toInt();
+      if(request->hasParam("uplinkMaxWindowSec",true)) config.uplinkMaxWindowSec = request->getParam("uplinkMaxWindowSec",true)->value().toInt();
       
       // BLE configuration for Collector (scanning for parent)
       config.bleBeaconEnabled = request->hasParam("bleBeaconEnabled",true);
@@ -350,6 +368,8 @@ void startConfigurationMode() {
       if(request->hasParam("uplinkPASS",true)) config.uplinkPASS = request->getParam("uplinkPASS",true)->value();
       if(request->hasParam("uplinkHost",true)) config.uplinkHost = request->getParam("uplinkHost",true)->value();
       if(request->hasParam("uplinkPort",true)) config.uplinkPort = request->getParam("uplinkPort",true)->value().toInt();
+      if(request->hasParam("uplinkIntervalMin",true)) config.uplinkIntervalMin = request->getParam("uplinkIntervalMin",true)->value().toInt();
+      if(request->hasParam("uplinkWindowSec",true)) config.uplinkWindowSec = request->getParam("uplinkWindowSec",true)->value().toInt();
       
       // BLE configuration for Repeater (beacon advertising)
       config.bleBeaconEnabled = request->hasParam("bleBeaconEnabled",true);
