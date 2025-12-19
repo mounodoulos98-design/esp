@@ -78,6 +78,8 @@ bool apActive = false;
 bool needToSyncTime = false;
 // Κάπου δίπλα στα άλλα singletons
 static SensorHeartbeatManager heartbeatManager;
+// IP->SN mapping for tracking sensor measurements
+static std::map<String, String> recentIpToSn;
 // Heartbeat server for sensors on port 3000
 static AsyncWebServer sensorServer(3000);
 
@@ -1685,9 +1687,6 @@ void loopOperationalMode() {
           );
 
           // Legacy POST /api/measure - sensor sends measurement data
-          // Store IP->SN mapping from recent heartbeats for counter reset
-          static std::map<String, String> recentIpToSn;
-          
           sensorServer.on(
             "/api/measure",
             HTTP_POST,
@@ -1884,7 +1883,6 @@ void loopOperationalMode() {
           elapsed = now - state_start_time;
           elapsedMs = (unsigned long)elapsed * 1000;
           
-          unsigned long uplinkMaxWindowMs = config.uplinkMaxWindowSec * 1000UL;
           if (elapsedMs < uplinkMaxWindowMs) {
             syncJobsFromRoot();
           } else {
