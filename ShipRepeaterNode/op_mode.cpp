@@ -148,8 +148,8 @@ static SensorHeartbeatCounter* getOrCreateCounter(const String& sn) {
 // Reset heartbeat counter when sensor uploads measurement data
 static void resetSensorCounter(const String& sn) {
   SensorHeartbeatCounter* counter = getOrCreateCounter(sn);
-  counter->heartbeatsAfterMeasurement = 0;  // Reset to 0, next heartbeat will be #1
-  Serial.printf("[HB-COUNTER] Reset counter for SN=%s (measurement uploaded)\n", sn.c_str());
+  counter->heartbeatsAfterMeasurement = 1;  // Reset to 1, next heartbeat will be #2 and can send CONFIG
+  Serial.printf("[HB-COUNTER] Reset counter for SN=%s to 1 (measurement uploaded, next HB will send CONFIG)\n", sn.c_str());
 }
 
 // Increment heartbeat counter
