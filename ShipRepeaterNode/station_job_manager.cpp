@@ -251,6 +251,13 @@ bool processJobsForSN(const String& sn, const String& ip) {
                         cfg.params   = params;
 
                         Serial.printf("[JOBS] Found CONFIG job for SN=%s\n", sn.c_str());
+                        
+                        // Wait 2 seconds before sending CONFIG (matching Python daemon behavior)
+                        // This gives the sensor time to finish uploading measurement data
+                        // See sensorsdaemon.py line 268-271: wait_before_sending logic
+                        Serial.println("[JOBS] Waiting 2 seconds before sending CONFIG command...");
+                        delay(2000);
+                        
                         bool ok = cu_sendConfiguration(cfg);
                         Serial.printf("[JOBS] CONFIG job result for SN=%s -> %s\n",
                                       sn.c_str(), ok ? "OK" : "FAIL");

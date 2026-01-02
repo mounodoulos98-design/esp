@@ -43,17 +43,32 @@ bool cu_sendConfiguration(const ConfigJob& job)
 
     client.print(request);
 
-    // Wait for response with 5-second timeout (matching Python daemon)
+    // Wait for complete response with 5-second timeout (matching Python daemon)
+    // Python daemon waits for ENTIRE response before closing connection
     unsigned long start = millis();
     String response;
+    bool connectionClosedByServer = false;
+    
     while (millis() - start < 5000UL) {
         while (client.available()) {
             char c = client.read();
             response += c;
         }
-        if (!client.connected() && response.length() > 0) break;
+        
+        // Check if server closed connection
+        if (!client.connected()) {
+            connectionClosedByServer = true;
+            // Continue reading any remaining buffered data
+            while (client.available()) {
+                char c = client.read();
+                response += c;
+            }
+            break;
+        }
         delay(10);
     }
+    
+    // Close connection only after reading all data (matching Python behavior)
     client.stop();
 
     // Extract body from response

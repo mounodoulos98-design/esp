@@ -78,6 +78,8 @@ bool apActive = false;
 bool needToSyncTime = false;
 // Κάπου δίπλα στα άλλα singletons
 static SensorHeartbeatManager heartbeatManager;
+// IP->SN mapping for tracking sensor measurements
+static std::map<String, String> recentIpToSn;
 // Heartbeat server for sensors on port 3000
 static AsyncWebServer sensorServer(3000);
 
@@ -85,9 +87,78 @@ static AsyncWebServer sensorServer(3000);
 static BLEBeaconManager bleBeacon;
 static BLEScannerManager bleScanner;
 
+// Repeater dynamic WiFi AP control
+static bool repeaterWiFiAPActive = false;
+static unsigned long repeaterAPStartTime = 0;
+
+// Repeater WiFi AP timeouts (configurable)
+#define REPEATER_NO_CLIENT_TIMEOUT_MS 30000   // 30 seconds
+#define REPEATER_MAX_AP_TIME_MS 300000        // 5 minutes
+#define REPEATER_AP_STARTUP_DELAY_MS 3000     // 3 seconds
+
+// Uplink window maximum duration (now configurable via web UI)
+// Note: config.uplinkMaxWindowSec is loaded from configuration
+
+// Forward declarations for Repeater WiFi control
+void startRepeaterWiFiAP();
+void ensureRepeaterHttpServer();
+
+// BLE Wake-up callback for Repeater
+class RepeaterWakeupCallback : public BLEWakeupCallback {
+public:
+    void onWakeupRequest() override {
+        Serial.println("[REPEATER-WAKEUP] Wake-up request received via BLE");
+        // Start WiFi AP when wake-up signal received
+        startRepeaterWiFiAP();
+        ensureRepeaterHttpServer();
+    }
+};
+
+static RepeaterWakeupCallback repeaterWakeupCb;
+
 // === Simple Memory-Based Buffer for Callback-to-Loop Communication ===
 // FreeRTOS queues cause mutex crashes when used from AsyncWebServer callbacks.
 // This uses simple volatile arrays that are safe to write from any context.
+
+// Sensor heartbeat tracking (matching Python daemon heartbeats_after_measurement logic)
+struct SensorHeartbeatCounter {
+  String sensorSn;
+  int heartbeatsAfterMeasurement;  // -1=first boot, 0=just uploaded, 1=first HB after upload, >1=ready for config
+  unsigned long lastHeartbeatTime;
+};
+
+static std::vector<SensorHeartbeatCounter> sensorCounters;
+
+// Get or create heartbeat counter for sensor
+static SensorHeartbeatCounter* getOrCreateCounter(const String& sn) {
+  for (auto& counter : sensorCounters) {
+    if (counter.sensorSn == sn) {
+      return &counter;
+    }
+  }
+  
+  SensorHeartbeatCounter counter;
+  counter.sensorSn = sn;
+  counter.heartbeatsAfterMeasurement = 0;  // Start at 0, will increment on first heartbeat
+  counter.lastHeartbeatTime = millis();
+  sensorCounters.push_back(counter);
+  return &sensorCounters.back();
+}
+
+// Reset heartbeat counter when sensor uploads measurement data
+static void resetSensorCounter(const String& sn) {
+  SensorHeartbeatCounter* counter = getOrCreateCounter(sn);
+  counter->heartbeatsAfterMeasurement = 1;  // Reset to 1, next heartbeat will be #2 and can send CONFIG
+  Serial.printf("[HB-COUNTER] Reset counter for SN=%s to 1 (measurement uploaded, next HB will send CONFIG)\n", sn.c_str());
+}
+
+// Increment heartbeat counter
+static void incrementSensorCounter(const String& sn) {
+  SensorHeartbeatCounter* counter = getOrCreateCounter(sn);
+  counter->heartbeatsAfterMeasurement++;
+  counter->lastHeartbeatTime = millis();
+  Serial.printf("[HB-COUNTER] SN=%s counter=%d\n", sn.c_str(), counter->heartbeatsAfterMeasurement);
+}
 
 // Heartbeat buffer - stores pending heartbeats for SD logging and job execution
 struct HeartbeatEntry {
@@ -95,6 +166,7 @@ struct HeartbeatEntry {
   char sensorIp[20];
   bool hasData;
   bool needsJobCheck;
+  bool isMeasurementUpload;  // True if this is a POST /api/measure completion
   uint8_t statusData[256];
   size_t statusDataLen;
 };
@@ -106,7 +178,8 @@ static HeartbeatEntry hbBuffer[HB_BUFFER_SIZE];
 
 // Queue a heartbeat from callback (safe - no FreeRTOS calls)
 static void bufferHeartbeat(const String& sn, const String& ip, bool needsJobCheck = false, 
-                            const uint8_t* statusData = nullptr, size_t statusDataLen = 0) {
+                            const uint8_t* statusData = nullptr, size_t statusDataLen = 0, 
+                            bool isMeasurementUpload = false) {
   int nextIdx = (hbBufferWriteIdx + 1) % HB_BUFFER_SIZE;
   if (nextIdx == hbBufferReadIdx) {
     // Buffer full, drop oldest
@@ -120,6 +193,7 @@ static void bufferHeartbeat(const String& sn, const String& ip, bool needsJobChe
   entry.sensorIp[sizeof(entry.sensorIp) - 1] = '\0';
   entry.hasData = true;
   entry.needsJobCheck = needsJobCheck;
+  entry.isMeasurementUpload = isMeasurementUpload;
   
   if (statusData && statusDataLen > 0 && statusDataLen <= sizeof(entry.statusData)) {
     memcpy((void*)entry.statusData, statusData, statusDataLen);
@@ -183,6 +257,11 @@ static void processHeartbeatBuffer() {
       // Update last heartbeat time
       lastHeartbeatMillis = millis();
       
+      // Handle measurement upload completion (reset counter)
+      if (entry.isMeasurementUpload) {
+        resetSensorCounter(sn);
+      }
+      
       // Log heartbeat to SD
       if (initSdCard()) {
         ensureDir(RECEIVED_DIR);
@@ -223,14 +302,27 @@ static void processHeartbeatBuffer() {
         }
       }
       
-      // Execute jobs if needed
-      if (entry.needsJobCheck) {
-        Serial.printf("[HB-BUFFER] Checking jobs for SN=%s IP=%s\n", sn.c_str(), ip.c_str());
-        bool didJobs = processJobsForSN(sn, ip);
-        if (didJobs) {
-          Serial.printf("[HB-BUFFER] Jobs executed for SN=%s\n", sn.c_str());
+      // Increment heartbeat counter for this sensor (only for heartbeat GET requests, not measurement uploads)
+      if (entry.needsJobCheck && !entry.isMeasurementUpload) {
+        incrementSensorCounter(sn);
+        
+        // Get current counter value
+        SensorHeartbeatCounter* counter = getOrCreateCounter(sn);
+        
+        // Execute jobs based on heartbeat counter (matching Python daemon logic)
+        // Counter > 1 means sensor has finished uploading measurement and is ready for config
+        if (counter->heartbeatsAfterMeasurement > 1) {
+          Serial.printf("[HB-BUFFER] Checking jobs for SN=%s IP=%s (counter=%d)\n", 
+                       sn.c_str(), ip.c_str(), counter->heartbeatsAfterMeasurement);
+          bool didJobs = processJobsForSN(sn, ip);
+          if (didJobs) {
+            Serial.printf("[HB-BUFFER] Jobs executed for SN=%s\n", sn.c_str());
+          } else {
+            Serial.printf("[HB-BUFFER] No jobs found for SN=%s\n", sn.c_str());
+          }
         } else {
-          Serial.printf("[HB-BUFFER] No jobs found for SN=%s\n", sn.c_str());
+          Serial.printf("[HB-BUFFER] Skipping jobs for SN=%s (counter=%d, waiting for measurement upload)\n",
+                       sn.c_str(), counter->heartbeatsAfterMeasurement);
         }
       }
       
@@ -479,6 +571,37 @@ void ensureRootHttpServer() {
   Serial.println("[ROOT] HTTP server started on :8080 (/health, /time, /ingest, /jobs, /firmware)");
 }
 
+// Start Repeater WiFi AP (dynamic control)
+void startRepeaterWiFiAP() {
+  if (repeaterWiFiAPActive) return;
+  
+  String ssid = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
+  String pass = config.apPASS;
+  String ipStr = config.apIP.length() ? config.apIP : String("192.168.20.1");
+  bool ok = safeBringUpAP(ssid, pass, ipStr, "REPEATER");
+  
+  if (ok) {
+    repeaterWiFiAPActive = true;
+    repeaterAPStartTime = millis();
+    Serial.printf("[REPEATER] WiFi AP started: %s | IP=%s\n", 
+                  ssid.c_str(), WiFi.softAPIP().toString().c_str());
+  } else {
+    Serial.println("[REPEATER] Failed to start WiFi AP!");
+  }
+}
+
+// Stop Repeater WiFi AP (dynamic control)
+void stopRepeaterWiFiAP() {
+  if (!repeaterWiFiAPActive) return;
+  
+  WiFi.softAPdisconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_OFF);
+  repeaterWiFiAPActive = false;
+  
+  Serial.println("[REPEATER] WiFi AP stopped, entering light sleep mode");
+}
+
 void ensureWiFiAPRepeater() {
   static bool up = false;
   if (up) return;
@@ -506,7 +629,11 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
     Serial.printf("[TIME] STA to %s...\n", config.uplinkSSID.c_str());
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeout_ms) { delay(200); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeout_ms) {
+      delay(200);
+      // Reset watchdog during WiFi connection attempt to prevent timeout
+      esp_task_wdt_reset();
+    }
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[TIME] STA connect failed");
@@ -556,6 +683,8 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
 
 void ensureRepeaterHttpServer() {
   if (repeaterHttpActive) return;
+  
+  // Time endpoint
   rptServer.on("/time", HTTP_GET, [](AsyncWebServerRequest* req) {
     time_t now;
     time(&now);
@@ -563,9 +692,113 @@ void ensureRepeaterHttpServer() {
     String json = String("{\"epoch\":") + String((unsigned long)now) + "}";
     req->send(200, "application/json", json);
   });
+  
+  // Job endpoints - serve jobs to Collectors (same as Root)
+  rptServer.on("/jobs/config_jobs.json", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!initSdCard()) {
+      req->send(404, "text/plain", "SD card not available");
+      return;
+    }
+    String path = "/jobs/config_jobs.json";
+    if (sd.exists(path.c_str())) {
+      FsFile file = sd.open(path.c_str(), O_RDONLY);
+      if (file) {
+        String content = "";
+        while (file.available()) {
+          content += (char)file.read();
+        }
+        file.close();
+        req->send(200, "application/json", content);
+        Serial.println("[REPEATER] Served /jobs/config_jobs.json to Collector");
+      } else {
+        req->send(500, "text/plain", "Failed to open file");
+      }
+    } else {
+      req->send(404, "text/plain", "File not found");
+    }
+  });
+
+  rptServer.on("/jobs/firmware_jobs.json", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!initSdCard()) {
+      req->send(404, "text/plain", "SD card not available");
+      return;
+    }
+    String path = "/jobs/firmware_jobs.json";
+    if (sd.exists(path.c_str())) {
+      FsFile file = sd.open(path.c_str(), O_RDONLY);
+      if (file) {
+        String content = "";
+        while (file.available()) {
+          content += (char)file.read();
+        }
+        file.close();
+        req->send(200, "application/json", content);
+        Serial.println("[REPEATER] Served /jobs/firmware_jobs.json to Collector");
+      } else {
+        req->send(500, "text/plain", "Failed to open file");
+      }
+    } else {
+      req->send(404, "text/plain", "File not found");
+    }
+  });
+
+  // Serve firmware hex files to Collectors
+  rptServer.on("/firmware/*", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!initSdCard()) {
+      req->send(404, "text/plain", "SD card not available");
+      return;
+    }
+    String path = req->url();
+    if (sd.exists(path.c_str())) {
+      FsFile file = sd.open(path.c_str(), O_RDONLY);
+      if (file) {
+        size_t fileSize = file.size();
+        String content = "";
+        content.reserve(fileSize + 1);
+        while (file.available()) {
+          content += (char)file.read();
+        }
+        file.close();
+        req->send(200, "application/octet-stream", content);
+        Serial.printf("[REPEATER] Served %s to Collector (%d bytes)\n", path.c_str(), fileSize);
+      } else {
+        req->send(500, "text/plain", "Failed to open file");
+      }
+    } else {
+      req->send(404, "text/plain", "File not found");
+    }
+  });
+  
+  // Multipart/form-data upload endpoint for Collectors to send data
+  rptServer.on(
+    "/ingest", HTTP_POST,
+    [](AsyncWebServerRequest* request) {},
+    [](AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final) {
+      static FsFile upFile;
+      static String current;
+      if (index == 0) {
+        if (!initSdCard()) {
+          Serial.println("[REPEATER] SD card init failed for upload");
+          return;
+        }
+        ensureDir(RECEIVED_DIR);
+        char name[64];
+        snprintf(name, sizeof(name), "%lu_", (unsigned long)millis());
+        current = String(RECEIVED_DIR) + "/" + name + filename;
+        upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+        Serial.printf("[REPEATER] Receiving file from Collector: %s\n", current.c_str());
+      }
+      if (upFile) { upFile.write(data, len); }
+      if (final) {
+        if (upFile) upFile.close();
+        request->send(200, "text/plain", "OK");
+        Serial.printf("[REPEATER] Saved file from Collector: %s\n", current.c_str());
+      }
+    });
+  
   rptServer.begin();
   repeaterHttpActive = true;
-  Serial.println("[REPEATER] HTTP /time ready on :8080");
+  Serial.println("[REPEATER] HTTP server ready on :8080 (/time, /jobs, /firmware, /ingest)");
 }
 
 // =============================
@@ -587,7 +820,11 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
     Serial.printf("[UPLINK] Connecting STA to %s...\n", config.uplinkSSID.c_str());
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(200); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+      delay(200);
+      // Reset watchdog during WiFi connection attempt to prevent timeout
+      esp_task_wdt_reset();
+    }
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[UPLINK] STA connect failed");
@@ -651,7 +888,11 @@ bool downloadFileFromRoot(const String& remotePath, const String& localPath) {
     Serial.printf("[DOWNLOAD] Connecting STA to %s...\n", config.uplinkSSID.c_str());
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(200); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+      delay(200);
+      // Reset watchdog during WiFi connection attempt to prevent timeout
+      esp_task_wdt_reset();
+    }
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[DOWNLOAD] STA connect failed");
@@ -762,6 +1003,9 @@ static void syncJobsFromRoot() {
   
   Serial.println("[SYNC] Syncing jobs from root...");
   
+  // Reset watchdog before potentially long downloads
+  esp_task_wdt_reset();
+  
   // Download config jobs
   bool cfgOk = downloadFileFromRoot("/jobs/config_jobs.json", "/jobs/config_jobs.json");
   if (cfgOk) {
@@ -778,7 +1022,75 @@ static void syncJobsFromRoot() {
   resetJobCache();
 }
 
-// Collector: Upload queue and sync jobs
+// Collector: Upload ALL queued files (queue-based with timeout)
+// =============================
+void uploadAllQueuedFiles(unsigned long maxDurationMs = 0) {
+  if (config.role != ROLE_COLLECTOR) return;
+  
+  Serial.println("[QUEUE-UPLOAD] Starting queue-based file upload...");
+  
+  unsigned long startTime = millis();
+  int filesUploaded = 0;
+  int filesSkipped = 0;
+  const int MAX_RETRY = 3;  // Retry failed uploads up to 3 times
+  String oldest;
+  
+  // Upload ALL files in queue until empty OR timeout reached
+  while (findOldestQueueFile(oldest)) {
+    // Reset watchdog to prevent timeout during long upload sessions
+    esp_task_wdt_reset();
+    
+    // Check if we've exceeded the maximum duration
+    if (maxDurationMs > 0 && (millis() - startTime) > maxDurationMs) {
+      Serial.printf("[QUEUE-UPLOAD] Max duration reached (%lu ms), stopping upload session\n", maxDurationMs);
+      Serial.printf("[QUEUE-UPLOAD] Uploaded %d files, skipped %d files\n", filesUploaded, filesSkipped);
+      Serial.println("[QUEUE-UPLOAD] Remaining files will be uploaded in next cycle");
+      return;
+    }
+    
+    if (!initSdCard()) {
+      Serial.println("[QUEUE-UPLOAD] SD card access failed");
+      break;
+    }
+    
+    String base = oldest.substring(String(QUEUE_DIR).length() + 1);
+    Serial.printf("[QUEUE-UPLOAD] Uploading file %d: %s\n", filesUploaded + filesSkipped + 1, base.c_str());
+    
+    bool ok = false;
+    for (int retry = 0; retry < MAX_RETRY && !ok; retry++) {
+      if (retry > 0) {
+        Serial.printf("[QUEUE-UPLOAD] Retry attempt %d/%d for: %s\n", retry, MAX_RETRY - 1, base.c_str());
+        delay(1000);  // Wait 1 second before retry
+      }
+      ok = uploadFileToRoot(oldest, base);
+      
+      // Check timeout even during retries
+      if (maxDurationMs > 0 && (millis() - startTime) > maxDurationMs) {
+        Serial.println("[QUEUE-UPLOAD] Timeout reached during retry, aborting");
+        break;
+      }
+    }
+    
+    if (ok && initSdCard()) { 
+      sd.remove(oldest.c_str());
+      filesUploaded++;
+      Serial.printf("[QUEUE-UPLOAD] Successfully uploaded and removed: %s\n", oldest.c_str());
+    } else {
+      filesSkipped++;
+      Serial.printf("[QUEUE-UPLOAD] Failed to upload after %d attempts: %s (continuing with next file)\n", 
+                    MAX_RETRY, oldest.c_str());
+      // Continue with next file instead of breaking
+      // Note: Failed file remains in queue for next cycle
+    }
+    
+    delay(100); // Small delay between uploads
+  }
+  
+  Serial.printf("[QUEUE-UPLOAD] Queue upload complete. Files uploaded: %d, skipped: %d\n", 
+                filesUploaded, filesSkipped);
+}
+
+// Collector: Upload queue and sync jobs (legacy function, now calls queue-based upload)
 // =============================
 void processQueue() {
   // For COLLECTOR: uplink via HTTP
@@ -990,7 +1302,7 @@ void startOperationalMode() {
   if (cause == ESP_SLEEP_WAKEUP_TIMER) {
     currentState = rtc_next_state;
     Serial.printf("[SCHEDULER] Waking up for pre-scheduled state: %s\n",
-                  (currentState == STATE_MESH_APPOINTMENT ? "UPLINK" : "AP"));
+                  (currentState == STATE_UPLINK ? "UPLINK" : "AP"));
   } else {
     currentState = STATE_INITIAL;
   }
@@ -1041,7 +1353,7 @@ void goToDeepSleep(unsigned int seconds) {
 }
 
 void printSchedulerInfo(time_t now) {
-  uint32_t uplink_interval_s = config.meshIntervalMin * 60;  // reused field as uplink interval
+  uint32_t uplink_interval_s = config.uplinkIntervalMin * 60;
   uint32_t time_to_next_uplink = uplink_interval_s - (now % uplink_interval_s);
   Serial.printf("[SCHEDULER] Next UPLINK in: %u sec.\n", time_to_next_uplink);
   if (config.role == ROLE_COLLECTOR) {
@@ -1057,7 +1369,7 @@ void decideAndGoToSleep() {
 
   if (timeinfo->tm_year < (2023 - 1900)) {
     Serial.println("[SCHEDULER] Time not set, will try to sync uplink soon.");
-    rtc_next_state = STATE_MESH_APPOINTMENT;  // reused as UPLINK window
+    rtc_next_state = STATE_UPLINK;
     goToDeepSleep(30);
     return;
   }
@@ -1065,7 +1377,7 @@ void decideAndGoToSleep() {
   Serial.println("[SCHEDULER] Deciding next action before sleeping...");
   printSchedulerInfo(now);
 
-  uint32_t uplink_interval_s = config.meshIntervalMin * 60;  // reuse field
+  uint32_t uplink_interval_s = config.uplinkIntervalMin * 60;
   uint32_t time_to_next_uplink = uplink_interval_s - (now % uplink_interval_s);
   uint32_t sleep_for;
 
@@ -1074,7 +1386,7 @@ void decideAndGoToSleep() {
 
     if (time_to_next_uplink <= time_to_next_ap) {
       // Next window is UPLINK
-      rtc_next_state = STATE_MESH_APPOINTMENT;  // treat as uplink
+      rtc_next_state = STATE_UPLINK;
       sleep_for = time_to_next_uplink;
 
       // If via repeater, wake +30s after the uplink boundary so repeater is ON
@@ -1135,26 +1447,44 @@ void loopOperationalMode() {
 
   // REPEATER
   if (config.role == ROLE_REPEATER) {
-    ensureWiFiAPRepeater();
-    ensureRepeaterHttpServer();
-    
-    // Repeater uses continuous BLE beacon with light sleep (not deep sleep)
-    // This allows collectors to find and wake it at any time
+    // Initialize BLE beacon with wake-up callback (only once)
     if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
       // Use actual AP SSID (same logic as ensureWiFiAPRepeater)
       String actualAPSSID = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
-      bleBeacon.begin(actualAPSSID, config.nodeName, 0); // 0 = Repeater role
+      bleBeacon.begin(actualAPSSID, config.nodeName, 0, &repeaterWakeupCb); // 0 = Repeater role, with callback
       bleBeacon.startAdvertising();
-      Serial.println("[BLE-MESH] Repeater BLE beacon active (continuous with light sleep)");
+      Serial.println("[BLE-MESH] Repeater BLE beacon active (WiFi AP OFF by default)");
     }
     
-    static bool tried = false;
-    if (!tried) {
-      tried = true;
+    // Sync time once at startup (before WiFi AP is turned off)
+    static bool timeSynced = false;
+    if (!timeSynced) {
       syncTimeFromUplink(5000);
+      timeSynced = true;
     }
-    // Repeater stays in light sleep with BLE beacon active
-    // No deep sleep - allows instant wake-up when collector connects
+    
+    // Check if WiFi AP should be stopped after transfer completion
+    // WiFi AP is started by wake-up callback and should stop when no clients connected
+    if (repeaterWiFiAPActive) {
+      int numClients = WiFi.softAPgetStationNum();
+      unsigned long apRunTime = millis() - repeaterAPStartTime;
+      
+      // Stop AP if no clients for timeout OR if running for max time
+      if (numClients == 0 && apRunTime > REPEATER_NO_CLIENT_TIMEOUT_MS) {
+        Serial.println("[REPEATER] No clients connected, stopping WiFi AP");
+        stopRepeaterWiFiAP();
+      } else if (apRunTime > REPEATER_MAX_AP_TIME_MS) {
+        Serial.printf("[REPEATER] Max AP time exceeded (%lu ms), stopping WiFi AP\n", apRunTime);
+        if (numClients > 0) {
+          Serial.printf("[REPEATER] Warning: Force stopping with %d client(s) still connected\n", numClients);
+        }
+        stopRepeaterWiFiAP();
+      }
+    }
+    
+    // Repeater stays in light sleep with BLE beacon active when WiFi AP is off
+    // No deep sleep - allows instant wake-up when collector sends BLE signal
+    return;
   }
 
   // NON-ROOT STATE MACHINE
@@ -1291,13 +1621,17 @@ void loopOperationalMode() {
             
             String sensorSn = request->getParam("sensor_sn")->value();
             IPAddress remoteIp = request->client()->remoteIP();
+            String ipStr = remoteIp.toString();
+            
+            // Store IP->SN mapping for measurement upload tracking
+            recentIpToSn[ipStr] = sensorSn;
             
             // Log to Serial and buffer for main loop processing
             Serial.printf("[HB-LEGACY] GET /api/heartbeat from SN=%s IP=%s\n", 
-                         sensorSn.c_str(), remoteIp.toString().c_str());
+                         sensorSn.c_str(), ipStr.c_str());
             
             // Buffer with job check enabled - main loop will process
-            bufferHeartbeat(sensorSn, remoteIp.toString(), true);
+            bufferHeartbeat(sensorSn, ipStr, true);
             
             request->send(200, "text/plain", "OK");
             lastActivityMillis = millis();
@@ -1359,8 +1693,20 @@ void loopOperationalMode() {
             [](AsyncWebServerRequest *request) {
               // This is called AFTER all body chunks are received
               IPAddress remoteIp = request->client()->remoteIP();
-              Serial.printf("[HB-LEGACY] POST /api/measure completed from IP=%s\n", 
-                           remoteIp.toString().c_str());
+              String ipStr = remoteIp.toString();
+              
+              Serial.printf("[HB-LEGACY] POST /api/measure completed from IP=%s\n", ipStr.c_str());
+              
+              // Find sensor S/N from recent heartbeats by IP
+              auto it = recentIpToSn.find(ipStr);
+              if (it != recentIpToSn.end()) {
+                String sensorSn = it->second;
+                // Buffer measurement completion to reset counter in main loop
+                bufferHeartbeat(sensorSn, ipStr, false, nullptr, 0, true);
+                Serial.printf("[HB-LEGACY] Measurement upload completed for SN=%s, counter will reset\n", 
+                             sensorSn.c_str());
+              }
+              
               request->send(200, "text/plain", "OK");
               lastActivityMillis = millis();
             },
@@ -1448,9 +1794,9 @@ void loopOperationalMode() {
 
 
     // ============================================
-    // STATE_MESH_APPOINTMENT (UPLINK WINDOW)
+    // STATE_UPLINK (UPLINK WINDOW)
     // ============================================
-    case STATE_MESH_APPOINTMENT:
+    case STATE_UPLINK:
       {
         static time_t state_start_time = 0;
         static bool started = false;
@@ -1467,20 +1813,34 @@ void loopOperationalMode() {
             String scannerName = config.nodeName + "_Scanner";
             bleScanner.begin(scannerName);
             BLEScannerManager::ScanResult result = bleScanner.scanForParent(config.bleScanDurationSec);
-            bleScanner.stop();
-            bleScanned = true;
             
             if (result.found) {
               Serial.printf("[BLE-MESH] Found parent SSID: %s (Role: %s, RSSI: %d dBm)\n",
                            result.apSSID.c_str(),
                            result.nodeRole == 1 ? "Root" : "Repeater",
                            result.rssi);
+              
+              // If parent is Repeater (role=0), send wake-up signal to start WiFi AP
+              if (result.nodeRole == 0) {
+                Serial.println("[BLE-WAKEUP] Parent is Repeater, sending wake-up signal...");
+                if (bleScanner.sendWakeupSignal(result.address)) {
+                  Serial.println("[BLE-WAKEUP] Wake-up signal sent successfully, waiting for WiFi AP...");
+                  // Wait for WiFi AP to start (give Repeater time to bring up AP)
+                  delay(REPEATER_AP_STARTUP_DELAY_MS);
+                } else {
+                  Serial.println("[BLE-WAKEUP] Failed to send wake-up signal");
+                }
+              }
+              
               // Override uplinkSSID with discovered AP SSID from BLE
               config.uplinkSSID = result.apSSID;
               Serial.printf("[BLE-MESH] Using discovered AP SSID for WiFi: %s\n", config.uplinkSSID.c_str());
             } else {
               Serial.println("[BLE-MESH] No parent found via BLE, proceeding with configured uplink");
             }
+            
+            bleScanner.stop();
+            bleScanned = true;
           }
 
           time(&state_start_time);
@@ -1494,23 +1854,55 @@ void loopOperationalMode() {
         }
 
         if (config.role == ROLE_COLLECTOR) {
-          processQueue();
-
-          String still;
-          if (!findOldestQueueFile(still)) {
-            Serial.println("[UPLINK] Queue empty → sleeping early.");
+          // Check elapsed time before starting upload
+          time_t now;
+          time(&now);
+          int elapsed = now - state_start_time;
+          unsigned long elapsedMs = (unsigned long)elapsed * 1000;
+          
+          // Calculate remaining time for upload operations
+          unsigned long uplinkMaxWindowMs = config.uplinkMaxWindowSec * 1000UL;
+          unsigned long remainingTimeMs = (elapsedMs < uplinkMaxWindowMs) ? 
+                                          (uplinkMaxWindowMs - elapsedMs) : 0;
+          
+          if (remainingTimeMs < 10000) {
+            Serial.printf("[UPLINK] Insufficient time remaining (%lu ms), skipping upload\n", remainingTimeMs);
             started = false;
-            bleScanned = false; // Reset for next cycle
+            bleScanned = false;
             decideAndGoToSleep();
             return;
           }
+          
+          // Queue-based upload with timeout (use 80% of remaining time for uploads)
+          unsigned long uploadTimeoutMs = (remainingTimeMs * 80) / 100;
+          Serial.printf("[UPLINK] Starting upload with timeout: %lu ms\n", uploadTimeoutMs);
+          uploadAllQueuedFiles(uploadTimeoutMs);
+          
+          // After uploading, sync jobs from parent (if time permits)
+          time(&now);
+          elapsed = now - state_start_time;
+          elapsedMs = (unsigned long)elapsed * 1000;
+          
+          if (elapsedMs < uplinkMaxWindowMs) {
+            syncJobsFromRoot();
+          } else {
+            Serial.println("[UPLINK] Timeout reached, skipping job sync");
+          }
+          
+          // Always exit after upload attempt (success or timeout)
+          Serial.println("[UPLINK] Upload session complete → sleeping.");
+          started = false;
+          bleScanned = false; // Reset for next cycle
+          decideAndGoToSleep();
+          return;
         }
 
+        // For REPEATER role (no upload operations)
         time_t now;
         time(&now);
         int elapsed = now - state_start_time;
 
-        if (elapsed < config.meshWindowSec) {
+        if (elapsed < config.uplinkWindowSec) {
           delay(50);
           return;
         }
