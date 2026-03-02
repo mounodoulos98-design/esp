@@ -146,8 +146,14 @@ static WiFiEventId_t stationConnectedEventId;
 static std::set<String> doneSensors;
 // AP session start time for uplink window miss detection
 static time_t apSessionStartTime = 0;
-// Grace period (ms) after all sensors complete their full flow before sleeping
-static const unsigned long SENSOR_DONE_GRACE_MS = 60000UL; // 60 seconds
+// Grace period (ms) after all sensors complete their full flow before sleeping.
+// Applied both when sensors have disconnected AND when they remain connected-but-silent.
+static const unsigned long SENSOR_DONE_GRACE_MS = 30000UL; // 30 seconds
+
+// IPs that have completed a POST /api/measure this AP session.
+// Used to distinguish pre-measurement heartbeats (→ STATUS, no jobs) from
+// post-measurement heartbeats (→ check jobs/firmware, mark done).
+static std::set<String> measuredIPs;
 
 // RTC Memory
 RTC_DATA_ATTR time_t rtc_last_known_time = 0;
@@ -1438,7 +1444,8 @@ void loopOperationalMode() {
           jobProcessedThisWindow = false;
           lastActivityMillis = millis();
           lastHeartbeatMillis = 0; // Reset heartbeat tracking for new session
-          doneSensors.clear(); // Reset sensor completion tracking for new session
+          doneSensors.clear();    // Reset sensor completion tracking for new session
+          measuredIPs.clear();    // Reset measurement tracking for new session
           time(&apSessionStartTime); // Record AP session start for uplink window detection
 
           // ======================================================
@@ -1494,13 +1501,20 @@ void loopOperationalMode() {
             
             String sensorSn = request->getParam("sensor_sn")->value();
             IPAddress remoteIp = request->client()->remoteIP();
+            String ipStr = remoteIp.toString();
             
             // Log to Serial and buffer for main loop processing
             Serial.printf("[HB-LEGACY] GET /api/heartbeat from SN=%s IP=%s\n", 
-                         sensorSn.c_str(), remoteIp.toString().c_str());
+                         sensorSn.c_str(), ipStr.c_str());
             
-            // Buffer with job check enabled - main loop will process
-            bufferHeartbeat(sensorSn, remoteIp.toString(), true);
+            // The sensor protocol has two heartbeat phases:
+            // 1. Pre-measurement: first heartbeat means "I'm here, give me STATUS".
+            //    Jobs must NOT be run yet because measurement hasn't happened.
+            // 2. Post-measurement: subsequent heartbeats mean "check for jobs/firmware".
+            // We use measuredIPs (populated when POST /api/measure completes) to
+            // distinguish the two phases.
+            bool isPostMeasurement = (measuredIPs.find(ipStr) != measuredIPs.end());
+            bufferHeartbeat(sensorSn, ipStr, isPostMeasurement);
             
             request->send(200, "text/plain", "OK");
             lastActivityMillis = millis();
@@ -1562,8 +1576,11 @@ void loopOperationalMode() {
             [](AsyncWebServerRequest *request) {
               // This is called AFTER all body chunks are received
               IPAddress remoteIp = request->client()->remoteIP();
-              Serial.printf("[HB-LEGACY] POST /api/measure completed from IP=%s\n", 
-                           remoteIp.toString().c_str());
+              String ipStr = remoteIp.toString();
+              Serial.printf("[HB-LEGACY] POST /api/measure completed from IP=%s\n", ipStr.c_str());
+              // Record that this IP has sent its measurement. Any subsequent heartbeat
+              // from this IP is a post-measurement heartbeat → check jobs/firmware.
+              measuredIPs.insert(ipStr);
               request->send(200, "text/plain", "OK");
               lastActivityMillis = millis();
             },
@@ -1603,7 +1620,6 @@ void loopOperationalMode() {
 
         // ---- TIMEOUT CHECK ----
         // Check for any sensor activity (heartbeats OR data transfers) periodically
-        // Use the configured collectorDataTimeoutSec when sensors are connected
         // Only check periodically to avoid race conditions with ongoing transfers
         static unsigned long lastTimeoutCheck = 0;
         int numConnected = WiFi.softAPgetStationNum();
@@ -1617,22 +1633,40 @@ void loopOperationalMode() {
           unsigned long timeout;
           
           if (numConnected > 0) {
-            // Sensors connected - use data timeout (allows time for measurement uploads)
-            timeout = config.collectorDataTimeoutSec * 1000UL;
-            
-            if (timeSinceLastActivity > timeout) {
-              Serial.printf("[AP] %d sensor(s) connected but no activity for %lu sec, entering sleep.\n",
-                           numConnected, timeSinceLastActivity / 1000);
-              Serial.println("[AP] Inactivity timeout reached.");
-              stopAPMode();
-              decideAndGoToSleep();
-              break;
+            // Sensors are still physically connected.
+            // If at least one has completed all stages (status → measure → jobs),
+            // wait only the short grace period before sleeping; it likely just hasn't
+            // disconnected its WiFi yet.  Otherwise use the full data timeout so we
+            // don't interrupt an active measurement upload.
+            // NOTE: In this protocol sensors connect one at a time, so a non-empty
+            // doneSensors reliably means the active sensor is finished.  If multiple
+            // sensors ever connect simultaneously this heuristic should be revisited.
+            if (!doneSensors.empty()) {
+              timeout = SENSOR_DONE_GRACE_MS;
+              if (timeSinceLastActivity > timeout) {
+                Serial.printf("[AP] %d sensor(s) still connected but all stages done; "
+                              "no activity for %lu sec → sleeping.\n",
+                              numConnected, timeSinceLastActivity / 1000);
+                stopAPMode();
+                decideAndGoToSleep();
+                break;
+              }
+            } else {
+              timeout = config.collectorDataTimeoutSec * 1000UL;
+              if (timeSinceLastActivity > timeout) {
+                Serial.printf("[AP] %d sensor(s) connected but no activity for %lu sec, entering sleep.\n",
+                             numConnected, timeSinceLastActivity / 1000);
+                Serial.println("[AP] Inactivity timeout reached.");
+                stopAPMode();
+                decideAndGoToSleep();
+                break;
+              }
             }
           } else {
             // No sensors connected
             if (hadStation) {
-              // If at least one sensor completed all stages, use a short grace period
-              // so the collector can sleep quickly instead of waiting the full data timeout.
+              // If at least one sensor completed all stages, use the short grace period;
+              // otherwise wait for the full data timeout in case more sensors connect.
               timeout = doneSensors.empty() ? (config.collectorDataTimeoutSec * 1000UL) : SENSOR_DONE_GRACE_MS;
             } else {
               timeout = config.collectorApWindowSec * 1000UL;
