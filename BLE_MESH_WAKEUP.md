@@ -17,6 +17,9 @@ The BLE (Bluetooth Low Energy) mesh wake-up system enables efficient power manag
 2. **Repeater Node**
    - **Light sleep with continuous BLE beacon** (not deep sleep)
    - Acts as BLE beacon continuously (advertises itself 24/7)
+   - CPU sleeps via `esp_light_sleep_start()` between events
+   - Wakes automatically on BLE activity (collector scan/connect),
+     WiFi activity (station connects to AP), or 1-second timer
    - Allows instant wake-up when Collector needs to connect
    - Forwards data from Collectors to Root
 
@@ -65,6 +68,8 @@ The BLE wake-up mechanism provides several power benefits:
 - **Targeted connection**: Only connect to confirmed available parents
 - **No blind WiFi scanning**: Avoids power-hungry WiFi scans
 - **Quick discovery**: BLE beacon detected in seconds vs. WiFi association
+- **Repeater light sleep**: CPU sleeps via `esp_light_sleep_start()` while BLE
+  beacon advertises autonomously; wakes on BLE/WiFi event or 1-second timer
 
 ## Flow Diagram
 
@@ -84,7 +89,10 @@ The BLE wake-up mechanism provides several power benefits:
 │  Continuous Operation:                                       │
 │  1. WiFi AP always active                                    │
 │  2. BLE Beacon advertising continuously (Role: 0)            │
-│  3. Light sleep mode (instant wake-up)                       │
+│  3. Light sleep mode (esp_light_sleep_start)                 │
+│     - Wakes on BLE activity (collector scan/connect)         │
+│     - Wakes on WiFi activity (station connects)              │
+│     - Wakes every 1 second for maintenance                   │
 │  4. When Collector connects:                                 │
 │     - Wake from light sleep                                  │
 │     - Receive data via WiFi                                  │
@@ -178,8 +186,10 @@ config.bleScanDurationSec = 5;   // BLE scan duration in seconds
 
 2. **Repeater Loop** (`loopOperationalMode()`)
    - Starts BLE beacon when awake
-   - Scans for parent before uplink
-   - Stops beacon before sleep
+   - Enables BLE + WiFi as wakeup sources (`esp_sleep_enable_bt_wakeup()`,
+     `esp_sleep_enable_wifi_wakeup()`)
+   - Calls `esp_light_sleep_start()` — CPU halts, BLE beacon advertises autonomously
+   - Wakes on BLE/WiFi activity or 1-second timer; loop repeats
 
 3. **Collector Uplink** (`STATE_MESH_APPOINTMENT`)
    - Scans for parent at start of uplink window

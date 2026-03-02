@@ -1226,13 +1226,9 @@ void decideAndGoToSleep() {
       sleep_for = time_to_next_ap;
     }
   } else if (config.role == ROLE_REPEATER) {
-    // REPEATER → stays awake with BLE beacon active
-    // Don't go to deep sleep - allows instant wake-up by collectors
-    // Note: Light sleep is managed by the Arduino/ESP-IDF framework automatically
-    // when CPU is idle. BLE beacon continues advertising during light sleep.
-    // Original scheduling logic removed: Repeater no longer uses scheduled uplink windows,
-    // instead stays continuously available for collectors to connect at any time.
-    Serial.println("[SCHEDULER] Repeater stays active with BLE beacon (automatic light sleep)");
+    // REPEATER: light sleep is handled directly in loopOperationalMode() with
+    // BLE and WiFi wakeup sources. Reaching here is unexpected.
+    Serial.println("[SCHEDULER] WARN: Repeater reached decideAndGoToSleep() unexpectedly; light sleep managed in main loop");
     return; // Don't call goToDeepSleep
   } else {
     // ROOT → always on, should never reach here
@@ -1277,7 +1273,7 @@ void loopOperationalMode() {
       String actualAPSSID = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
       bleBeacon.begin(actualAPSSID, config.nodeName, 0); // 0 = Repeater role
       bleBeacon.startAdvertising();
-      Serial.println("[BLE-MESH] Repeater BLE beacon active (continuous with light sleep)");
+      Serial.println("[BLE-MESH] Repeater BLE beacon active, entering light sleep mode");
     }
     
     static bool tried = false;
@@ -1285,8 +1281,26 @@ void loopOperationalMode() {
       tried = true;
       syncTimeFromUplink(5000);
     }
-    // Repeater stays in light sleep with BLE beacon active
-    // No deep sleep - allows instant wake-up when collector connects
+
+    // Enter light sleep: BLE beacon continues advertising autonomously during sleep.
+    // CPU wakes on BLE activity (collector scan/connect), WiFi activity (station
+    // connecting to the AP), or after 1 second (periodic maintenance wakeup).
+    esp_err_t bt_ret = esp_sleep_enable_bt_wakeup();
+    if (bt_ret != ESP_OK) {
+      Serial.printf("[BLE-MESH] WARN: esp_sleep_enable_bt_wakeup() err=%d\n", bt_ret);
+    }
+    esp_err_t wifi_ret = esp_sleep_enable_wifi_wakeup();
+    if (wifi_ret != ESP_OK) {
+      Serial.printf("[BLE-MESH] WARN: esp_sleep_enable_wifi_wakeup() err=%d\n", wifi_ret);
+    }
+    esp_sleep_enable_timer_wakeup(1000000ULL); // 1 second periodic wakeup
+    esp_err_t sleep_ret = esp_light_sleep_start();
+    if (sleep_ret != ESP_OK) {
+      Serial.printf("[BLE-MESH] WARN: esp_light_sleep_start() err=%d\n", sleep_ret);
+      delay(100); // fallback: brief delay before retrying
+    }
+    // Execution resumes here after each wakeup; loop() calls this function again.
+    return;
   }
 
   // NON-ROOT STATE MACHINE
