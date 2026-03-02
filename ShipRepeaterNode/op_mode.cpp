@@ -1306,10 +1306,12 @@ void loopOperationalMode() {
       Serial.printf("[BLE-MESH] WARN: esp_sleep_enable_bt_wakeup() err=%d\n", bt_ret);
     }
 #endif
+#ifdef SOC_PM_SUPPORT_WIFI_WAKEUP
     esp_err_t wifi_ret = esp_sleep_enable_wifi_wakeup();
     if (wifi_ret != ESP_OK) {
       Serial.printf("[BLE-MESH] WARN: esp_sleep_enable_wifi_wakeup() err=%d\n", wifi_ret);
     }
+#endif
     // 5 s timer: resets the 30 s WDT and handles any deferred maintenance.
     // Longer than 1 s (previous) = fewer wakeups = lower average current.
     esp_sleep_enable_timer_wakeup(5000000ULL); // 5 seconds
