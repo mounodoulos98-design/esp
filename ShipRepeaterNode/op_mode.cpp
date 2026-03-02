@@ -1266,10 +1266,8 @@ void loopOperationalMode() {
     ensureWiFiAPRepeater();
     ensureRepeaterHttpServer();
     
-    // Repeater uses continuous BLE beacon with light sleep (not deep sleep)
-    // This allows collectors to find and wake it at any time
+    // Start BLE beacon once (BT modem sleep + 1000ms interval set inside begin())
     if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
-      // Use actual AP SSID (same logic as ensureWiFiAPRepeater)
       String actualAPSSID = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
       bleBeacon.begin(actualAPSSID, config.nodeName, 0); // 0 = Repeater role
       bleBeacon.startAdvertising();
@@ -1282,9 +1280,21 @@ void loopOperationalMode() {
       syncTimeFromUplink(5000);
     }
 
-    // Enter light sleep: BLE beacon continues advertising autonomously during sleep.
-    // CPU wakes on BLE activity (collector scan/connect), WiFi activity (station
-    // connecting to the AP), or after 1 second (periodic maintenance wakeup).
+    // ── Power saving #3: lower CPU frequency while idle ──────────────────────
+    // The Repeater spends almost all its time in light sleep; when the CPU
+    // does wake (BLE/WiFi event), 80 MHz is more than enough.  Dropping from
+    // 240 MHz → 80 MHz reduces active CPU current by ~3×.
+    // This is set once; it persists across light-sleep cycles.
+    static bool cpuScaled = false;
+    if (!cpuScaled) {
+      setCpuFrequencyMhz(80);
+      cpuScaled = true;
+      Serial.println("[PM] CPU frequency set to 80 MHz (Repeater idle mode)");
+    }
+
+    // Enter light sleep.  The BLE controller advertises autonomously at its
+    // 1000 ms hardware interval; WiFi AP stays live for station connections.
+    // CPU wakes on:  BLE activity | WiFi station connect | 5 s timer (WDT keepalive)
     esp_err_t bt_ret = esp_sleep_enable_bt_wakeup();
     if (bt_ret != ESP_OK) {
       Serial.printf("[BLE-MESH] WARN: esp_sleep_enable_bt_wakeup() err=%d\n", bt_ret);
@@ -1293,7 +1303,9 @@ void loopOperationalMode() {
     if (wifi_ret != ESP_OK) {
       Serial.printf("[BLE-MESH] WARN: esp_sleep_enable_wifi_wakeup() err=%d\n", wifi_ret);
     }
-    esp_sleep_enable_timer_wakeup(1000000ULL); // 1 second periodic wakeup
+    // 5 s timer: resets the 30 s WDT and handles any deferred maintenance.
+    // Longer than 1 s (previous) = fewer wakeups = lower average current.
+    esp_sleep_enable_timer_wakeup(5000000ULL); // 5 seconds
     esp_err_t sleep_ret = esp_light_sleep_start();
     if (sleep_ret != ESP_OK) {
       Serial.printf("[BLE-MESH] WARN: esp_light_sleep_start() err=%d\n", sleep_ret);

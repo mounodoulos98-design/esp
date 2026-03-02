@@ -8,6 +8,14 @@
 #include <BLEAdvertising.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include "esp_bt.h"   // esp_bt_sleep_enable()
+
+// Advertising interval for the Repeater beacon.
+// Units: 0.625 ms  →  1600 × 0.625 ms = 1000 ms (1 s).
+// A Collector scanning for 5 s will always see at least 4-5 packets.
+// Increasing this from the BLE default (~100 ms) reduces the BT radio
+// duty cycle by 10× and is the single biggest power saving available.
+#define BLE_ADV_INTERVAL_UNITS 1600   // 1000 ms
 
 // BLE Service UUID for mesh node identification
 #define BLE_MESH_SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -25,6 +33,17 @@ public:
         } catch (...) {
             Serial.println("[BLE-BEACON] ERROR: Failed to initialize BLE");
             return;
+        }
+
+        // ── Power saving #1: BT controller modem sleep ───────────────────────
+        // The BT radio hardware sleeps between advertising packets instead of
+        // idling at full power.  Advertising continues normally; only the radio
+        // front-end is gated.  Saves ~60-70 % of the BT radio current.
+        esp_err_t btSleep = esp_bt_sleep_enable();
+        if (btSleep == ESP_OK) {
+            Serial.println("[BLE-BEACON] BT modem sleep enabled");
+        } else {
+            Serial.printf("[BLE-BEACON] BT modem sleep unavailable (err=%d)\n", (int)btSleep);
         }
         
         // Create BLE Server (needed for advertising)
@@ -44,10 +63,14 @@ public:
         // Add service UUID to advertisement
         pAdvertising->addServiceUUID(BLE_MESH_SERVICE_UUID);
         
-        // Set advertising parameters
+        // ── Power saving #2: slow advertising interval ───────────────────────
+        // Default BLE advertising interval is ~100 ms (160 × 0.625 ms).
+        // At 1000 ms (1600 × 0.625 ms) the radio transmits 10× less often,
+        // cutting average BT current from ~3-5 mA down to ~0.3-0.5 mA.
+        // A Collector scanning for the default 5 s still sees 4-5 packets.
+        pAdvertising->setMinInterval(BLE_ADV_INTERVAL_UNITS);
+        pAdvertising->setMaxInterval(BLE_ADV_INTERVAL_UNITS + 16); // +10 ms jitter
         pAdvertising->setScanResponse(true);
-        pAdvertising->setMinPreferred(0x06);  // Min connection interval
-        pAdvertising->setMaxPreferred(0x12);  // Max connection interval
         
         // Add manufacturer data with node role and AP SSID
         // Format: [role_byte, apSSID_bytes...]
@@ -61,7 +84,7 @@ public:
         pAdvertising->setAdvertisementData(advData);
         
         isInitialized = true;
-        Serial.printf("[BLE-BEACON] BLE Beacon initialized (advertising AP SSID: %s)\n", apSSID.c_str());
+        Serial.printf("[BLE-BEACON] Initialized: AP SSID=%s, adv interval=1000ms\n", apSSID.c_str());
     }
 
     void startAdvertising() {
