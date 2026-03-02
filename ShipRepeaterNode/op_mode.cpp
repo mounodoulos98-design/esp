@@ -1302,12 +1302,12 @@ void loopOperationalMode() {
     ensureWiFiAPRepeater();
     ensureRepeaterHttpServer();
     
-    // Start BLE beacon once (BT modem sleep + 1000ms interval set inside begin())
+    // Start BLE beacon once (100ms advertising interval set inside begin())
     if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
       String actualAPSSID = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
       bleBeacon.begin(actualAPSSID, config.nodeName, 0); // 0 = Repeater role
       bleBeacon.startAdvertising();
-      Serial.println("[BLE-MESH] Repeater BLE beacon active, entering light sleep mode");
+      Serial.println("[BLE-MESH] Repeater BLE beacon active");
     }
     
     static bool tried = false;
@@ -1321,11 +1321,10 @@ void loopOperationalMode() {
       }
     }
 
-    // ── Power saving #3: lower CPU frequency while idle ──────────────────────
-    // The Repeater spends almost all its time in light sleep; when the CPU
-    // does wake (BLE/WiFi event), 80 MHz is more than enough.  Dropping from
-    // 240 MHz → 80 MHz reduces active CPU current by ~3×.
-    // This is set once; it persists across light-sleep cycles.
+    // ── Power saving: lower CPU frequency while idle ─────────────────────────
+    // 80 MHz is more than enough for WiFi AP + BLE advertising + HTTP server.
+    // Dropping from 240 MHz → 80 MHz reduces active CPU current by ~3×.
+    // This is set once and persists for the lifetime of the repeater process.
     static bool cpuScaled = false;
     if (!cpuScaled) {
       setCpuFrequencyMhz(80);
@@ -1333,34 +1332,11 @@ void loopOperationalMode() {
       Serial.println("[PM] CPU frequency set to 80 MHz (Repeater idle mode)");
     }
 
-    // Enter light sleep.  The BLE controller advertises autonomously at its
-    // 1000 ms hardware interval; WiFi AP stays live for station connections.
-    // CPU wakes on:  BLE activity (where supported) | WiFi station connect | 5 s timer (WDT keepalive)
-#ifdef SOC_PM_SUPPORT_BT_WAKEUP
-    // esp_sleep_enable_bt_wakeup() is only available on chips that expose
-    // BT as a light-sleep wakeup source (e.g. original ESP32).  On ESP32-S3,
-    // C3, etc. the BLE controller handles beacon advertising autonomously and
-    // the CPU is woken by WiFi activity or the timer below instead.
-    esp_err_t bt_ret = esp_sleep_enable_bt_wakeup();
-    if (bt_ret != ESP_OK) {
-      Serial.printf("[BLE-MESH] WARN: esp_sleep_enable_bt_wakeup() err=%d\n", bt_ret);
-    }
-#endif
-#ifdef SOC_PM_SUPPORT_WIFI_WAKEUP
-    esp_err_t wifi_ret = esp_sleep_enable_wifi_wakeup();
-    if (wifi_ret != ESP_OK) {
-      Serial.printf("[BLE-MESH] WARN: esp_sleep_enable_wifi_wakeup() err=%d\n", wifi_ret);
-    }
-#endif
-    // 5 s timer: resets the 30 s WDT and handles any deferred maintenance.
-    // Longer than 1 s (previous) = fewer wakeups = lower average current.
-    esp_sleep_enable_timer_wakeup(5000000ULL); // 5 seconds
-    esp_err_t sleep_ret = esp_light_sleep_start();
-    if (sleep_ret != ESP_OK) {
-      Serial.printf("[BLE-MESH] WARN: esp_light_sleep_start() err=%d\n", sleep_ret);
-      delay(100); // fallback: brief delay before retrying
-    }
-    // Execution resumes here after each wakeup; loop() calls this function again.
+    // Yield to the RTOS for 100 ms.  This keeps BLE advertising and the WiFi
+    // AP fully active (no light sleep which stops BLE on ESP32-PICO-D4) while
+    // still giving the FreeRTOS idle task time to feed the WDT and process
+    // background WiFi/BT events.
+    delay(100);
     return;
   }
 

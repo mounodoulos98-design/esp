@@ -8,14 +8,13 @@
 #include <BLEAdvertising.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
-#include "esp_bt.h"   // esp_bt_sleep_enable()
 
 // Advertising interval for the Repeater beacon.
-// Units: 0.625 ms  →  1600 × 0.625 ms = 1000 ms (1 s).
-// A Collector scanning for 5 s will always see at least 4-5 packets.
-// Increasing this from the BLE default (~100 ms) reduces the BT radio
-// duty cycle by 10× and is the single biggest power saving available.
-#define BLE_ADV_INTERVAL_UNITS 1600   // 1000 ms
+// Units: 0.625 ms  →  160 × 0.625 ms = 100 ms.
+// A shorter interval makes the repeater reliably discoverable by both the
+// Collector (5 s scan) and standard phone Bluetooth scanners.
+// The BT radio duty cycle at 100 ms is low enough for always-on repeater use.
+#define BLE_ADV_INTERVAL_UNITS 160    // 100 ms
 
 // BLE Service UUID for mesh node identification
 #define BLE_MESH_SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -35,16 +34,11 @@ public:
             return;
         }
 
-        // ── Power saving #1: BT controller modem sleep ───────────────────────
-        // The BT radio hardware sleeps between advertising packets instead of
-        // idling at full power.  Advertising continues normally; only the radio
-        // front-end is gated.  Saves ~60-70 % of the BT radio current.
-        esp_err_t btSleep = esp_bt_sleep_enable();
-        if (btSleep == ESP_OK) {
-            Serial.println("[BLE-BEACON] BT modem sleep enabled");
-        } else {
-            Serial.printf("[BLE-BEACON] BT modem sleep unavailable (err=%d)\n", (int)btSleep);
-        }
+        // NOTE: esp_bt_sleep_enable() (BT modem sleep) is intentionally NOT
+        // called here.  On the original ESP32 (incl. ESP32-PICO-D4 used in the
+        // Adafruit Feather v2), combining BT modem sleep with CPU light sleep
+        // stops BLE advertising during the CPU sleep window.  The advertising
+        // interval (100 ms) is already low-duty-cycle enough for always-on use.
         
         // Create BLE Server (needed for advertising)
         pServer = BLEDevice::createServer();
@@ -63,11 +57,9 @@ public:
         // Add service UUID to advertisement
         pAdvertising->addServiceUUID(BLE_MESH_SERVICE_UUID);
         
-        // ── Power saving #2: slow advertising interval ───────────────────────
-        // Default BLE advertising interval is ~100 ms (160 × 0.625 ms).
-        // At 1000 ms (1600 × 0.625 ms) the radio transmits 10× less often,
-        // cutting average BT current from ~3-5 mA down to ~0.3-0.5 mA.
-        // A Collector scanning for the default 5 s still sees 4-5 packets.
+        // ── Power saving: slow advertising interval ──────────────────────────
+        // 100 ms (160 × 0.625 ms) keeps BLE discoverable by phones and
+        // Collectors while keeping the radio duty cycle low.
         pAdvertising->setMinInterval(BLE_ADV_INTERVAL_UNITS);
         pAdvertising->setMaxInterval(BLE_ADV_INTERVAL_UNITS + 16); // +10 ms jitter
         pAdvertising->setScanResponse(true);
@@ -83,8 +75,15 @@ public:
         advData.setCompleteServices(BLEUUID(BLE_MESH_SERVICE_UUID));
         pAdvertising->setAdvertisementData(advData);
         
+        // Set local name in scan-response so phones see a friendly name when
+        // browsing Bluetooth devices (scan-response data is separate from the
+        // 31-byte primary advertisement, so it doesn't crowd out the UUID).
+        BLEAdvertisementData scanRsp;
+        scanRsp.setName(nodeName.c_str());
+        pAdvertising->setScanResponseData(scanRsp);
+        
         isInitialized = true;
-        Serial.printf("[BLE-BEACON] Initialized: AP SSID=%s, adv interval=1000ms\n", apSSID.c_str());
+        Serial.printf("[BLE-BEACON] Initialized: AP SSID=%s, adv interval=100ms\n", apSSID.c_str());
     }
 
     void startAdvertising() {
