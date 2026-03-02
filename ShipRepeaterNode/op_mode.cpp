@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <vector>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <sys/time.h>
 #include "sensor_heartbeat_manager.h"
@@ -141,6 +142,13 @@ unsigned long lastActivityMillis = 0;
 unsigned long lastHeartbeatMillis = 0;  // Track last actual heartbeat from any sensor
 static WiFiEventId_t stationConnectedEventId;
 
+// Sensor completion tracking: SNs that finished all stages this AP window
+static std::set<String> doneSensors;
+// AP session start time for uplink window miss detection
+static time_t apSessionStartTime = 0;
+// Grace period (ms) after all sensors complete their full flow before sleeping
+static const unsigned long SENSOR_DONE_GRACE_MS = 60000UL; // 60 seconds
+
 // RTC Memory
 RTC_DATA_ATTR time_t rtc_last_known_time = 0;
 RTC_DATA_ATTR uint32_t rtc_last_sleep_duration_s = 0;
@@ -244,6 +252,10 @@ static void processHeartbeatBuffer() {
         } else {
           Serial.printf("[HB-BUFFER] No jobs found for SN=%s\n", sn.c_str());
         }
+        // Sensor has completed all stages (status → measurement → jobs/firmware).
+        // Mark it done so the AP can use a short grace period before sleeping.
+        doneSensors.insert(sn);
+        Serial.printf("[HB-BUFFER] Sensor SN=%s marked as done (all stages complete).\n", sn.c_str());
       }
       
       entry.hasData = false;
@@ -1198,10 +1210,27 @@ void decideAndGoToSleep() {
   printSchedulerInfo(now);
 
   uint32_t uplink_interval_s = config.meshIntervalMin * 60;  // reuse field
-  uint32_t time_to_next_uplink = uplink_interval_s - (now % uplink_interval_s);
+  uint32_t elapsed_in_interval = (uint32_t)(now % uplink_interval_s);
+  uint32_t time_to_next_uplink = uplink_interval_s - elapsed_in_interval;
   uint32_t sleep_for;
 
   if (config.role == ROLE_COLLECTOR) {
+    // If the uplink window occurred while the AP session was active (or is still active),
+    // transition directly to the uplink state instead of sleeping.
+    // last_uplink_boundary is the start of the most recent uplink window.
+    // apSessionStartTime is reset to 0 here (both branches) so this check fires at most
+    // once per AP session; the STATE_MESH_APPOINTMENT path then sets apSessionStartTime = 0
+    // (already done), preventing repeated triggering.
+    time_t last_uplink_boundary = now - (time_t)elapsed_in_interval;
+    if (apSessionStartTime > 0 && last_uplink_boundary >= apSessionStartTime) {
+      Serial.printf("[SCHEDULER] Uplink window (boundary=%lu) occurred during AP session (start=%lu); going to UPLINK now.\n",
+                    (unsigned long)last_uplink_boundary, (unsigned long)apSessionStartTime);
+      apSessionStartTime = 0; // Reset so this is a one-shot transition per AP session
+      currentState = STATE_MESH_APPOINTMENT;
+      return;  // No sleep; handle uplink in next loop iteration
+    }
+    apSessionStartTime = 0; // No uplink missed; clear for next AP session
+
     uint32_t time_to_next_ap = config.collectorApCycleSec - (now % config.collectorApCycleSec);
 
     if (time_to_next_uplink <= time_to_next_ap) {
@@ -1278,7 +1307,12 @@ void loopOperationalMode() {
     static bool tried = false;
     if (!tried) {
       tried = true;
-      syncTimeFromUplink(5000);
+      if (!syncTimeFromUplink(5000)) {
+        // Time sync failed; disconnect STA to clean up lingering state and
+        // avoid interference with the AP and BLE advertising.
+        WiFi.disconnect(false, false);
+        Serial.println("[REPEATER] STA disconnected after failed time sync (AP and BLE unaffected).");
+      }
     }
 
     // ── Power saving #3: lower CPU frequency while idle ──────────────────────
@@ -1404,6 +1438,8 @@ void loopOperationalMode() {
           jobProcessedThisWindow = false;
           lastActivityMillis = millis();
           lastHeartbeatMillis = 0; // Reset heartbeat tracking for new session
+          doneSensors.clear(); // Reset sensor completion tracking for new session
+          time(&apSessionStartTime); // Record AP session start for uplink window detection
 
           // ======================================================
           //                HEARTBEAT INTEGRATION
@@ -1593,8 +1629,14 @@ void loopOperationalMode() {
               break;
             }
           } else {
-            // No sensors connected - use shorter window timeout
-            timeout = hadStation ? (config.collectorDataTimeoutSec * 1000UL) : (config.collectorApWindowSec * 1000UL);
+            // No sensors connected
+            if (hadStation) {
+              // If at least one sensor completed all stages, use a short grace period
+              // so the collector can sleep quickly instead of waiting the full data timeout.
+              timeout = doneSensors.empty() ? (config.collectorDataTimeoutSec * 1000UL) : SENSOR_DONE_GRACE_MS;
+            } else {
+              timeout = config.collectorApWindowSec * 1000UL;
+            }
             
             if (timeSinceLastActivity > timeout) {
               if (hadStation)
