@@ -221,6 +221,17 @@ static void processHeartbeatBuffer() {
                          statusFile, (int)entry.statusDataLen);
           }
         }
+        
+        // For COLLECTOR: notify Root about this heartbeat so the server can track it.
+        // Root stores the tiny file in /received/hb_<SN>_<ts>.txt.
+        if (config.role == ROLE_COLLECTOR) {
+          char notifyPath[96];
+          snprintf(notifyPath, sizeof(notifyPath), "/received/hb_%s_%lu.txt",
+                   sn.c_str(), (unsigned long)now);
+          String hbBody = String(timestamp) + "," + sn + "," + ip + "\n";
+          notifyRoot(String(notifyPath), hbBody);
+          Serial.printf("[HB-BUFFER] Notified Root: %s\n", notifyPath);
+        }
       }
       
       // Execute jobs if needed
@@ -489,8 +500,8 @@ void ensureRootHttpServer() {
         return;
       }
       String filePath = request->getParam("path")->value();
-      // Restrict to safe directories: /jobs/ and /firmware/
-      if (!filePath.startsWith("/jobs/") && !filePath.startsWith("/firmware/")) {
+      // Restrict to safe directories: /jobs/, /firmware/, /received/ (Collector writes status/HB)
+      if (!filePath.startsWith("/jobs/") && !filePath.startsWith("/firmware/") && !filePath.startsWith("/received/")) {
         request->send(403, "text/plain", "Forbidden path");
         return;
       }
@@ -655,6 +666,42 @@ void ensureRepeaterHttpServer() {
 // =============================
 // Collector: HTTP upload to Root
 // =============================
+
+// Notify Root about a small sensor event by writing a tiny file via POST /upload.
+// Used by Collector to push heartbeat and status data to Root's /received/ directory.
+static bool notifyRoot(const String& remoteFilePath, const String& body) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  String targetHost = config.uplinkHost;
+  if (targetHost.length() == 0 || targetHost == "Auto" || targetHost == "auto") {
+    IPAddress gw = WiFi.gatewayIP();
+    targetHost = gw.toString();
+  }
+
+  WiFiClient client;
+  if (!client.connect(targetHost.c_str(), config.uplinkPort)) {
+    Serial.printf("[NOTIFY] Cannot connect to root %s:%d\n", targetHost.c_str(), config.uplinkPort);
+    return false;
+  }
+
+  String url = "/upload?path=" + remoteFilePath;
+  String req = "POST " + url + " HTTP/1.1\r\n";
+  req += "Host: " + targetHost + "\r\n";
+  req += "Content-Type: text/plain\r\n";
+  req += "Content-Length: " + String(body.length()) + "\r\n";
+  req += "Connection: close\r\n\r\n";
+  req += body;
+  client.print(req);
+
+  unsigned long t0 = millis();
+  while (client.connected() && millis() - t0 < 5000) {
+    while (client.available()) { client.read(); t0 = millis(); }
+    delay(10);
+  }
+  client.stop();
+  return true;
+}
+
 bool uploadFileToRoot(const String& fullPath, const String& basename) {
   if (!initSdCard()) return false;
   FsFile f = sd.open(fullPath.c_str(), O_RDONLY);

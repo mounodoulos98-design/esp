@@ -19,5 +19,5 @@ void sjm_resetJobCache();  // Reset job cache when AP session starts
 void resetJobCache();      // Alias for sjm_resetJobCache for compatibility
 
 // Helper functions for async heartbeat-driven job execution
-bool sjm_requestStatus(const String& ip, String& snOut);
+bool sjm_requestStatus(const String& ip, String& snOut, String* bodyOut = nullptr);
 bool processJobsForSN(const String& sn, const String& ip);

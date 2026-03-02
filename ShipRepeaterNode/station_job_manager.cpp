@@ -9,6 +9,8 @@
 
 extern SdFat sd;
 extern bool initSdCard();
+// Defined in op_mode.cpp: upload a tiny text file to Root's /received/ via POST /upload
+extern bool notifyRoot(const String& remoteFilePath, const String& body);
 
 // ---------------------
 // Εσωτερική κατάσταση
@@ -63,9 +65,9 @@ static bool writeJsonFile(const char* path, StaticJsonDocument<16384>& doc) {
 // ---------------------
 // STATUS request:
 //   - GET /api?command=STATUS&datetime=<ms>&
-//   - Παίρνουμε S/N από το body
+//   - Παίρνουμε S/N (και προαιρετικά ολόκληρο το body) από το body
 // ---------------------
-bool sjm_requestStatus(const String& ip, String& snOut) {
+bool sjm_requestStatus(const String& ip, String& snOut, String* bodyOut) {
     if (ip.length() == 0 || ip == "0.0.0.0") return false;
 
     // Wait 2s πριν το STATUS, όπως ο daemon
@@ -136,6 +138,8 @@ bool sjm_requestStatus(const String& ip, String& snOut) {
     }
 
     Serial.printf("[STATUS] SN=%s for IP=%s\n", snOut.c_str(), ip.c_str());
+    // Return the full body to the caller if requested (used for Root notification)
+    if (bodyOut) *bodyOut = body;
     return true;
 }
 
@@ -199,9 +203,10 @@ bool processJobsForSN(const String& sn, const String& ip) {
                         // handleFirmwareUpdate: MAX_TRIES=3, 4s delay between retries).
                         const int STATUS_MAX_TRIES = 3;
                         String statusSn;
+                        String statusBody;
                         bool statusOk = false;
                         for (int t = 0; t < STATUS_MAX_TRIES; t++) {
-                            if (sjm_requestStatus(ip, statusSn)) {
+                            if (sjm_requestStatus(ip, statusSn, &statusBody)) {
                                 statusOk = true;
                                 break;
                             }
@@ -215,8 +220,17 @@ bool processJobsForSN(const String& sn, const String& ip) {
                             return false;
                         }
 
-                        // For COLLECTOR: ensure firmware file is downloaded from root
+                        // For COLLECTOR: upload full status to Root so the server can update its DB.
                         extern NodeConfig config;
+                        if (config.role == ROLE_COLLECTOR && statusBody.length() > 0) {
+                            char statusPath[96];
+                            snprintf(statusPath, sizeof(statusPath),
+                                     "/received/status_%s_%lu.txt", sn.c_str(), (unsigned long)millis());
+                            notifyRoot(String(statusPath), statusBody);
+                            Serial.printf("[JOBS] Uploaded status to Root: %s\n", statusPath);
+                        }
+
+                        // For COLLECTOR: ensure firmware file is downloaded from root
                         extern bool downloadFileFromRoot(const String& remotePath, const String& localPath);
                         if (config.role == ROLE_COLLECTOR) {
                             if (!sd.exists(fw.hexPath.c_str())) {
@@ -274,6 +288,18 @@ bool processJobsForSN(const String& sn, const String& ip) {
                         bool ok = cu_sendConfiguration(cfg);
                         Serial.printf("[JOBS] CONFIG job result for SN=%s -> %s\n",
                                       sn.c_str(), ok ? "OK" : "FAIL");
+
+                        // After config, get fresh STATUS and upload to Root
+                        if (ok && config.role == ROLE_COLLECTOR) {
+                            String cfgStatusSn, cfgStatusBody;
+                            if (sjm_requestStatus(ip, cfgStatusSn, &cfgStatusBody) && cfgStatusBody.length() > 0) {
+                                char cfgStatusPath[96];
+                                snprintf(cfgStatusPath, sizeof(cfgStatusPath),
+                                         "/received/status_%s_%lu.txt", sn.c_str(), (unsigned long)millis());
+                                notifyRoot(String(cfgStatusPath), cfgStatusBody);
+                                Serial.printf("[JOBS] Uploaded post-config status to Root: %s\n", cfgStatusPath);
+                            }
+                        }
 
                         // Only remove job on success
                         if (ok) {
