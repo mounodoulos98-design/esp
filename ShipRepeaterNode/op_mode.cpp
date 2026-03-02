@@ -474,9 +474,93 @@ void ensureRootHttpServer() {
       }
     });
 
+  // Server pushes jobs/firmware to Root: POST /upload?path=/jobs/config_jobs.json
+  // Body is raw file content (JSON or hex). Used by sensorsdaemon/server to deliver jobs.
+  rootServer.on(
+    "/upload",
+    HTTP_POST,
+    [](AsyncWebServerRequest* request) {
+      request->send(400, "text/plain", "Expected body");
+    },
+    nullptr,
+    [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
+      if (!request->hasParam("path")) {
+        request->send(400, "text/plain", "Missing ?path= parameter");
+        return;
+      }
+      String filePath = request->getParam("path")->value();
+      // Restrict to safe directories: /jobs/ and /firmware/
+      if (!filePath.startsWith("/jobs/") && !filePath.startsWith("/firmware/")) {
+        request->send(403, "text/plain", "Forbidden path");
+        return;
+      }
+      static FsFile uploadFile;
+      if (index == 0) {
+        if (!initSdCard()) { request->send(503, "text/plain", "SD unavailable"); return; }
+        String dir = filePath.substring(0, filePath.lastIndexOf('/'));
+        if (!sd.exists(dir.c_str())) sd.mkdir(dir.c_str());
+        uploadFile = sd.open(filePath.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+        Serial.printf("[ROOT] /upload: writing %s\n", filePath.c_str());
+      }
+      if (uploadFile) uploadFile.write(data, len);
+      if (index + len == total) {
+        if (uploadFile) uploadFile.close();
+        request->send(200, "text/plain", "OK");
+        Serial.printf("[ROOT] /upload: saved %s (%u bytes)\n", filePath.c_str(), (unsigned)total);
+      }
+    });
+
+  // List files in a directory: GET /list?dir=/received  (returns JSON array of names)
+  rootServer.on("/list", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!req->hasParam("dir")) { req->send(400, "text/plain", "Missing ?dir="); return; }
+    String dir = req->getParam("dir")->value();
+    if (!dir.startsWith("/received") && !dir.startsWith("/jobs") && !dir.startsWith("/firmware")) {
+      req->send(403, "text/plain", "Forbidden"); return;
+    }
+    if (!initSdCard()) { req->send(503, "text/plain", "SD unavailable"); return; }
+    FsFile d = sd.open(dir.c_str());
+    if (!d || !d.isDir()) { req->send(404, "text/plain", "Directory not found"); return; }
+    String json = "[";
+    bool first = true;
+    while (true) {
+      FsFile f = d.openNextFile();
+      if (!f) break;
+      if (f.isDir()) { f.close(); continue; }
+      char fname[64];
+      f.getName(fname, sizeof(fname));
+      f.close();
+      if (!first) json += ",";
+      json += "\"";
+      json += String(fname);
+      json += "\"";
+      first = false;
+    }
+    d.close();
+    json += "]";
+    req->send(200, "application/json", json);
+  });
+
+  // Download a specific file: GET /download?path=/received/foo.csv
+  rootServer.on("/download", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!req->hasParam("path")) { req->send(400, "text/plain", "Missing ?path="); return; }
+    String filePath = req->getParam("path")->value();
+    if (!filePath.startsWith("/received/") && !filePath.startsWith("/jobs/")) {
+      req->send(403, "text/plain", "Forbidden"); return;
+    }
+    if (!initSdCard()) { req->send(503, "text/plain", "SD unavailable"); return; }
+    if (!sd.exists(filePath.c_str())) { req->send(404, "text/plain", "Not found"); return; }
+    FsFile f = sd.open(filePath.c_str(), O_RDONLY);
+    if (!f) { req->send(500, "text/plain", "Cannot open file"); return; }
+    String content = "";
+    content.reserve(f.size() + 1);
+    while (f.available()) content += (char)f.read();
+    f.close();
+    req->send(200, "application/octet-stream", content);
+  });
+
   rootServer.begin();
   rootHttpActive = true;
-  Serial.println("[ROOT] HTTP server started on :8080 (/health, /time, /ingest, /jobs, /firmware)");
+  Serial.println("[ROOT] HTTP server started on :8080 (/health /time /ingest /upload /list /download /jobs /firmware)");
 }
 
 void ensureWiFiAPRepeater() {
@@ -1122,13 +1206,38 @@ void loopOperationalMode() {
   if (config.role == ROLE_ROOT) {
     ensureWiFiAPRoot();
     ensureRootHttpServer();
-    
-    // Root doesn't need BLE - always on and accessible via WiFi
-    
+
+    // For testing without PoE: if uplinkSSID is set, connect as STA to server's WiFi.
+    // This allows sensorsdaemon/server to reach root at root's DHCP IP on the shared network.
+    // Root's SoftAP (for collectors) remains active simultaneously (WIFI_AP_STA mode).
+    static bool rootStaConnected = false;
+    static bool rootStaAttempted = false;
+    if (!rootStaAttempted && config.uplinkSSID.length() > 0) {
+      rootStaAttempted = true;
+      Serial.printf("[ROOT-STA] Connecting to server WiFi: %s\n", config.uplinkSSID.c_str());
+      if (config.uplinkPASS.length() >= 8) {  // WPA2 requires at least 8 chars
+        WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
+      } else {
+        WiFi.begin(config.uplinkSSID.c_str());
+      }
+      unsigned long t0 = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(300); }
+      if (WiFi.status() == WL_CONNECTED) {
+        rootStaConnected = true;
+        Serial.printf("[ROOT-STA] Connected! STA IP: %s  AP IP: %s\n",
+                      WiFi.localIP().toString().c_str(),
+                      WiFi.softAPIP().toString().c_str());
+        Serial.printf("[ROOT-STA] Server can reach root at http://%s:%d\n",
+                      WiFi.localIP().toString().c_str(), config.uplinkPort);
+      } else {
+        Serial.println("[ROOT-STA] Server WiFi connect failed - root accessible via AP only");
+      }
+    }
+
     static unsigned long lastPrint = 0;
     if (millis() - lastPrint > 10000) {
       debugPrintTime("Root loop");
-      lastPrint = 0;
+      lastPrint = millis();
     }
     return;
   }

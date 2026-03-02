@@ -135,7 +135,22 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
         <label for="apSSID_root">Root AP SSID:</label><input type="text" id="apSSID_root" name="apSSID" placeholder="Root_AP">
         <label for="apPASS_root">Root AP Password:</label><input type="text" id="apPASS_root" name="apPASS">
         <label for="uplinkPort_root">HTTP Port:</label><input type="number" id="uplinkPort_root" name="uplinkPort" value="8080">
-        
+
+        <h3>Server WiFi (for testing without PoE)</h3>
+        <div class="muted">Connect root to the same WiFi as your server/laptop so sensorsdaemon can reach root at its DHCP IP. Leave empty if using PoE/Ethernet or not needed.</div>
+        <div class="row">
+          <div style="flex:2">
+            <label for="uplinkSSID_root">Server WiFi SSID:</label>
+            <input type="text" id="uplinkSSID_root" name="uplinkSSID" placeholder="(leave empty if not needed)">
+          </div>
+          <div style="flex:1;align-self:end">
+            <button type="button" onclick="scanWiFi('uplinkSSID_root')">Scan WiFi</button>
+          </div>
+        </div>
+        <select id="wifiList_root" style="width:100%;margin-top:5px;display:none;"></select>
+        <label for="uplinkPASS_root">Server WiFi Password:</label>
+        <input type="text" id="uplinkPASS_root" name="uplinkPASS" placeholder="(leave empty if open)">
+
         <h3>BLE Configuration</h3>
         <div class="muted">Root is always on via WiFi. BLE beacon not needed.</div>
         <label>
@@ -167,7 +182,10 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
         const resp = await fetch('/scan');
         if (!resp.ok) throw new Error(resp.statusText);
         const nets = await resp.json();
-        const sel = document.getElementById(targetInput==='uplinkSSID_r'?'wifiList_r':'wifiList');
+        let listId = 'wifiList';
+        if (targetInput === 'uplinkSSID_r') listId = 'wifiList_r';
+        else if (targetInput === 'uplinkSSID_root') listId = 'wifiList_root';
+        const sel = document.getElementById(listId);
         sel.innerHTML='';
         nets.forEach(n=>{
           const opt=document.createElement('option');
@@ -359,10 +377,14 @@ void startConfigurationMode() {
       if(request->hasParam("apSSID",true)) config.apSSID = request->getParam("apSSID",true)->value();
       if(request->hasParam("apPASS",true)) config.apPASS = request->getParam("apPASS",true)->value();
       if(request->hasParam("uplinkPort",true)) config.uplinkPort = request->getParam("uplinkPort",true)->value().toInt();
-      
+      // Server WiFi for testing (uplinkSSID/PASS reused as server-side WiFi credentials)
+      if(request->hasParam("uplinkSSID",true)) config.uplinkSSID = request->getParam("uplinkSSID",true)->value();
+      if(request->hasParam("uplinkPASS",true)) config.uplinkPASS = request->getParam("uplinkPASS",true)->value();
+
       // BLE configuration for Root (typically disabled)
       config.bleBeaconEnabled = request->hasParam("bleBeaconEnabled",true);
-      Serial.printf("[CONFIG] Root config: BLE=%d\n", config.bleBeaconEnabled);
+      Serial.printf("[CONFIG] Root config: BLE=%d, ServerWiFi=%s\n",
+                    config.bleBeaconEnabled, config.uplinkSSID.c_str());
     }
 
     config.isConfigured = true;

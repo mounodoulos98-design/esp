@@ -194,7 +194,27 @@ bool processJobsForSN(const String& sn, const String& ip) {
                         fw.totalTimeoutMs = jobObj["timeout_ms"] | (8UL * 60UL * 1000UL);
 
                         Serial.printf("[JOBS] Found FW job for SN=%s\n", sn.c_str());
-                        
+
+                        // Initial STATUS check before firmware update (matches sensorsdaemon
+                        // handleFirmwareUpdate: MAX_TRIES=3, 4s delay between retries).
+                        const int STATUS_MAX_TRIES = 3;
+                        String statusSn;
+                        bool statusOk = false;
+                        for (int t = 0; t < STATUS_MAX_TRIES; t++) {
+                            if (sjm_requestStatus(ip, statusSn)) {
+                                statusOk = true;
+                                break;
+                            }
+                            Serial.printf("[JOBS] STATUS try %d/%d failed for SN=%s, retrying in 4s...\n",
+                                          t + 1, STATUS_MAX_TRIES, sn.c_str());
+                            if (t < STATUS_MAX_TRIES - 1) delay(4000);
+                        }
+                        if (!statusOk) {
+                            Serial.printf("[JOBS] Aborting FW job for SN=%s: STATUS failed after %d tries\n",
+                                          sn.c_str(), STATUS_MAX_TRIES);
+                            return false;
+                        }
+
                         // For COLLECTOR: ensure firmware file is downloaded from root
                         extern NodeConfig config;
                         extern bool downloadFileFromRoot(const String& remotePath, const String& localPath);
