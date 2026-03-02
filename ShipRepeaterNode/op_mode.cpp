@@ -1207,32 +1207,8 @@ void loopOperationalMode() {
     ensureWiFiAPRoot();
     ensureRootHttpServer();
 
-    // For testing without PoE: if uplinkSSID is set, connect as STA to server's WiFi.
-    // This allows sensorsdaemon/server to reach root at root's DHCP IP on the shared network.
-    // Root's SoftAP (for collectors) remains active simultaneously (WIFI_AP_STA mode).
-    static bool rootStaConnected = false;
-    static bool rootStaAttempted = false;
-    if (!rootStaAttempted && config.uplinkSSID.length() > 0) {
-      rootStaAttempted = true;
-      Serial.printf("[ROOT-STA] Connecting to server WiFi: %s\n", config.uplinkSSID.c_str());
-      if (config.uplinkPASS.length() >= 8) {  // WPA2 requires at least 8 chars
-        WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
-      } else {
-        WiFi.begin(config.uplinkSSID.c_str());
-      }
-      unsigned long t0 = millis();
-      while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(300); }
-      if (WiFi.status() == WL_CONNECTED) {
-        rootStaConnected = true;
-        Serial.printf("[ROOT-STA] Connected! STA IP: %s  AP IP: %s\n",
-                      WiFi.localIP().toString().c_str(),
-                      WiFi.softAPIP().toString().c_str());
-        Serial.printf("[ROOT-STA] Server can reach root at http://%s:%d\n",
-                      WiFi.localIP().toString().c_str(), config.uplinkPort);
-      } else {
-        Serial.println("[ROOT-STA] Server WiFi connect failed - root accessible via AP only");
-      }
-    }
+    // Root is always-on AP. The server connects to Root's AP (Root_AP) to
+    // communicate with Root's HTTP API. No STA connection needed from Root.
 
     static unsigned long lastPrint = 0;
     if (millis() - lastPrint > 10000) {

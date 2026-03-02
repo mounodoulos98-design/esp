@@ -1,63 +1,92 @@
-# Root Node: Server Communication & WiFi Testing Guide
+# Root Node: Architecture & Server Communication Guide
 
-## Περίληψη
+## Αρχιτεκτονική
 
-Αυτό το document εξηγεί:
-1. **Πώς επικοινωνεί ο Root με τον server** (sensorsdaemon / backend)
-2. **Πώς να κάνεις testing χωρίς PoE** χρησιμοποιώντας WiFi boards
+```
+[Server / Laptop]
+  │  WiFi (συνδέεται στο Root_AP)
+  │  sensorsdaemon.py + rootdaemon.py
+  │
+  └──→ [Root ESP32]  ←  SoftAP "Root_AP" (192.168.10.1:8080)
+          │
+          └──→ [Repeater ESP32]  ←  SoftAP
+                    │
+                    └──→ [Collector ESP32]  ←  SoftAP
+                                │
+                                └──→ [Sensors (HAT)]
+```
+
+**Ροή δεδομένων:**
+- Sensors → Collector → (Repeater) → Root (`POST /ingest`)
+- Root → Server: `GET /list`, `GET /download`
+- Server → Root: `POST /upload` (config/firmware jobs)
+- Root → Collector: `GET /jobs/config_jobs.json`, `GET /jobs/firmware_jobs.json`
 
 ---
 
-## Αρχιτεκτονική - Root ↔ Server
+## Ρύθμιση Root ESP32
 
-### Κανονική λειτουργία (PoE / Ethernet)
-
-```
-[Server/Laptop]
-   │  (Ethernet / PoE)
-   │
-[Root ESP32] ←── SoftAP ──── [Repeater / Collector]
-   port 8080
-```
-
-Ο Root συνδέεται απευθείας στον server μέσω Ethernet/PoE. Ο server γνωρίζει σταθερά την IP του Root.
-
-### Testing χωρίς PoE (WiFi)
-
-```
-[Server/Laptop]
-   │  WiFi (home router / hotspot)
-   │
-[Root ESP32] ←── WiFi STA ──── [Home Router]
-   │
-   └──── SoftAP (Root_AP) ──── [Repeater / Collector]
-```
-
-Ο Root συνδέεται **ταυτόχρονα** σε δύο δίκτυα:
-- **SoftAP** (`Root_AP` / `192.168.10.1`): Για collectors/repeaters να ανεβάζουν δεδομένα
-- **WiFi STA** (home router): Ο server φτάνει τον root στο DHCP IP που παίρνει
-
----
-
-## Ρύθμιση Root για WiFi Testing
-
-### Στη Configuration page του Root:
-
-1. Άνοιξε το config page (σύνδεσε σε `Repeater_Setup_XXXX`, βγαίνει στο `192.168.4.1`)
-2. Επίλεξε Role: **Root**
-3. Συμπλήρωσε:
-   - **Root AP SSID**: `Root_AP` (αυτό βλέπουν collectors/repeaters)
+1. Σύνδεσε το ESP32 στο PC μέσω USB
+2. Μπές στη configuration page (σύνδεσε σε `Repeater_Setup_XXXX`, βγαίνει `192.168.4.1`)
+3. Επίλεξε Role: **Root**
+4. Συμπλήρωσε:
+   - **Root AP SSID**: `Root_AP` (ή ό,τι θες)
+   - **Root AP Password**: (min 8 chars ή άδειο για open)
    - **HTTP Port**: `8080`
-   - **Server WiFi SSID**: το SSID του home WiFi/laptop hotspot
-   - **Server WiFi Password**: ο κωδικός του
-
-4. Save & Reboot
+5. Save & Reboot
 
 Στο Serial Monitor θα δεις:
 ```
-[ROOT-STA] Connecting to server WiFi: MyHomeWiFi
-[ROOT-STA] Connected! STA IP: 192.168.1.50  AP IP: 192.168.10.1
-[ROOT-STA] Server can reach root at http://192.168.1.50:8080
+[ROOT] SoftAP Root_AP: OK | IP=192.168.10.1
+[ROOT] HTTP server started on :8080 (/health /time /ingest /upload /list /download /jobs /firmware)
+```
+
+---
+
+## Ρύθμιση Server (sensorsdaemon)
+
+### 1. Σύνδεσε το Server στο Root_AP
+
+Στο Linux/Mac:
+```bash
+# Βρες το SSID
+nmcli dev wifi list
+
+# Σύνδεσε
+nmcli dev wifi connect "Root_AP" password "mypassword"
+
+# Επαλήθευσε
+ping 192.168.10.1
+curl http://192.168.10.1:8080/health   # → {"ok":true}
+```
+
+### 2. Ρύθμιση config.ini
+
+Στο αρχείο `config.<hostname>.ini` (π.χ. `config.hat.testble.ini`):
+
+```ini
+[General]
+# ... υπάρχουσες ρυθμίσεις ...
+
+# Root-node polling
+root_node_host=192.168.10.1
+root_node_port=8080
+root_poll_interval_seconds=30
+```
+
+### 3. Εκκίνηση sensorsdaemon
+
+```bash
+cd ShipRepeaterNode/oninemonitoribg/sensorsdaemon
+python3 sensorsdaemon.py -v
+```
+
+Θα δεις:
+```
+HAT Sensors Daemon started
+Root-node polling started → http://192.168.10.1:8080
+[rootdaemon] Root node is reachable.
+[rootdaemon] [ROOT] 0 new file(s) in /received
 ```
 
 ---
@@ -66,135 +95,108 @@
 
 | Method | Endpoint | Περιγραφή |
 |--------|----------|-----------|
-| GET | `/health` | Health check: `{"ok":true}` |
-| GET | `/time` | Επιστρέφει Unix epoch: `{"epoch":1234567890}` |
-| POST | `/ingest` | Upload δεδομένου από collector (multipart) |
-| **POST** | **`/upload?path=/jobs/config_jobs.json`** | **Server → Root: στείλε jobs** |
-| **GET** | **`/list?dir=/received`** | **List αρχείων που έχει λάβει ο root** |
-| **GET** | **`/download?path=/received/foo.csv`** | **Download αρχείου** |
+| GET | `/health` | `{"ok":true}` |
+| GET | `/time` | `{"epoch":1234567890}` |
+| POST | `/ingest` | Upload αρχείου από collector (multipart) |
+| POST | `/upload?path=/jobs/config_jobs.json` | Server → Root: ανέβασε jobs/firmware |
+| GET | `/list?dir=/received` | Λίστα αρχείων που έχει λάβει ο root |
+| GET | `/download?path=/received/foo.bin` | Κατέβασε αρχείο |
 | GET | `/jobs/config_jobs.json` | Collector κατεβάζει config jobs |
 | GET | `/jobs/firmware_jobs.json` | Collector κατεβάζει firmware jobs |
 | GET | `/firmware/*` | Collector κατεβάζει hex αρχεία |
 
-### Πώς ο Server στέλνει jobs στον Root
+---
+
+## rootdaemon.py – Λογική
+
+### PULL (κάθε `root_poll_interval_seconds` δευτερόλεπτα)
+
+1. `GET /list?dir=/received` → λίστα αρχείων
+2. Για κάθε νέο αρχείο:
+   - `.bin` → αποθηκεύεται στο `measurements/hat_sensors/` → `processMeasurements()` το επεξεργάζεται
+   - `heartbeat*.csv` → ενημερώνει `latest_heartbeat_on` στη DB για κάθε SN
+   - `*_SRSP.csv` / `status_*` → ενημερώνει sensor status στη DB
+
+### PUSH (κάθε polling cycle)
+
+1. Sensors με `flag_update_configuration=1` → generates `config_jobs.json` → `POST /upload?path=/jobs/config_jobs.json`
+2. Sensors με εκκρεμές firmware update → generates `firmware_jobs.json` + ανεβάζει hex → `POST /upload`
+
+---
+
+## Job File Formats
+
+### config_jobs.json
+```json
+{
+  "jobs": [
+    {
+      "sn": "324269",
+      "params": {
+        "sleep_time_after_sec_Station_mode": 120,
+        "wakeup_every_min": 1,
+        "temp_threshold": 45,
+        "send_heartbeat_every_sec": 10,
+        "start_time_for_accel_data_sec": 0,
+        "send_accel_data_every_min": 5,
+        "vibration_threshold_in_mg": 800,
+        "vibration_threshold_frequency_in_Hz": 25,
+        "acc_data_measure_time": 5000,
+        "accel_full_scale": 16
+      }
+    }
+  ]
+}
+```
+
+### firmware_jobs.json
+```json
+{
+  "jobs": [
+    {
+      "sn": "324269",
+      "hex_path": "/firmware/fw_1_17.hex",
+      "timeout_ms": 480000
+    }
+  ]
+}
+```
+
+---
+
+## Manual Testing (χωρίς sensorsdaemon)
 
 ```bash
-# Στείλε config jobs (π.χ. από laptop)
-curl -X POST \
-  "http://192.168.1.50:8080/upload?path=/jobs/config_jobs.json" \
+# Βεβαιώσου ότι είσαι στο Root_AP
+ping 192.168.10.1
+
+# Health check
+curl http://192.168.10.1:8080/health
+
+# Στείλε config jobs
+curl -X POST "http://192.168.10.1:8080/upload?path=/jobs/config_jobs.json" \
+  -H "Content-Type: application/json" \
   --data-binary @config_jobs.json
 
-# Στείλε firmware jobs
-curl -X POST \
-  "http://192.168.1.50:8080/upload?path=/jobs/firmware_jobs.json" \
-  --data-binary @firmware_jobs.json
+# Δες τι έχει λάβει ο root από collectors
+curl "http://192.168.10.1:8080/list?dir=/received"
 
-# Ανέβασε hex αρχείο για firmware update
-curl -X POST \
-  "http://192.168.1.50:8080/upload?path=/firmware/vibration_sensor_app_v1.17.hex" \
-  --data-binary @vibration_sensor_app_v1.17.hex
+# Κατέβασε ένα αρχείο
+curl "http://192.168.10.1:8080/download?path=/received/heartbeat_api.csv"
 ```
-
-### Πώς ο Server διαβάζει δεδομένα από τον Root
-
-```bash
-# List αρχεία που έχουν ανέβει από collectors
-curl "http://192.168.1.50:8080/list?dir=/received"
-# → ["heartbeat_api.csv","status_324269_12345.txt","12345678_sensordata.bin"]
-
-# Download ένα αρχείο
-curl "http://192.168.1.50:8080/download?path=/received/heartbeat_api.csv" \
-  -o heartbeat_api.csv
-```
-
----
-
-## Retry Logic (ίδιο με sensorsdaemon.py)
-
-### Python sensorsdaemon.py
-
-```python
-# handleFirmwareUpdate:
-MAX_TRIES = 3
-
-# 1. Initial STATUS before firmware (3 retries, 4s delay)
-while tries < MAX_TRIES:
-    res = submitCommandStatus(sensor, wait_before_sending=False)
-    if res: break
-    time.sleep(4)
-
-# 2. Each HEX line (3 retries, 4s delay)
-for fw_line in fw_lines:
-    while tries < MAX_TRIES:
-        res = submitFirmwareUpdateCommand(sensor, fw_line)
-        if res: break
-        time.sleep(4)
-```
-
-### ESP32 (μετά τις αλλαγές)
-
-```cpp
-// processJobsForSN → FW job:
-
-// 1. Initial STATUS (3 retries, 4s delay) - ΝΕΟ ✅
-const int STATUS_MAX_TRIES = 3;
-for (int t = 0; t < STATUS_MAX_TRIES; t++) {
-    if (sjm_requestStatus(ip, statusSn)) { statusOk = true; break; }
-    Serial.printf("[JOBS] STATUS try %d/%d failed, retrying in 4s...\n", t+1, STATUS_MAX_TRIES);
-    if (t < STATUS_MAX_TRIES - 1) delay(4000);
-}
-if (!statusOk) return false; // Abort FW job
-
-// 2. Each HEX line (3 retries, 4s delay) - Υπήρχε ήδη ✅
-// (firmware_updater.cpp::executeFirmwareJob)
-const int MAX_TRIES = 3;
-for (int t = 0; t < MAX_TRIES; ++t) {
-    if (httpGetSensor(ip, path, body, 5000UL)) { ok = true; break; }
-    delay(4000);
-}
-```
-
-### Σύγκριση
-
-| Βήμα | sensorsdaemon.py | ESP32 (before) | ESP32 (after) |
-|------|-----------------|----------------|---------------|
-| STATUS πριν FW | 3 retries, 4s | ❌ none | ✅ 3 retries, 4s |
-| Κάθε HEX line | 3 retries, 4s | ✅ 3 retries, 4s | ✅ 3 retries, 4s |
-| CONFIG update | 1 attempt | 1 attempt | 1 attempt |
-| STATUS heartbeat | 1 attempt | 1 attempt | 1 attempt |
-
----
-
-## Root-Server: Μελλοντική Αρχιτεκτονική (PoE)
-
-Για production deployment:
-
-```
-[Server]
-  ├── sensorsdaemon.py (Linux service)
-  │     └── POST http://root-ip:8080/upload?path=/jobs/...
-  │     └── GET  http://root-ip:8080/list?dir=/received
-  │     └── GET  http://root-ip:8080/download?path=...
-  │
-  └── [Root ESP32] via PoE/Ethernet
-        ├── SoftAP: Root_AP (192.168.10.1) ← collectors
-        └── Ethernet: 192.168.0.X ← server
-```
-
-Για να ενεργοποιηθεί το Ethernet support στο ESP32, θα χρειαστεί:
-- ESP32 με Ethernet PHY (π.χ. WT32-ETH01 ή ESP32 + LAN8720)
-- Αλλαγή στον κώδικα για `ETH.begin()` αντί WiFi STA
-
-**Για τώρα (testing)**: Το WiFi STA mode είναι ισοδύναμο - ο server φτάνει τον root στο DHCP IP.
 
 ---
 
 ## Checklist Testing
 
-- [ ] Root ESP32: Configure Server WiFi SSID/Pass
-- [ ] Root booting → check Serial for `[ROOT-STA] Connected! STA IP: X.X.X.X`
-- [ ] Server: `curl http://X.X.X.X:8080/health` → `{"ok":true}`
-- [ ] Server: push config_jobs.json via `/upload`
-- [ ] Collector boots → connects to Root_AP → downloads jobs
-- [ ] Collector executes jobs (check Serial)
-- [ ] Server: `curl "http://X.X.X.X:8080/list?dir=/received"` → αρχεία από collectors
+- [ ] Root ESP32: Flash με role=Root, AP SSID=Root_AP
+- [ ] Root: Serial log → `HTTP server started on :8080`
+- [ ] Server: WiFi συνδέεται στο Root_AP (`nmcli dev wifi connect Root_AP`)
+- [ ] Server: `curl http://192.168.10.1:8080/health` → `{"ok":true}`
+- [ ] Config ini: `root_node_host=192.168.10.1` uncommented
+- [ ] sensorsdaemon: ξεκινάει → `Root-node polling started`
+- [ ] Collector: Flash με role=Collector, uplinkSSID=Root_AP
+- [ ] Sensor: Ξυπνάει, συνδέεται σε Collector, ανεβάζει δεδομένα
+- [ ] Collector: Ανεβάζει στο Root (`POST /ingest`)
+- [ ] Server: rootdaemon κατεβάζει τα αρχεία → processMeasurements()
+- [ ] DB: Sensor status/heartbeat ενημερωμένα
