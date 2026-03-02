@@ -133,7 +133,7 @@ static void bufferHeartbeat(const String& sn, const String& ip, bool needsJobChe
 
 // Forward declarations - both functions are defined later in this file
 static void processHeartbeatBuffer();
-static bool notifyRoot(const String& remoteFilePath, const String& body);
+bool notifyRoot(const String& remoteFilePath, const String& body);
 
 // Collector AP State (sensor intake / command execution)
 bool hadStation = false;
@@ -670,7 +670,7 @@ void ensureRepeaterHttpServer() {
 
 // Notify Root about a small sensor event by writing a tiny file via POST /upload.
 // Used by Collector to push heartbeat and status data to Root's /received/ directory.
-static bool notifyRoot(const String& remoteFilePath, const String& body) {
+bool notifyRoot(const String& remoteFilePath, const String& body) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   String targetHost = config.uplinkHost;
