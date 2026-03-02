@@ -131,8 +131,9 @@ static void bufferHeartbeat(const String& sn, const String& ip, bool needsJobChe
   hbBufferWriteIdx = nextIdx;
 }
 
-// Forward declaration - implemented after ensureDir
+// Forward declarations - both functions are defined later in this file
 static void processHeartbeatBuffer();
+static bool notifyRoot(const String& remoteFilePath, const String& body);
 
 // Collector AP State (sensor intake / command execution)
 bool hadStation = false;
@@ -1294,11 +1295,17 @@ void loopOperationalMode() {
 
     // Enter light sleep.  The BLE controller advertises autonomously at its
     // 1000 ms hardware interval; WiFi AP stays live for station connections.
-    // CPU wakes on:  BLE activity | WiFi station connect | 5 s timer (WDT keepalive)
+    // CPU wakes on:  BLE activity (where supported) | WiFi station connect | 5 s timer (WDT keepalive)
+#ifdef SOC_PM_SUPPORT_BT_WAKEUP
+    // esp_sleep_enable_bt_wakeup() is only available on chips that expose
+    // BT as a light-sleep wakeup source (e.g. original ESP32).  On ESP32-S3,
+    // C3, etc. the BLE controller handles beacon advertising autonomously and
+    // the CPU is woken by WiFi activity or the timer below instead.
     esp_err_t bt_ret = esp_sleep_enable_bt_wakeup();
     if (bt_ret != ESP_OK) {
       Serial.printf("[BLE-MESH] WARN: esp_sleep_enable_bt_wakeup() err=%d\n", bt_ret);
     }
+#endif
     esp_err_t wifi_ret = esp_sleep_enable_wifi_wakeup();
     if (wifi_ret != ESP_OK) {
       Serial.printf("[BLE-MESH] WARN: esp_sleep_enable_wifi_wakeup() err=%d\n", wifi_ret);
