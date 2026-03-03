@@ -8,6 +8,7 @@
 #include <BLEAdvertising.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include "esp_bt.h"
 
 // Advertising interval for the Repeater beacon.
 // Units: 0.625 ms  →  160 × 0.625 ms = 100 ms.
@@ -35,10 +36,15 @@ public:
         }
 
         // NOTE: esp_bt_sleep_enable() (BT modem sleep) is intentionally NOT
-        // called here.  On the original ESP32 (incl. ESP32-PICO-D4 used in the
-        // Adafruit Feather v2), combining BT modem sleep with CPU light sleep
-        // stops BLE advertising during the CPU sleep window.  The advertising
-        // interval (100 ms) is already low-duty-cycle enough for always-on use.
+        // called on the original ESP32 (incl. ESP32-PICO-D4) because combining
+        // BT modem sleep with CPU light sleep stops BLE advertising during the
+        // CPU sleep window.
+        // On ESP32-C6 the BT/BLE subsystem handles modem sleep correctly
+        // alongside CPU light sleep, so we enable it to allow the repeater
+        // beacon to sleep properly between advertising events.
+#if defined(CONFIG_IDF_TARGET_ESP32C6)
+        esp_bt_sleep_enable();
+#endif
         
         // Create BLE Server (needed for advertising)
         pServer = BLEDevice::createServer();

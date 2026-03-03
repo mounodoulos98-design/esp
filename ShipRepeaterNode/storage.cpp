@@ -125,7 +125,7 @@ bool initSdCard() {
   Serial.println("[SD] (Re)Initializing SD card...");
   SPI.end();
   delay(50);
-  SPI.begin(SCK, MISO, MOSI, SD_CS_PIN);
+  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
   delay(20);
 
   bool success = sd.begin(spiCfg);
@@ -134,7 +134,7 @@ bool initSdCard() {
     delay(100);
     SPI.end();
     delay(20);
-    SPI.begin(SCK, MISO, MOSI, SD_CS_PIN);
+    SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
     SdSpiConfig retryCfg(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(8));
     success = sd.begin(retryCfg);
   }

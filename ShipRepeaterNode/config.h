@@ -25,7 +25,13 @@
 #define NEOPIXEL_PIN             0
 #define NEOPIXEL_POWER_PIN       2
 #define NEOPIXEL_BRIGHTNESS     20
-#define SD_CS_PIN               27
+
+// SD card SPI pins – Waveshare ESP32-C6 (16 MB Flash)
+// Breakout wiring: CLK→GPIO19, DO(MISO)→GPIO20, DI(MOSI)→GPIO21, CS→GPIO18
+#define SD_SCK_PIN              19   // FSPICLK  / SDIO_CLK
+#define SD_MISO_PIN             20   // FSPID    / SDIO_DATA0  (SD DO)
+#define SD_MOSI_PIN             21   // FSPIQ    / SDIO_DATA1  (SD DI)
+#define SD_CS_PIN               18   // FSPICS0  / SDIO_CMD
 
 // Network Defaults
 #define ROOT_AP_SSID            "Root_AP"
