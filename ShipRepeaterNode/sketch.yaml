@@ -2,20 +2,43 @@
 #
 # Board: Waveshare ESP32-C6 (16 MB flash)
 #
-# Why PartitionScheme=custom:
-#   The default ESP32-C6 scheme allocates only 1.25 MB for the app
-#   (upload.maximum_size=1310720), causing "text section exceeds available
-#   space in board" when the sketch grows beyond that.
-#   Setting PartitionScheme=custom does two things:
-#     1. Sets upload.maximum_size=3145728 (3 MB) so the linker has room.
-#     2. Instructs the ESP32 arduino core to use partitions.csv from this
-#        sketch directory instead of a built-in partition table.
+# WHY THIS FILE EXISTS
+# --------------------
+# The sketch exceeds the 1.25 MB default app partition for ESP32-C6.
+# This file tells the build system to use PartitionScheme=custom, which:
+#   1. Sets upload.maximum_size=3145728 (3 MB) – linker error goes away.
+#   2. Tells arduino-esp32 to load partitions.csv from this directory
+#      instead of a built-in table, giving the full 16 MB layout.
 #
-# Why FlashSize=16M:
-#   The Waveshare ESP32-C6 has 16 MB of flash.  This ensures esptool and
-#   the build system know the full flash capacity so the partition offsets
-#   in partitions.csv are valid.
+# HOW TO USE IN ARDUINO IDE
+# -------------------------
+# This file is used AUTOMATICALLY by:
+#   - arduino-cli 0.35+  (reads default_fqbn below)
+#   - Arduino IDE 2.2+   (select profile "waveshare_esp32c6_16mb" from the
+#                         dropdown that appears when you open the sketch)
 #
-# The matching partitions.csv (same directory) defines:
-#   nvs     20 KB, otadata 8 KB, app0 3 MB, app1 3 MB, spiffs ~10 MB
+# For Arduino IDE < 2.2 or IDE 1.x you must set it MANUALLY once:
+#   1. Tools → Board → ESP32 Arduino → ESP32C6 Dev Module
+#   2. Tools → Flash Size → 16MB (128Mb)
+#   3. Tools → Partition Scheme → Custom
+#   Then compile – the partitions.csv in this folder is used automatically.
+#   (Alternatively choose "Huge APP (3MB No OTA/1MB SPIFFS)" if you do not
+#    need OTA updates; that works without any custom CSV file.)
+#
+# PARTITION LAYOUT (partitions.csv in this directory)
+# ----------------------------------------------------
+#   nvs       20 KB  – WiFi credentials / Preferences
+#   otadata    8 KB  – OTA boot state
+#   app0    3072 KB  – running firmware  (~1.62 MB sketch + 1.5 MB headroom)
+#   app1    3072 KB  – OTA update slot   (same size as app0, required by IDF)
+#   spiffs ~9920 KB  – remaining flash for data / web assets
+
+# Used by arduino-cli (any version) when no --fqbn flag is given
 default_fqbn: esp32:esp32:esp32c6:FlashSize=16M,PartitionScheme=custom
+
+# Used by Arduino IDE 2.2+ – select this profile from the IDE toolbar
+profiles:
+  waveshare_esp32c6_16mb:
+    fqbn: esp32:esp32:esp32c6:FlashSize=16M,PartitionScheme=custom
+    platforms:
+      - platform: esp32:esp32
