@@ -1,0 +1,21 @@
+# Arduino sketch configuration – ShipRepeaterNode
+#
+# Board: Waveshare ESP32-C6 (16 MB flash)
+#
+# Why PartitionScheme=custom:
+#   The default ESP32-C6 scheme allocates only 1.25 MB for the app
+#   (upload.maximum_size=1310720), causing "text section exceeds available
+#   space in board" when the sketch grows beyond that.
+#   Setting PartitionScheme=custom does two things:
+#     1. Sets upload.maximum_size=3145728 (3 MB) so the linker has room.
+#     2. Instructs the ESP32 arduino core to use partitions.csv from this
+#        sketch directory instead of a built-in partition table.
+#
+# Why FlashSize=16M:
+#   The Waveshare ESP32-C6 has 16 MB of flash.  This ensures esptool and
+#   the build system know the full flash capacity so the partition offsets
+#   in partitions.csv are valid.
+#
+# The matching partitions.csv (same directory) defines:
+#   nvs     20 KB, otadata 8 KB, app0 3 MB, app1 3 MB, spiffs ~10 MB
+default_fqbn: esp32:esp32:esp32c6:FlashSize=16M,PartitionScheme=custom
