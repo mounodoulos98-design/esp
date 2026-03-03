@@ -356,10 +356,10 @@ static void debugPrintTime(const char* tag) {
   time(&now);
   struct tm* t = localtime(&now);
   if (t)
-    Serial.printf("[DEBUG_TIME] %s -> %04d-%02d-%02d %02d:%02d:%02d (epoch=%ld)\n",
+    Serial.printf("[DEBUG_TIME] %s -> %04d-%02d-%02d %02d:%02d:%02d (epoch=%lld)\n",
                   tag,
                   t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-                  t->tm_hour, t->tm_min, t->tm_sec, now);
+                  t->tm_hour, t->tm_min, t->tm_sec, (long long)now);
   else
     Serial.printf("[DEBUG_TIME] %s -> invalid time\n", tag);
 }
@@ -1129,10 +1129,12 @@ void startOperationalMode() {
   WiFi.mode(WIFI_OFF);
   delay(200);
   esp_task_wdt_config_t wdt_cfg = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
-  esp_err_t wdt_err = esp_task_wdt_init(&wdt_cfg);
-  if (wdt_err == ESP_ERR_INVALID_STATE) {
-    // TWDT already initialised by Arduino with a short (5 s) timeout – reconfigure to 30 s.
-    esp_task_wdt_reconfigure(&wdt_cfg);
+  // Arduino framework always initialises the TWDT before setup() runs.
+  // Calling esp_task_wdt_init() again would print an error and return
+  // ESP_ERR_INVALID_STATE, so reconfigure the already-running TWDT directly.
+  // Fall back to init() only when the TWDT has not been started yet.
+  if (esp_task_wdt_reconfigure(&wdt_cfg) == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_init(&wdt_cfg);
   }
   esp_task_wdt_add(NULL);
   Serial.printf("[BOOT] Wake cause=%d, rtc_last_sleep_duration_s=%u\n",
