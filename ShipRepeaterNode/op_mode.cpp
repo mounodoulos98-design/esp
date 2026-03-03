@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <sys/time.h>
 #include "sensor_heartbeat_manager.h"
+#if SHIP_BLE_ENABLED
 #include "ble_mesh_beacon.h"
+#endif
 
 
 
@@ -83,8 +85,10 @@ static SensorHeartbeatManager heartbeatManager;
 static AsyncWebServer sensorServer(3000);
 
 // BLE Mesh Wake-up: Beacon for Root/Repeater, Scanner for Collector/Repeater
+#if SHIP_BLE_ENABLED
 static BLEBeaconManager bleBeacon;
 static BLEScannerManager bleScanner;
+#endif
 
 // === Simple Memory-Based Buffer for Callback-to-Loop Communication ===
 // FreeRTOS queues cause mutex crashes when used from AsyncWebServer callbacks.
@@ -1128,6 +1132,13 @@ void initializeTime() {
 void startOperationalMode() {
   WiFi.mode(WIFI_OFF);
   delay(200);
+#if !SHIP_BLE_ENABLED
+  if (config.bleBeaconEnabled) {
+    Serial.println("[BLE] WARNING: bleBeaconEnabled=true but BLE was not compiled in.");
+    Serial.println("[BLE] Set SHIP_BLE_ENABLED=1 in config.h to enable BLE support.");
+    config.bleBeaconEnabled = false;
+  }
+#endif
   esp_task_wdt_config_t wdt_cfg = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
   esp_task_wdt_init(&wdt_cfg);
   esp_task_wdt_add(NULL);
@@ -1180,10 +1191,12 @@ void goToDeepSleep(unsigned int seconds) {
   stopAPMode();
   
   // Stop BLE before deep sleep
+#if SHIP_BLE_ENABLED
   if (config.bleBeaconEnabled) {
     bleBeacon.stop();
     Serial.println("[BLE-MESH] Stopped BLE beacon before sleep");
   }
+#endif
   
   Serial.printf("[SLEEP] Entering deep sleep for %u seconds.\n", seconds);
   esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
@@ -1304,12 +1317,14 @@ void loopOperationalMode() {
     ensureRepeaterHttpServer();
     
     // Start BLE beacon once (100ms advertising interval set inside begin())
+#if SHIP_BLE_ENABLED
     if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
       String actualAPSSID = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
       bleBeacon.begin(actualAPSSID, config.nodeName, 0); // 0 = Repeater role
       bleBeacon.startAdvertising();
       Serial.println("[BLE-MESH] Repeater BLE beacon active");
     }
+#endif
     
     static bool tried = false;
     if (!tried) {
@@ -1674,7 +1689,9 @@ void loopOperationalMode() {
       {
         static time_t state_start_time = 0;
         static bool started = false;
+#if SHIP_BLE_ENABLED
         static bool bleScanned = false;
+#endif
 
         if (!started) {
           setStatusLed(STATUS_SENDING_DATA);
@@ -1682,6 +1699,7 @@ void loopOperationalMode() {
                         (config.role == ROLE_REPEATER ? "REPEATER" : "COLLECTOR"));
 
           // BLE Scan for parent discovery (Collector/Repeater finding their parent)
+#if SHIP_BLE_ENABLED
           if (config.bleBeaconEnabled && !bleScanned) {
             Serial.println("[BLE-MESH] Scanning for parent node...");
             String scannerName = config.nodeName + "_Scanner";
@@ -1702,6 +1720,7 @@ void loopOperationalMode() {
               Serial.println("[BLE-MESH] No parent found via BLE, proceeding with configured uplink");
             }
           }
+#endif
 
           time(&state_start_time);
           started = true;
@@ -1720,7 +1739,9 @@ void loopOperationalMode() {
           if (!findOldestQueueFile(still)) {
             Serial.println("[UPLINK] Queue empty → sleeping early.");
             started = false;
+#if SHIP_BLE_ENABLED
             bleScanned = false; // Reset for next cycle
+#endif
             decideAndGoToSleep();
             return;
           }
@@ -1737,7 +1758,9 @@ void loopOperationalMode() {
 
         Serial.printf("[UPLINK] Window finished after %d sec.\n", elapsed);
         started = false;
+#if SHIP_BLE_ENABLED
         bleScanned = false; // Reset for next cycle
+#endif
         decideAndGoToSleep();
         break;
       }
