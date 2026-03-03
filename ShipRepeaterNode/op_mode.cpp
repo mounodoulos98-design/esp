@@ -1192,8 +1192,8 @@ void goToDeepSleep(unsigned int seconds) {
   }
   
   Serial.printf("[SLEEP] Entering deep sleep for %u seconds.\n", seconds);
+  Serial.flush();  // Ensure all serial output is transmitted before UART shuts down
   esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
-  delay(200);
   esp_deep_sleep_start();
 }
 
