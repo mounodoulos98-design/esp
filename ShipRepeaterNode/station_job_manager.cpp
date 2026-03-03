@@ -342,20 +342,18 @@ void resetJobCache() {
 // ---------------------
 extern "C" {
 #include "esp_wifi.h"
-#include "esp_netif.h"
 }
 
 static void updateStationIPs() {
     wifi_sta_list_t wifi_sta_list;
-    esp_netif_sta_list_t netif_sta_list;
+    wifi_sta_mac_ip_list_t ip_list;
     memset(&wifi_sta_list, 0, sizeof(wifi_sta_list));
-    memset(&netif_sta_list, 0, sizeof(netif_sta_list));
+    memset(&ip_list, 0, sizeof(ip_list));
 
     if (esp_wifi_ap_get_sta_list(&wifi_sta_list) != ESP_OK) {
         return;
     }
-    esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (!ap_netif || esp_netif_get_sta_list(&wifi_sta_list, &netif_sta_list) != ESP_OK) {
+    if (esp_wifi_ap_get_sta_list_with_ip(&wifi_sta_list, &ip_list) != ESP_OK) {
         return;
     }
 
@@ -363,14 +361,13 @@ static void updateStationIPs() {
         // Αν έχουμε ήδη κανονική IP (όχι 0.0.0.0), δεν χρειάζεται update
         if (st.ip.length() > 0 && st.ip != "0.0.0.0") continue;
 
-        for (int j = 0; j < netif_sta_list.num; ++j) {
-            const wifi_sta_info_t& wi = wifi_sta_list.sta[j];
-            const esp_netif_sta_info_t& ai = netif_sta_list.sta[j];
+        for (int j = 0; j < ip_list.num; ++j) {
+            const wifi_sta_ip_mac_t& ai = ip_list.sta[j];
 
             char macStr[20];
             sprintf(macStr, "%02x:%02x:%02x:%02x:%02x:%02x",
-                    wi.mac[0], wi.mac[1], wi.mac[2],
-                    wi.mac[3], wi.mac[4], wi.mac[5]);
+                    ai.mac[0], ai.mac[1], ai.mac[2],
+                    ai.mac[3], ai.mac[4], ai.mac[5]);
 
             if (!st.mac.equalsIgnoreCase(String(macStr))) continue;
 

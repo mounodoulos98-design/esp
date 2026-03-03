@@ -269,7 +269,8 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 
 void startConfigurationMode() {
   setStatusLed(STATUS_CONFIG_MODE);
-  esp_task_wdt_init(30, true);
+  esp_task_wdt_config_t wdt_cfg = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
+  esp_task_wdt_init(&wdt_cfg);
   esp_task_wdt_add(NULL);
 
   mesh.setDebugMsgTypes(ERROR | STARTUP);

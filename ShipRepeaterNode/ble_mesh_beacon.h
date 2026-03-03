@@ -35,16 +35,8 @@ public:
             return;
         }
 
-        // NOTE: esp_bt_sleep_enable() (BT modem sleep) is intentionally NOT
-        // called on the original ESP32 (incl. ESP32-PICO-D4) because combining
-        // BT modem sleep with CPU light sleep stops BLE advertising during the
-        // CPU sleep window.
-        // On ESP32-C6 the BT/BLE subsystem handles modem sleep correctly
-        // alongside CPU light sleep, so we enable it to allow the repeater
-        // beacon to sleep properly between advertising events.
-#if defined(CONFIG_IDF_TARGET_ESP32C6)
-        esp_bt_sleep_enable();
-#endif
+        // BLE modem sleep on ESP32-C6 with IDF 5.x is handled automatically
+        // by the BLE stack; no explicit esp_bt_sleep_enable() call needed.
         
         // Create BLE Server (needed for advertising)
         pServer = BLEDevice::createServer();
@@ -74,9 +66,9 @@ public:
         // Format: [role_byte, apSSID_bytes...]
         // We advertise AP SSID because that's what's needed for WiFi connection
         BLEAdvertisementData advData;
-        std::string mfgData;
-        mfgData.push_back(nodeRole); // 0=Repeater, 1=Root
-        mfgData.append(apSSID.c_str());  // Use AP SSID instead of node name
+        String mfgData;
+        mfgData += (char)nodeRole; // 0=Repeater, 1=Root
+        mfgData += apSSID;  // Use AP SSID instead of node name
         advData.setManufacturerData(mfgData);
         advData.setCompleteServices(BLEUUID(BLE_MESH_SERVICE_UUID));
         pAdvertising->setAdvertisementData(advData);
@@ -177,8 +169,8 @@ public:
 
         Serial.printf("[BLE-SCAN] Starting scan for %d seconds...\n", scanDurationSeconds);
         
-        BLEScanResults foundDevices = pBLEScan->start(scanDurationSeconds, false);
-        int count = foundDevices.getCount();
+        BLEScanResults* foundDevices = pBLEScan->start(scanDurationSeconds, false);
+        int count = foundDevices->getCount();
         
         Serial.printf("[BLE-SCAN] Found %d devices\n", count);
         
@@ -187,7 +179,7 @@ public:
         int bestIndex = -1;
         
         for (int i = 0; i < count; i++) {
-            BLEAdvertisedDevice device = foundDevices.getDevice(i);
+            BLEAdvertisedDevice device = foundDevices->getDevice(i);
             
             // Check if device has our mesh service UUID
             if (device.haveServiceUUID() && device.isAdvertisingService(BLEUUID(BLE_MESH_SERVICE_UUID))) {
@@ -196,7 +188,7 @@ public:
                 // Extract AP SSID from manufacturer data if available
                 String apSSID = String(device.getName().c_str());  // Default to BLE name
                 if (device.haveManufacturerData()) {
-                    std::string mfgData = device.getManufacturerData();
+                    String mfgData = device.getManufacturerData();
                     if (mfgData.length() > 1) {
                         // Extract AP SSID from manufacturer data (skip first byte which is role)
                         apSSID = "";
@@ -217,7 +209,7 @@ public:
         }
         
         if (bestIndex >= 0) {
-            BLEAdvertisedDevice bestDevice = foundDevices.getDevice(bestIndex);
+            BLEAdvertisedDevice bestDevice = foundDevices->getDevice(bestIndex);
             result.found = true;
             result.nodeName = String(bestDevice.getName().c_str());
             result.rssi = bestRSSI;
@@ -225,7 +217,7 @@ public:
             
             // Extract role and AP SSID from manufacturer data
             if (bestDevice.haveManufacturerData()) {
-                std::string mfgData = bestDevice.getManufacturerData();
+                String mfgData = bestDevice.getManufacturerData();
                 if (mfgData.length() > 0) {
                     result.nodeRole = mfgData[0];  // First byte is role
                     
