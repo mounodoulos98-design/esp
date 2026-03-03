@@ -1,0 +1,17 @@
+# Waveshare ESP32-C6 16 MB Flash – dual-OTA, 3 MB per app slot
+# Required because the default 4 MB scheme only allocates 1.25 MB for the
+# app, which is too small once BLE + WiFi + painlessMesh are all included.
+#
+# Layout (total = 16 MB = 0x1000000):
+#   nvs       20 KB   – non-volatile storage (WiFi credentials, Preferences)
+#   otadata    8 KB   – OTA state (which slot to boot)
+#   app0    3072 KB   – running firmware  (fits the ~1.62 MB sketch + room)
+#   app1    3072 KB   – OTA update target (same size as app0, required by IDF)
+#   spiffs  9920 KB   – remaining flash for data / web assets
+#
+# Name,    Type, SubType, Offset,   Size,    Flags
+nvs,       data, nvs,     0x9000,   0x5000,
+otadata,   data, ota,     0xe000,   0x2000,
+app0,      app,  ota_0,   0x10000,  0x300000,
+app1,      app,  ota_1,   0x310000, 0x300000,
+spiffs,    data, spiffs,  0x610000, 0x9F0000,
