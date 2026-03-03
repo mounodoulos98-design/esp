@@ -342,18 +342,32 @@ void resetJobCache() {
 // ---------------------
 extern "C" {
 #include "esp_wifi.h"
+#include "esp_netif.h"
 }
 
 static void updateStationIPs() {
     wifi_sta_list_t wifi_sta_list;
-    wifi_sta_mac_ip_list_t ip_list;
     memset(&wifi_sta_list, 0, sizeof(wifi_sta_list));
-    memset(&ip_list, 0, sizeof(ip_list));
 
-    if (esp_wifi_ap_get_sta_list(&wifi_sta_list) != ESP_OK) {
+    if (esp_wifi_ap_get_sta_list(&wifi_sta_list) != ESP_OK || wifi_sta_list.num == 0) {
         return;
     }
-    if (esp_wifi_ap_get_sta_list_with_ip(&wifi_sta_list, &ip_list) != ESP_OK) {
+
+    esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!ap_netif) {
+        return;
+    }
+
+    // esp_netif_dhcps_get_clients_by_mac: caller fills MAC, function fills IP.
+    // Available in IDF 5.0+ (official replacement for removed esp_netif_get_sta_list).
+    esp_netif_pair_mac_ip_t pairs[ESP_WIFI_MAX_CONN_NUM];
+    memset(pairs, 0, sizeof(pairs));
+    int num = (wifi_sta_list.num < ESP_WIFI_MAX_CONN_NUM) ? wifi_sta_list.num : ESP_WIFI_MAX_CONN_NUM;
+    for (int i = 0; i < num; i++) {
+        memcpy(pairs[i].mac, wifi_sta_list.sta[i].mac, sizeof(wifi_sta_list.sta[i].mac));
+    }
+
+    if (esp_netif_dhcps_get_clients_by_mac(ap_netif, num, pairs) != ESP_OK) {
         return;
     }
 
@@ -361,17 +375,15 @@ static void updateStationIPs() {
         // Αν έχουμε ήδη κανονική IP (όχι 0.0.0.0), δεν χρειάζεται update
         if (st.ip.length() > 0 && st.ip != "0.0.0.0") continue;
 
-        for (int j = 0; j < ip_list.num; ++j) {
-            const wifi_sta_ip_mac_t& ai = ip_list.sta[j];
-
+        for (int j = 0; j < num; ++j) {
             char macStr[20];
             sprintf(macStr, "%02x:%02x:%02x:%02x:%02x:%02x",
-                    ai.mac[0], ai.mac[1], ai.mac[2],
-                    ai.mac[3], ai.mac[4], ai.mac[5]);
+                    pairs[j].mac[0], pairs[j].mac[1], pairs[j].mac[2],
+                    pairs[j].mac[3], pairs[j].mac[4], pairs[j].mac[5]);
 
             if (!st.mac.equalsIgnoreCase(String(macStr))) continue;
 
-            uint32_t ipraw = ai.ip.addr;
+            uint32_t ipraw = pairs[j].ip.addr;
             if (ipraw == 0) {
                 // DHCP δεν έχει δώσει IP ακόμα, μην γράψεις 0.0.0.0
                 continue;
@@ -383,9 +395,7 @@ static void updateStationIPs() {
                 (ipraw >> 16) & 0xFF,
                 (ipraw >> 24) & 0xFF
             );
-            String ipStr = ipAddr.toString();
-
-            st.ip = ipStr;
+            st.ip = ipAddr.toString();
             Serial.printf("[SJM] MAC %s -> IP %s\n",
                           st.mac.c_str(), st.ip.c_str());
         }
