@@ -1,15 +1,6 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-// BLE mesh beacon / scanner support.
-// Set to 1 to include BLE discovery (adds ~200–400 KB to the binary).
-// Leave at 0 (default) so the sketch fits in the standard 1.25 MB
-// app partition without any Arduino IDE settings changes.
-// When enabled, also set Tools → Partition Scheme → Custom (or Huge APP 3MB).
-#ifndef SHIP_BLE_ENABLED
-#define SHIP_BLE_ENABLED 0
-#endif
-
 // **ΑΦΑΙΡΕΣΑΜΕ ΤΟ ΛΑΘΟΣ #include "config.h" ΑΠΟ ΕΔΩ**
 
 #include <Arduino.h>
@@ -103,7 +94,7 @@ struct NodeConfig {
   bool isConfigured = false;
   
   // BLE Mesh Wake-up Configuration
-  bool bleBeaconEnabled = false; // BLE beacon (only active when SHIP_BLE_ENABLED=1)
+  bool bleBeaconEnabled = true;  // Enable BLE beacon for parent discovery (Repeater/Root)
   int bleScanDurationSec = 5;    // Duration to scan for parent nodes (Collector/Repeater)
 };
 

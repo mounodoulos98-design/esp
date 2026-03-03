@@ -64,7 +64,7 @@ void loadConfiguration() {
       }
       
       // Load BLE mesh wake-up configuration
-      config.bleBeaconEnabled = preferences.getBool("bleBeacon", false);
+      config.bleBeaconEnabled = preferences.getBool("bleBeacon", true);
       config.bleScanDurationSec = preferences.getInt("bleScanSec", 5);
       
       Serial.println("[STORAGE] Configuration loaded from flash.");
