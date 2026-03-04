@@ -269,17 +269,26 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 
 void startConfigurationMode() {
   setStatusLed(STATUS_CONFIG_MODE);
+  // Arduino framework already initialises the TWDT before setup() runs.
+  // esp_task_wdt_init() would return ESP_ERR_INVALID_STATE (leaving the short
+  // default timeout unchanged), so reconfigure the running TWDT directly.
   esp_task_wdt_config_t wdt_cfg = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
-  esp_task_wdt_init(&wdt_cfg);
+  if (esp_task_wdt_reconfigure(&wdt_cfg) == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_init(&wdt_cfg);
+  }
   esp_task_wdt_add(NULL);
 
-  mesh.setDebugMsgTypes(ERROR | STARTUP);
-  mesh.init(MESH_SSID, MESH_PASSWORD, &userScheduler, MESH_PORT);
-  while (mesh.getNodeId() == 0) { mesh.update(); delay(10); }
-  uint32_t nodeId = mesh.getNodeId();
-  mesh.stop();
-
-  WiFi.mode(WIFI_AP_STA); // ✅ AP + STA για Wi-Fi scan
+  // Derive a unique 32-bit node ID from the WiFi station MAC address.
+  // This avoids starting the full painlessMesh stack (which hangs in a
+  // blocking loop on ESP32-C6) just to read what is essentially the chip ID.
+  // We use mac[2..5] (the lower 4 bytes after the 2-byte OUI) to produce a
+  // 32-bit value — this is the same 4-byte window painlessMesh uses internally
+  // for its own nodeId, so the AP SSID will match what the mesh stack uses.
+  WiFi.mode(WIFI_AP_STA); // AP + STA for Wi-Fi scan
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  uint32_t nodeId = ((uint32_t)mac[2] << 24) | ((uint32_t)mac[3] << 16)
+                  | ((uint32_t)mac[4] << 8)  |  (uint32_t)mac[5];
   String ap_ssid = CONFIG_AP_SSID_PREFIX + String(nodeId);
   WiFi.softAP(ap_ssid.c_str(), CONFIG_AP_PASSWORD);
   dnsServer.start(53, "*", WiFi.softAPIP());
