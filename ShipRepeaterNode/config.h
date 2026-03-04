@@ -21,7 +21,9 @@
 #include <ArduinoJson.h> // **ΤΟ ΒΑΖΟΥΜΕ ΕΔΩ ΓΙΑ ΝΑ ΕΙΝΑΙ ΔΙΑΘΕΣΙΜΟ ΠΑΝΤΟΥ**
 
 // Hardware
-#define BOOT_BUTTON_PIN         38
+// GPIO9 is the physical BOOT button on the Waveshare ESP32-C6 board.
+// (ESP32-C6 GPIOs are 0-30; GPIO38 does not exist on this chip.)
+#define BOOT_BUTTON_PIN          9
 #define NEOPIXEL_PIN             0
 #define NEOPIXEL_POWER_PIN       2
 #define NEOPIXEL_BRIGHTNESS     20

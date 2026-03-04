@@ -19,6 +19,13 @@ unsigned long bootButtonPressTime = 0;
 
 
 void setup() {
+  // Sample BOOT button as the very first thing – before any blocking code.
+  // GPIO9 is the physical BOOT button on the Waveshare ESP32-C6.
+  // Holding it LOW during reset / deep-sleep wake forces Configuration Mode.
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+  delay(20);  // Debounce
+  bool forceConfigMode = (digitalRead(BOOT_BUTTON_PIN) == LOW);
+
   Serial.begin(115200);
   // Wait up to 3 s for the serial port to be ready before printing anything.
   // On boards that use a CH340 USB-to-UART chip, Serial (UART0) is always
@@ -37,11 +44,7 @@ void setup() {
   Serial.println("[SERIAL] Baud rate: 115200 -- make sure your monitor is set to 115200!");
 
   setupStatusLed();
-  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
   sdCardMutex = xSemaphoreCreateMutex();
-
-  delay(50);  // Debounce for boot button
-  bool forceConfigMode = (digitalRead(BOOT_BUTTON_PIN) == LOW);
   WiFi.mode(WIFI_OFF);
   delay(200);
 
