@@ -27,18 +27,6 @@ void setup() {
   bool forceConfigMode = (digitalRead(BOOT_BUTTON_PIN) == LOW);
 
   Serial.begin(115200);
-  // Wait up to 3 s for the serial port to be ready before printing anything.
-  // On boards that use a CH340 USB-to-UART chip, Serial (UART0) is always
-  // ready immediately after begin() and this loop exits instantly.
-  // On boards that expose the ESP32-C6's native USB-CDC as Serial, the USB
-  // device disconnects and re-enumerates after every deep-sleep wake; the
-  // host OS needs up to ~2-3 s to reopen the virtual COM port.  Without this
-  // wait all boot messages are lost and only USB reconnection noise is visible.
-  // The 3000 ms cap ensures normal operation when no terminal is connected.
-  {
-    unsigned long t0 = millis();
-    while (!Serial && millis() - t0 < 3000) delay(10);
-  }
   Serial.println("\n\n===================================");
   Serial.println("ShipRepeaterNode Booting...");
   Serial.println("[SERIAL] Baud rate: 115200 -- make sure your monitor is set to 115200!");

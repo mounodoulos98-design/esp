@@ -1192,8 +1192,6 @@ void goToDeepSleep(unsigned int seconds) {
   }
   
   Serial.printf("[SLEEP] Entering deep sleep for %u seconds.\n", seconds);
-  Serial.flush();  // Drain UART TX FIFO into CH340's internal buffer
-  delay(200);      // Allow CH340 to complete its USB transfer before power-down
   esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
   esp_deep_sleep_start();
 }
