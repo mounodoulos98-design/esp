@@ -1419,15 +1419,14 @@ void loopOperationalMode() {
     }
 
     // ── Periodic power-consumption estimate ──────────────────────────────────
-    // ESP32-C6 at 80 MHz + WiFi AP + BLE ≈ 100 mA average.
-    // Printed every 60 s so the user can track cumulative consumption for
-    // battery sizing without needing external instrumentation.
+    // ESP32-C6 in light sleep + WiFi AP + BLE beacon (1000 ms interval) ≈ 4-5 mA
+    // average.  Printed every 60 s for battery sizing.
     static unsigned long rptLastPowerLog = 0;
     if (millis() - rptLastPowerLog >= 60000UL) {
       float elapsedHrs = millis() / 3600000.0f;
-      float estimatedMah = elapsedHrs * 100.0f; // ~100 mA average
+      float estimatedMah = elapsedHrs * 4.5f; // ~4-5 mA average in light sleep
       Serial.printf("[PM] Repeater uptime=%lu s | AP stations=%d | "
-                    "Est. draw ~100 mA | Est. consumed=%.2f mAh\n",
+                    "Est. draw ~4-5 mA (light sleep) | Est. consumed=%.2f mAh\n",
                     millis() / 1000UL,
                     (int)WiFi.softAPgetStationNum(),
                     estimatedMah);
@@ -1456,11 +1455,29 @@ void loopOperationalMode() {
       }
     }
 
-    // Yield to the RTOS for 100 ms.  This keeps BLE advertising and the WiFi
-    // AP fully active (no light sleep which stops BLE on ESP32-PICO-D4) while
-    // still giving the FreeRTOS idle task time to feed the WDT and process
-    // background WiFi/BT events.
-    delay(100);
+    // Configure light sleep wakeup sources once (timer re-armed each iteration).
+    static bool wakeupConfigured = false;
+    if (!wakeupConfigured) {
+      // Wake when a Collector connects to our WiFi AP.
+      esp_sleep_enable_wifi_wakeup();
+      // Wake when a Collector BLE-scans for us.
+      esp_sleep_enable_bt_wakeup();
+      wakeupConfigured = true;
+      Serial.println("[REPEATER] Light sleep armed: wakeup = BLE + WiFi + 5s timer");
+    }
+
+    // 5-second timer: keeps WDT fed and allows the relay/pending-upload
+    // check to run even when no Collector is active.
+    esp_sleep_enable_timer_wakeup(5000000ULL);
+
+    // Reset WDT immediately before entering sleep so the WDT window is exactly
+    // the sleep duration (≤5 s).  A second reset after wakeup feeds the WDT
+    // before the next loop body executes.
+    esp_task_wdt_reset();
+    // Enter light sleep — CPU halts; BLE beacon and WiFi AP modem stay active.
+    // Wakes automatically on BLE/WiFi activity or after 5 s.
+    esp_light_sleep_start();
+    esp_task_wdt_reset();
     return;
   }
 

@@ -11,11 +11,11 @@
 #include "esp_bt.h"
 
 // Advertising interval for the Repeater beacon.
-// Units: 0.625 ms  →  160 × 0.625 ms = 100 ms.
-// A shorter interval makes the repeater reliably discoverable by both the
-// Collector (5 s scan) and standard phone Bluetooth scanners.
-// The BT radio duty cycle at 100 ms is low enough for always-on repeater use.
-#define BLE_ADV_INTERVAL_UNITS 160    // 100 ms
+// Units: 0.625 ms  →  1600 × 0.625 ms = 1000 ms.
+// At 1000 ms the BT radio duty cycle is very low (~0.3 mA average) while the
+// Repeater is light-sleeping.  The Collector's 5-second scan window still
+// reliably catches at least 4-5 beacons, so discovery is unaffected.
+#define BLE_ADV_INTERVAL_UNITS 1600   // 1000 ms — modem sleeps between beacons
 
 // BLE Service UUID for mesh node identification
 #define BLE_MESH_SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
