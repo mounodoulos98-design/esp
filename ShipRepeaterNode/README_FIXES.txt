@@ -30,3 +30,16 @@ Files modified:
 How to use:
 - Open in Arduino IDE as before. No changes in filenames.
 - For initial tests, consider using a slightly wider meshWindowSec and collectorApWindowSec.
+
+Serial / USB settings
+---------------------
+BAUD RATE: 115200  <-- set this in your serial monitor (Arduino IDE, PuTTY, etc.)
+                       Using 9600 or any other rate will show only garbage.
+
+The Waveshare ESP32-C6 dev kit has two USB-C ports:
+  - The port labelled "UART" uses a CH340 USB-to-UART chip → always use 115200 baud.
+  - The port labelled "USB" exposes the ESP32-C6's native USB-CDC.
+    The native USB port does not enforce a baud rate over USB, but many serial
+    monitors still need to be configured to 115200.
+Always select 115200 baud in your terminal before opening the port.
+
