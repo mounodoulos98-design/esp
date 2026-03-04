@@ -20,6 +20,16 @@ unsigned long bootButtonPressTime = 0;
 
 void setup() {
   Serial.begin(115200);
+  // The ESP32-C6 uses native USB-CDC as its serial port.  After a deep-sleep
+  // wake the USB device disconnects and re-enumerates.  The host OS needs up
+  // to ~1.5 s to reopen the virtual COM port.  Without this wait all boot
+  // messages are lost and only USB reconnection noise is visible in the
+  // terminal.  The loop exits immediately once the port is open; the 1500 ms
+  // cap ensures normal operation when no terminal is connected.
+  {
+    unsigned long t0 = millis();
+    while (!Serial && millis() - t0 < 1500) delay(10);
+  }
   Serial.println("\n\n===================================");
   Serial.println("ShipRepeaterNode Booting...");
 
