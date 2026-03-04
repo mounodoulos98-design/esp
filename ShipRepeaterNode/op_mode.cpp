@@ -668,8 +668,14 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
   return false;
 }
 
+// Set to true by the /ingest body handler when a file has been fully written to
+// the SD queue.  The main Repeater loop drains it by uploading to Root.
+static volatile bool rptPendingUpload = false;
+
 void ensureRepeaterHttpServer() {
   if (repeaterHttpActive) return;
+
+  // /time – serve current epoch so Collectors can sync their clock
   rptServer.on("/time", HTTP_GET, [](AsyncWebServerRequest* req) {
     time_t now;
     time(&now);
@@ -677,9 +683,64 @@ void ensureRepeaterHttpServer() {
     String json = String("{\"epoch\":") + String((unsigned long)now) + "}";
     req->send(200, "application/json", json);
   });
+
+  // /ingest – receive a queue file from a Collector and store it locally.
+  // The main loop will forward it to Root during the next uplink opportunity.
+  rptServer.on(
+    "/ingest",
+    HTTP_POST,
+    [](AsyncWebServerRequest* req) {
+      // Called after all body chunks have been received.
+      String senderIP = req->client()->remoteIP().toString();
+      Serial.printf("[REPEATER] /ingest complete from %s\n", senderIP.c_str());
+      req->send(200, "text/plain", "OK");
+      // Signal main loop to relay this file to Root.
+      rptPendingUpload = true;
+    },
+    nullptr,
+    [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index, size_t total) {
+      esp_task_wdt_reset();
+      // SoftAP mode allows only one connected client at a time in this protocol,
+      // so these statics are never accessed concurrently.
+      static FsFile rptIngestFile;
+      static size_t rptIngestBytes = 0;
+
+      if (index == 0) {
+        rptIngestBytes = 0;
+        String senderIP = req->client()->remoteIP().toString();
+        Serial.printf("[REPEATER] /ingest started from %s (total=%u bytes)\n",
+                      senderIP.c_str(), (unsigned)total);
+        // Generate a unique queue filename without calling preferences from callback.
+        char path[64];
+        snprintf(path, sizeof(path), "/queue/relay_%08lu.bin", (unsigned long)millis());
+        if (initSdCard()) {
+          ensureDir(QUEUE_DIR);
+          rptIngestFile = sd.open(path, O_WRONLY | O_CREAT | O_TRUNC);
+          if (rptIngestFile) {
+            Serial.printf("[REPEATER] Streaming to %s\n", path);
+          } else {
+            Serial.printf("[REPEATER] ERROR: cannot open %s\n", path);
+          }
+        }
+      }
+
+      if (rptIngestFile) {
+        rptIngestFile.write(data, len);
+        rptIngestBytes += len;
+      }
+
+      if (total > 0 && index + len >= total) {
+        if (rptIngestFile) {
+          rptIngestFile.close();
+          Serial.printf("[REPEATER] Relay file saved (%u bytes).\n", (unsigned)rptIngestBytes);
+        }
+      }
+    }
+  );
+
   rptServer.begin();
   repeaterHttpActive = true;
-  Serial.println("[REPEATER] HTTP /time ready on :8080");
+  Serial.println("[REPEATER] HTTP /time + /ingest ready on :8080");
 }
 
 // =============================
@@ -1315,6 +1376,25 @@ void loopOperationalMode() {
       bleBeacon.startAdvertising();
       Serial.println("[BLE-MESH] Repeater BLE beacon active");
     }
+
+    // Register WiFi SoftAP station events once so we can log when Collectors
+    // connect and disconnect.
+    static bool rptEventsRegistered = false;
+    if (!rptEventsRegistered) {
+      WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+        if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
+          char mac[20];
+          snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                   info.wifi_ap_staconnected.mac[0], info.wifi_ap_staconnected.mac[1],
+                   info.wifi_ap_staconnected.mac[2], info.wifi_ap_staconnected.mac[3],
+                   info.wifi_ap_staconnected.mac[4], info.wifi_ap_staconnected.mac[5]);
+          Serial.printf("[REPEATER] Station connected: %s (Collector uplink started)\n", mac);
+        } else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
+          Serial.println("[REPEATER] Station disconnected.");
+        }
+      });
+      rptEventsRegistered = true;
+    }
     
     static bool tried = false;
     if (!tried) {
@@ -1336,6 +1416,44 @@ void loopOperationalMode() {
       setCpuFrequencyMhz(80);
       cpuScaled = true;
       Serial.println("[PM] CPU frequency set to 80 MHz (Repeater idle mode)");
+    }
+
+    // ── Periodic power-consumption estimate ──────────────────────────────────
+    // ESP32-C6 at 80 MHz + WiFi AP + BLE ≈ 100 mA average.
+    // Printed every 60 s so the user can track cumulative consumption for
+    // battery sizing without needing external instrumentation.
+    static unsigned long rptLastPowerLog = 0;
+    if (millis() - rptLastPowerLog >= 60000UL) {
+      float elapsedHrs = millis() / 3600000.0f;
+      float estimatedMah = elapsedHrs * 100.0f; // ~100 mA average
+      Serial.printf("[PM] Repeater uptime=%lu s | AP stations=%d | "
+                    "Est. draw ~100 mA | Est. consumed=%.2f mAh\n",
+                    millis() / 1000UL,
+                    (int)WiFi.softAPgetStationNum(),
+                    estimatedMah);
+      rptLastPowerLog = millis();
+    }
+
+    // ── Relay pending uploads from /ingest to Root ───────────────────────────
+    // After the Collector uploads a file to this Repeater's /ingest endpoint,
+    // rptPendingUpload is set.  We try to forward the oldest queue file to Root
+    // via a STA connection.  AP stays up throughout (WIFI_AP_STA).
+    if (rptPendingUpload) {
+      rptPendingUpload = false;
+      String oldest;
+      if (findOldestQueueFile(oldest)) {
+        String base = oldest.substring(String(QUEUE_DIR).length() + 1);
+        Serial.printf("[REPEATER] Relaying %s to Root...\n", base.c_str());
+        bool ok = uploadFileToRoot(oldest, base);
+        if (ok && initSdCard()) {
+          sd.remove(oldest.c_str());
+          Serial.printf("[REPEATER] Relay OK, removed: %s\n", base.c_str());
+        } else {
+          Serial.println("[REPEATER] Relay to Root failed; file kept for next attempt.");
+        }
+        // Disconnect STA so it does not interfere with the AP or BLE.
+        WiFi.disconnect(false, false);
+      }
     }
 
     // Yield to the RTOS for 100 ms.  This keeps BLE advertising and the WiFi
@@ -1552,11 +1670,13 @@ void loopOperationalMode() {
           );
 
           // Legacy POST /api/measure - sensor sends measurement data
+          // Body chunks are streamed directly to an SD queue file so the data
+          // survives and gets uploaded to Root during the next UPLINK window.
           sensorServer.on(
             "/api/measure",
             HTTP_POST,
             [](AsyncWebServerRequest *request) {
-              // This is called AFTER all body chunks are received
+              // Called AFTER all body chunks have been received.
               IPAddress remoteIp = request->client()->remoteIP();
               String ipStr = remoteIp.toString();
               Serial.printf("[HB-LEGACY] POST /api/measure completed from IP=%s\n", ipStr.c_str());
@@ -1568,19 +1688,47 @@ void loopOperationalMode() {
             },
             nullptr,
             [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-              // This is called for each chunk of data received
-              // Update activity timestamp on EVERY chunk to prevent timeout during long uploads
+              // Called for each incoming body chunk.
+              // Reset WDT and activity timer on every chunk so long uploads don't
+              // trigger a watchdog reset or an AP-window timeout.
               lastActivityMillis = millis();
-              
+              esp_task_wdt_reset();
+
+              // SoftAP mode allows only one connected sensor at a time in this
+              // protocol, so these statics are never accessed concurrently.
+              static FsFile measureQueueFile;
+              static size_t measureQueueBytes = 0;
+
               if (index == 0) {
-                // First chunk - log start with sensor info
+                // First chunk: open a new queue file for this upload.
+                measureQueueBytes = 0;
                 IPAddress remoteIp = request->client()->remoteIP();
-                Serial.printf("[HB-LEGACY] POST /api/measure started from IP=%s (total=%d bytes)\n", 
-                             remoteIp.toString().c_str(), total);
+                Serial.printf("[HB-LEGACY] POST /api/measure started from IP=%s (total=%u bytes)\n",
+                              remoteIp.toString().c_str(), (unsigned)total);
+                // Generate a unique queue filename (counter persisted in NVS).
+                String qPath = nextQueueFilename();
+                measureQueueFile = sd.open(qPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+                if (measureQueueFile) {
+                  Serial.printf("[HB-LEGACY] Streaming measurement to queue: %s\n", qPath.c_str());
+                } else {
+                  Serial.printf("[HB-LEGACY] ERROR: cannot open queue file %s\n", qPath.c_str());
+                }
               }
-              
-              // Just receive the data - don't send response here
-              // The response is sent in the main handler above after all chunks are received
+
+              // Write this chunk to the open queue file.
+              if (measureQueueFile) {
+                measureQueueFile.write(data, len);
+                measureQueueBytes += len;
+              }
+
+              // Last chunk: close the file and report.
+              if (total > 0 && index + len >= total) {
+                if (measureQueueFile) {
+                  measureQueueFile.close();
+                  Serial.printf("[HB-LEGACY] Measurement saved to queue (%u bytes).\n",
+                                (unsigned)measureQueueBytes);
+                }
+              }
             }
           );
 
@@ -1720,6 +1868,19 @@ void loopOperationalMode() {
 
         if (config.role == ROLE_COLLECTOR) {
           processQueue();
+
+          // ── Periodic power-consumption estimate ────────────────────────────
+          // ESP32-C6 during UPLINK (WiFi STA + SD) ≈ 120 mA.
+          // Printed every 30 s so the user can track consumption for battery sizing.
+          static unsigned long lastUplinkPowerLog = 0;
+          if (millis() - lastUplinkPowerLog >= 30000UL) {
+            float elapsedHrs = millis() / 3600000.0f;
+            float estimatedMah = elapsedHrs * 120.0f; // ~120 mA active average
+            Serial.printf("[PM] Collector uptime=%lu s | UPLINK state | "
+                          "Est. draw ~120 mA | Est. consumed this session=%.2f mAh\n",
+                          millis() / 1000UL, estimatedMah);
+            lastUplinkPowerLog = millis();
+          }
 
           String still;
           if (!findOldestQueueFile(still)) {
