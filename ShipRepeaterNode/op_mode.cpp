@@ -619,6 +619,8 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
   if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
   if (WiFi.status() != WL_CONNECTED) {
     Serial.printf("[TIME] STA to %s...\n", config.uplinkSSID.c_str());
+    WiFi.disconnect(false);
+    delay(50);
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeout_ms) { esp_task_wdt_reset(); delay(200); }
@@ -694,6 +696,22 @@ void ensureRepeaterHttpServer() {
       // Called after all body chunks have been received.
       String senderIP = req->client()->remoteIP().toString();
       Serial.printf("[REPEATER] /ingest complete from %s\n", senderIP.c_str());
+      // If the Collector included its current epoch, sync our clock from it.
+      // This lets a Repeater with no upstream get valid time from a connected Collector.
+      if (req->hasHeader("X-Epoch")) {
+        unsigned long senderEpoch = strtoul(req->header("X-Epoch").c_str(), nullptr, 10);
+        if (senderEpoch > 1700000000UL) {
+          time_t curEpoch;
+          time(&curEpoch);
+          if (curEpoch < 1700000000UL) {
+            struct timeval tv = { .tv_sec = (time_t)senderEpoch, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            persistRtcTime((time_t)senderEpoch);
+            needToSyncTime = false;
+            Serial.printf("[REPEATER] Clock synced from Collector: epoch=%lu\n", senderEpoch);
+          }
+        }
+      }
       req->send(200, "text/plain", "OK");
       // Signal main loop to relay this file to Root.
       rptPendingUpload = true;
@@ -797,6 +815,8 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
   if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
   if (WiFi.status() != WL_CONNECTED) {
     Serial.printf("[UPLINK] Connecting STA to %s...\n", config.uplinkSSID.c_str());
+    WiFi.disconnect(false);
+    delay(50);
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { esp_task_wdt_reset(); delay(200); }
@@ -826,6 +846,12 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
   String boundary = "----esp32bound" + String(millis());
   String head = "POST /ingest HTTP/1.1\r\nHost: " + targetHost + "\r\n";
   head += "Connection: close\r\nContent-Type: multipart/form-data; boundary=" + boundary + "\r\n";
+  // Include our current epoch so the Repeater can sync its clock from us.
+  time_t nowEpoch;
+  time(&nowEpoch);
+  if (nowEpoch > 1700000000UL) {
+    head += "X-Epoch: " + String((unsigned long)nowEpoch) + "\r\n";
+  }
   String pre = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"" + basename + "\"\r\nContent-Type: application/octet-stream\r\n\r\n";
   String post = "\r\n--" + boundary + "--\r\n";
   uint32_t contentLength = pre.length() + fsize + post.length();
@@ -861,6 +887,8 @@ bool downloadFileFromRoot(const String& remotePath, const String& localPath) {
   if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
   if (WiFi.status() != WL_CONNECTED) {
     Serial.printf("[DOWNLOAD] Connecting STA to %s...\n", config.uplinkSSID.c_str());
+    WiFi.disconnect(false);
+    delay(50);
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { esp_task_wdt_reset(); delay(200); }
@@ -1432,6 +1460,19 @@ void loopOperationalMode() {
                     (int)WiFi.softAPgetStationNum(),
                     estimatedMah);
       rptLastPowerLog = millis();
+
+      // Persist the current epoch every 5 minutes so that a future cold boot can
+      // restore a reasonable time estimate (e.g., after a power cut that forces
+      // a cold-boot on a Repeater that never goes to deep sleep).
+      static unsigned long rptLastTimePersist = 0;
+      if (millis() - rptLastTimePersist >= 300000UL) {
+        time_t nowEp;
+        time(&nowEp);
+        if (nowEp > 1700000000UL) {
+          persistRtcTime(nowEp);
+          rptLastTimePersist = millis();
+        }
+      }
     }
 
     // ── Relay pending uploads from /ingest to Root ───────────────────────────
@@ -1523,6 +1564,9 @@ void loopOperationalMode() {
             Serial.println("[SD] (Re)Initializing SD card failed before AP start.");
           } else {
             Serial.println("[SD] Card initialized successfully.");
+            // Pre-create /queue dir so body callbacks can open files without calling
+            // Preferences (which is unsafe from the async_tcp task context).
+            ensureDir(QUEUE_DIR);
           }
           
           // NOTE: SD writer task removed - causes mutex crashes from AsyncWebServer callbacks
@@ -1734,17 +1778,20 @@ void loopOperationalMode() {
 
               if (index == 0) {
                 // First chunk: open a new queue file for this upload.
+                // Use millis()-based name to avoid calling Preferences (NVS) from the
+                // async_tcp task context, which is unsafe on ESP32-C6.
+                // The /queue directory is pre-created in AP setup so sd.open() succeeds.
                 measureQueueBytes = 0;
                 IPAddress remoteIp = request->client()->remoteIP();
                 Serial.printf("[HB-LEGACY] POST /api/measure started from IP=%s (total=%u bytes)\n",
                               remoteIp.toString().c_str(), (unsigned)total);
-                // Generate a unique queue filename (counter persisted in NVS).
-                String qPath = nextQueueFilename();
-                measureQueueFile = sd.open(qPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+                char qPath[64];
+                snprintf(qPath, sizeof(qPath), "%s/measure_%08lu.bin", QUEUE_DIR, (unsigned long)millis());
+                measureQueueFile = sd.open(qPath, O_WRONLY | O_CREAT | O_TRUNC);
                 if (measureQueueFile) {
-                  Serial.printf("[HB-LEGACY] Streaming measurement to queue: %s\n", qPath.c_str());
+                  Serial.printf("[HB-LEGACY] Streaming measurement to queue: %s\n", qPath);
                 } else {
-                  Serial.printf("[HB-LEGACY] ERROR: cannot open queue file %s\n", qPath.c_str());
+                  Serial.printf("[HB-LEGACY] ERROR: cannot open queue file %s\n", qPath);
                 }
               }
 
