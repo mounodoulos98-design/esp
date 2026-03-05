@@ -1476,6 +1476,12 @@ void loopOperationalMode() {
     // Using 25 s instead of 5 s lowers unnecessary CPU wake-ups by 5×.
     esp_sleep_enable_timer_wakeup(25000000ULL);
 
+    // Turn the LED off before sleeping: during light sleep GPIO outputs hold
+    // their last state, so a green LED would stay lit the whole time, wasting
+    // ~1–2 mA continuously.  Turn it off now and restore it after waking.
+    setStatusLed(STATUS_SLEEPING);
+    loopStatusLed();
+
     // Reset WDT immediately before entering sleep so the WDT window is exactly
     // the sleep duration (≤25 s, well under the 30 s WDT timeout).
     // A second reset after wakeup feeds the WDT before the next loop body runs.
@@ -1484,6 +1490,10 @@ void loopOperationalMode() {
     // Wakes automatically on BLE/WiFi activity, BOOT button press, or after 25 s.
     esp_light_sleep_start();
     esp_task_wdt_reset();
+
+    // Restore operational-idle LED colour immediately after wakeup so the LED
+    // reflects the correct state again before the next loop iteration runs.
+    setStatusLed(STATUS_OPERATIONAL_IDLE);
     return;
   }
 
