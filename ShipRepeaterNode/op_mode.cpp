@@ -10,6 +10,7 @@
 #include <sys/time.h>
 #include "sensor_heartbeat_manager.h"
 #include "ble_mesh_beacon.h"
+#include <driver/gpio.h>  // gpio_wakeup_enable / esp_sleep_enable_gpio_wakeup
 
 
 
@@ -1462,20 +1463,25 @@ void loopOperationalMode() {
       esp_sleep_enable_wifi_wakeup();
       // Wake when a Collector BLE-scans for us.
       esp_sleep_enable_bt_wakeup();
+      // Wake immediately when the BOOT button is pressed (GPIO9 = LOW) so the
+      // factory-reset / config-mode button-hold check in loop() is responsive.
+      gpio_wakeup_enable((gpio_num_t)BOOT_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+      esp_sleep_enable_gpio_wakeup();
       wakeupConfigured = true;
-      Serial.println("[REPEATER] Light sleep armed: wakeup = BLE + WiFi + 5s timer");
+      Serial.println("[REPEATER] Light sleep armed: wakeup = BLE + WiFi + BOOT button + 25s timer");
     }
 
-    // 5-second timer: keeps WDT fed and allows the relay/pending-upload
-    // check to run even when no Collector is active.
-    esp_sleep_enable_timer_wakeup(5000000ULL);
+    // 25-second timer: keeps WDT fed (WDT timeout = 30 s) and lets periodic
+    // tasks (relay check, power log) run even when no Collector is active.
+    // Using 25 s instead of 5 s lowers unnecessary CPU wake-ups by 5×.
+    esp_sleep_enable_timer_wakeup(25000000ULL);
 
     // Reset WDT immediately before entering sleep so the WDT window is exactly
-    // the sleep duration (≤5 s).  A second reset after wakeup feeds the WDT
-    // before the next loop body executes.
+    // the sleep duration (≤25 s, well under the 30 s WDT timeout).
+    // A second reset after wakeup feeds the WDT before the next loop body runs.
     esp_task_wdt_reset();
     // Enter light sleep — CPU halts; BLE beacon and WiFi AP modem stay active.
-    // Wakes automatically on BLE/WiFi activity or after 5 s.
+    // Wakes automatically on BLE/WiFi activity, BOOT button press, or after 25 s.
     esp_light_sleep_start();
     esp_task_wdt_reset();
     return;

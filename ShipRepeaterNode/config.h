@@ -24,8 +24,12 @@
 // GPIO9 is the physical BOOT button on the Waveshare ESP32-C6 board.
 // (ESP32-C6 GPIOs are 0-30; GPIO38 does not exist on this chip.)
 #define BOOT_BUTTON_PIN          9
-#define NEOPIXEL_PIN             0
-#define NEOPIXEL_POWER_PIN       2
+// Waveshare ESP32-C6-DEV: WS2812B RGB LED is on GPIO8.
+// GPIO0 is the Flash CS0 pin and must not be used as GPIO.
+#define NEOPIXEL_PIN             8
+// No separate power-enable pin on the Waveshare ESP32-C6-DEV board.
+// Set to -1 to disable the power-pin init in setupStatusLed().
+#define NEOPIXEL_POWER_PIN      -1
 #define NEOPIXEL_BRIGHTNESS     20
 
 // SD card SPI pins – Waveshare ESP32-C6 (16 MB Flash)

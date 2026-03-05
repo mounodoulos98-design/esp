@@ -5,9 +5,13 @@ static unsigned long lastBlink = 0;
 static bool ledState = false;
 
 void setupStatusLed() {
-  pinMode(NEOPIXEL_POWER_PIN, OUTPUT);
-  digitalWrite(NEOPIXEL_POWER_PIN, HIGH);
-  delay(10);
+  // Only configure a power-enable pin if one is defined (>= 0).
+  // On the Waveshare ESP32-C6-DEV the LED is always powered; no control pin.
+  if (NEOPIXEL_POWER_PIN >= 0) {
+    pinMode(NEOPIXEL_POWER_PIN, OUTPUT);
+    digitalWrite(NEOPIXEL_POWER_PIN, HIGH);
+    delay(10);
+  }
   pixel.begin();
   pixel.setBrightness(NEOPIXEL_BRIGHTNESS);
   pixel.clear();
