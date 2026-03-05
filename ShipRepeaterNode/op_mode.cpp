@@ -245,6 +245,15 @@ static void drainMeasureBuffer() {
   // Open the queue file the first time we are called after an upload starts.
   if (!measureFileOpen && s_measureActive) {
     if (initSdCard()) {
+      // Ensure the parent directory exists (needed for /jobs/, /firmware/, etc.)
+      {
+        String qPath = String(s_measureQueuePath);
+        int slash = qPath.lastIndexOf('/');
+        if (slash > 0) {
+          String dir = qPath.substring(0, slash);
+          if (!sd.exists(dir.c_str())) sd.mkdir(dir.c_str());
+        }
+      }
       measureFile = sd.open(s_measureQueuePath, O_WRONLY | O_CREAT | O_TRUNC);
       if (measureFile) {
         measureFileOpen     = true;
@@ -589,29 +598,51 @@ void ensureRootHttpServer() {
   });
 
   // Multipart/form-data upload to /ingest
+  // NOTE: Do NOT call SdFat/SPI from this callback – it runs in the async_tcp
+  // FreeRTOS task and causes xTaskPriorityDisinherit mutex crashes on ESP32-C6.
+  // Write chunks into the shared ring buffer; drainMeasureBuffer() (ROOT main
+  // loop) will write them to SD where SPI access is safe.
   rootServer.on(
     "/ingest", HTTP_POST,
     [](AsyncWebServerRequest* request) {},
     [](AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final) {
-      static FsFile upFile;
-      static String current;
       if (index == 0) {
+        s_measureRingHead      = 0;
+        s_measureRingTail      = 0;
+        s_measureSendDone      = false;
+        s_measureDrainComplete = false;
         char name[64];
         snprintf(name, sizeof(name), "%lu_", (unsigned long)millis());
-        current = String(RECEIVED_DIR) + "/" + name + filename;
-        upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
-        Serial.printf("[ROOT] Receiving file: %s\n", current.c_str());
+        snprintf(s_measureQueuePath, sizeof(s_measureQueuePath),
+                 "%s/%s%s", RECEIVED_DIR, name, filename.c_str());
+        s_measureActive = true;
+        Serial.printf("[ROOT] /ingest: streaming %s\n", s_measureQueuePath);
       }
-      if (upFile) { upFile.write(data, len); }
+      if (!s_measureActive) return;
+      size_t remaining = len;
+      const uint8_t* ptr = data;
+      while (remaining > 0) {
+        size_t wrote = measureRingWrite(ptr, remaining);
+        ptr       += wrote;
+        remaining -= wrote;
+        if (remaining > 0) vTaskDelay(pdMS_TO_TICKS(1));
+      }
       if (final) {
-        if (upFile) upFile.close();
+        s_measureSendDone = true;
+        // Respond immediately: the data is buffered in RAM and will be written
+        // to SD asynchronously by drainMeasureBuffer() in the ROOT main loop.
+        // This matches the same pattern used for COLLECTOR's /api/measure.
         request->send(200, "text/plain", "OK");
-        Serial.printf("[ROOT] Saved file: %s\n", current.c_str());
+        Serial.printf("[ROOT] /ingest: all data received for %s\n", s_measureQueuePath);
       }
     });
 
   // Server pushes jobs/firmware to Root: POST /upload?path=/jobs/config_jobs.json
   // Body is raw file content (JSON or hex). Used by sensorsdaemon/server to deliver jobs.
+  // NOTE: Do NOT call SdFat/SPI from this callback – it runs in the async_tcp
+  // FreeRTOS task and causes xTaskPriorityDisinherit mutex crashes on ESP32-C6.
+  // Write chunks into the shared ring buffer; drainMeasureBuffer() (ROOT main
+  // loop) will write them to SD where SPI access is safe.
   rootServer.on(
     "/upload",
     HTTP_POST,
@@ -630,19 +661,32 @@ void ensureRootHttpServer() {
         request->send(403, "text/plain", "Forbidden path");
         return;
       }
-      static FsFile uploadFile;
       if (index == 0) {
-        if (!initSdCard()) { request->send(503, "text/plain", "SD unavailable"); return; }
-        String dir = filePath.substring(0, filePath.lastIndexOf('/'));
-        if (!sd.exists(dir.c_str())) sd.mkdir(dir.c_str());
-        uploadFile = sd.open(filePath.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
-        Serial.printf("[ROOT] /upload: writing %s\n", filePath.c_str());
+        s_measureRingHead      = 0;
+        s_measureRingTail      = 0;
+        s_measureSendDone      = false;
+        s_measureDrainComplete = false;
+        snprintf(s_measureQueuePath, sizeof(s_measureQueuePath), "%s", filePath.c_str());
+        s_measureActive = true;
+        Serial.printf("[ROOT] /upload: streaming to %s\n", filePath.c_str());
       }
-      if (uploadFile) uploadFile.write(data, len);
+      if (!s_measureActive) return;
+      size_t remaining = len;
+      const uint8_t* ptr = data;
+      while (remaining > 0) {
+        size_t wrote = measureRingWrite(ptr, remaining);
+        ptr       += wrote;
+        remaining -= wrote;
+        if (remaining > 0) vTaskDelay(pdMS_TO_TICKS(1));
+      }
       if (index + len == total) {
-        if (uploadFile) uploadFile.close();
+        s_measureSendDone = true;
+        // Respond immediately: the data is buffered in RAM and will be written
+        // to SD asynchronously by drainMeasureBuffer() in the ROOT main loop.
+        // This matches the same pattern used for COLLECTOR's /api/measure.
         request->send(200, "text/plain", "OK");
-        Serial.printf("[ROOT] /upload: saved %s (%u bytes)\n", filePath.c_str(), (unsigned)total);
+        Serial.printf("[ROOT] /upload: all data received for %s (%u bytes)\n",
+                      filePath.c_str(), (unsigned)total);
       }
     });
 
@@ -1490,6 +1534,10 @@ void loopOperationalMode() {
     // Root is always-on AP. The server connects to Root's AP (Root_AP) to
     // communicate with Root's HTTP API. No STA connection needed from Root.
 
+    // Drain ring-buffered /ingest and /upload data to SD (safe – main loop context).
+    // Must run here; SdFat/SPI must NOT be called from async callbacks on ESP32-C6.
+    drainMeasureBuffer();
+
     static unsigned long lastPrint = 0;
     if (millis() - lastPrint > 10000) {
       debugPrintTime("Root loop");
@@ -1893,10 +1941,11 @@ void loopOperationalMode() {
               if (index == 0) {
                 // First chunk: initialise ring buffer and record target SD path.
                 // The /queue directory is pre-created during AP setup.
-                s_measureRingHead   = 0;
-                s_measureRingTail   = 0;
-                s_measureSendDone   = false;
-                s_measureTotalBytes = total;
+                s_measureRingHead      = 0;
+                s_measureRingTail      = 0;
+                s_measureSendDone      = false;
+                s_measureDrainComplete = false;
+                s_measureTotalBytes    = total;
                 IPAddress remoteIp  = request->client()->remoteIP();
                 Serial.printf("[HB-LEGACY] POST /api/measure started from IP=%s (total=%u bytes)\n",
                               remoteIp.toString().c_str(), (unsigned)total);
