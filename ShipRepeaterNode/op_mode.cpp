@@ -133,7 +133,52 @@ static void bufferHeartbeat(const String& sn, const String& ip, bool needsJobChe
   hbBufferWriteIdx = nextIdx;
 }
 
+// === Measure Upload Ring Buffer ===
+// The /api/measure body callback runs in the async_tcp FreeRTOS task.
+// Calling SdFat (SPI) from that context causes xTaskPriorityDisinherit
+// mutex assertion crashes (see comment above re: SD writer task removal).
+// Instead, each incoming chunk is written into this lock-free ring buffer;
+// the main loop drains it to the SD card where SPI access is safe.
+#define MEASURE_RING_SIZE (16 * 1024)
+static uint8_t         s_measureRing[MEASURE_RING_SIZE];
+static volatile size_t s_measureRingHead  = 0;   // written by async_tcp callback
+static volatile size_t s_measureRingTail  = 0;   // read by main loop
+static volatile bool   s_measureActive    = false;
+static volatile bool   s_measureSendDone  = false;
+static volatile bool   s_measureDrainComplete = false; // set by main loop when file is closed
+static volatile size_t s_measureTotalBytes = 0;
+static char            s_measureQueuePath[64];
+
+static inline size_t measureRingUsed() {
+  // Volatile reads: safe on single-core ESP32-C6 where only one task runs at
+  // a time; no additional memory barriers required.
+  size_t h = s_measureRingHead, t = s_measureRingTail;
+  return (h >= t) ? (h - t) : (MEASURE_RING_SIZE - t + h);
+}
+static inline size_t measureRingFree() {
+  return MEASURE_RING_SIZE - 1 - measureRingUsed();
+}
+// Write bytes into ring buffer; returns bytes actually written.
+// Single-producer / single-consumer: safe when only the async_tcp task writes
+// and only the main-loop task reads.
+static size_t measureRingWrite(const uint8_t* src, size_t len) {
+  size_t written = 0;
+  while (written < len) {
+    size_t free = measureRingFree();
+    if (free == 0) break;
+    size_t h = s_measureRingHead;
+    size_t canWrite = MEASURE_RING_SIZE - h;
+    if (canWrite > free)       canWrite = free;
+    if (canWrite > len - written) canWrite = len - written;
+    memcpy(s_measureRing + h, src + written, canWrite);
+    s_measureRingHead = (h + canWrite) & (MEASURE_RING_SIZE - 1);
+    written += canWrite;
+  }
+  return written;
+}
+
 // Forward declarations - both functions are defined later in this file
+static void drainMeasureBuffer();
 static void processHeartbeatBuffer();
 bool notifyRoot(const String& remoteFilePath, const String& body);
 
@@ -184,6 +229,66 @@ static void ensureDir(const char* path) {
     } else {
       Serial.printf("[SD] mkdir(%s) OK\n", path);
     }
+  }
+}
+
+// Drain the measure upload ring buffer to an SD queue file.
+// MUST be called from the main loop only – SD/SPI access is safe here.
+// Used by both COLLECTOR (POST /api/measure) and REPEATER (POST /ingest).
+static void drainMeasureBuffer() {
+  if (!s_measureActive && measureRingUsed() == 0) return;
+
+  static FsFile measureFile;
+  static bool   measureFileOpen     = false;
+  static size_t measureBytesWritten = 0;
+
+  // Open the queue file the first time we are called after an upload starts.
+  if (!measureFileOpen && s_measureActive) {
+    if (initSdCard()) {
+      measureFile = sd.open(s_measureQueuePath, O_WRONLY | O_CREAT | O_TRUNC);
+      if (measureFile) {
+        measureFileOpen     = true;
+        measureBytesWritten = 0;
+        Serial.printf("[UPLOAD] Streaming to queue: %s\n", s_measureQueuePath);
+      } else {
+        Serial.printf("[UPLOAD] ERROR: cannot open queue file %s\n", s_measureQueuePath);
+      }
+    }
+  }
+
+  // Write all currently available ring-buffer bytes to the SD file.
+  size_t avail = measureRingUsed();
+  while (avail > 0) {
+    size_t t        = s_measureRingTail;
+    size_t canRead  = MEASURE_RING_SIZE - t;
+    if (canRead > avail) canRead = avail;
+    if (measureFileOpen) {
+      size_t wrote = measureFile.write(s_measureRing + t, canRead);
+      measureBytesWritten += wrote;
+      if (wrote != canRead) {
+        Serial.printf("[UPLOAD] SD write error: %u/%u bytes written\n",
+                      (unsigned)wrote, (unsigned)canRead);
+      }
+    }
+    s_measureRingTail = (t + canRead) & (MEASURE_RING_SIZE - 1);
+    avail -= canRead;
+  }
+
+  // When all data has been received AND the ring buffer is fully drained, close.
+  if (s_measureSendDone && measureRingUsed() == 0) {
+    if (measureFileOpen) {
+      measureFile.close();
+      measureFileOpen = false;
+      Serial.printf("[UPLOAD] Saved to queue: %s (%u bytes)\n",
+                    s_measureQueuePath, (unsigned)measureBytesWritten);
+      s_measureDrainComplete = true;  // signal caller (e.g. Repeater) that file is on SD
+    } else {
+      Serial.printf("[UPLOAD] Dropped (SD open failed, %u bytes lost).\n",
+                    (unsigned)s_measureTotalBytes);
+    }
+    s_measureActive    = false;
+    s_measureSendDone  = false;
+    measureBytesWritten = 0;
   }
 }
 
@@ -713,46 +818,46 @@ void ensureRepeaterHttpServer() {
         }
       }
       req->send(200, "text/plain", "OK");
-      // Signal main loop to relay this file to Root.
-      rptPendingUpload = true;
+      // NOTE: rptPendingUpload is set by the main loop AFTER drainMeasureBuffer()
+      // confirms the file is on SD.  Do NOT set it here.
     },
     nullptr,
     [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index, size_t total) {
+      // NOTE: Do NOT call SdFat/SPI here – this runs in the async_tcp FreeRTOS
+      // task and causes xTaskPriorityDisinherit mutex crashes.
+      // Write chunks to the shared ring buffer; drainMeasureBuffer() (main loop)
+      // will write them to SD and set s_measureDrainComplete when done.
       esp_task_wdt_reset();
-      // SoftAP mode allows only one connected client at a time in this protocol,
-      // so these statics are never accessed concurrently.
-      static FsFile rptIngestFile;
-      static size_t rptIngestBytes = 0;
 
       if (index == 0) {
-        rptIngestBytes = 0;
+        s_measureRingHead   = 0;
+        s_measureRingTail   = 0;
+        s_measureSendDone   = false;
+        s_measureDrainComplete = false;
+        s_measureTotalBytes = total;
         String senderIP = req->client()->remoteIP().toString();
         Serial.printf("[REPEATER] /ingest started from %s (total=%u bytes)\n",
                       senderIP.c_str(), (unsigned)total);
-        // Generate a unique queue filename without calling preferences from callback.
-        char path[64];
-        snprintf(path, sizeof(path), "/queue/relay_%08lu.bin", (unsigned long)millis());
-        if (initSdCard()) {
-          ensureDir(QUEUE_DIR);
-          rptIngestFile = sd.open(path, O_WRONLY | O_CREAT | O_TRUNC);
-          if (rptIngestFile) {
-            Serial.printf("[REPEATER] Streaming to %s\n", path);
-          } else {
-            Serial.printf("[REPEATER] ERROR: cannot open %s\n", path);
-          }
-        }
+        snprintf(s_measureQueuePath, sizeof(s_measureQueuePath),
+                 "/queue/relay_%08lu.bin", (unsigned long)millis());
+        s_measureActive = true;
       }
 
-      if (rptIngestFile) {
-        rptIngestFile.write(data, len);
-        rptIngestBytes += len;
+      if (!s_measureActive) return;
+
+      size_t remaining = len;
+      const uint8_t* ptr = data;
+      while (remaining > 0) {
+        size_t wrote = measureRingWrite(ptr, remaining);
+        ptr       += wrote;
+        remaining -= wrote;
+        if (remaining > 0) {
+          vTaskDelay(pdMS_TO_TICKS(1));
+        }
       }
 
       if (total > 0 && index + len >= total) {
-        if (rptIngestFile) {
-          rptIngestFile.close();
-          Serial.printf("[REPEATER] Relay file saved (%u bytes).\n", (unsigned)rptIngestBytes);
-        }
+        s_measureSendDone = true;
       }
     }
   );
@@ -1479,6 +1584,17 @@ void loopOperationalMode() {
     // After the Collector uploads a file to this Repeater's /ingest endpoint,
     // rptPendingUpload is set.  We try to forward the oldest queue file to Root
     // via a STA connection.  AP stays up throughout (WIFI_AP_STA).
+
+    // Drain ring-buffered /ingest data to SD (safe – main loop context).
+    // When the file is fully written, s_measureDrainComplete becomes true and
+    // we trigger the relay by setting rptPendingUpload.
+    drainMeasureBuffer();
+    if (s_measureDrainComplete) {
+      s_measureDrainComplete = false;
+      rptPendingUpload = true;
+      Serial.printf("[REPEATER] Relay file saved to SD: %s\n", s_measureQueuePath);
+    }
+
     if (rptPendingUpload) {
       rptPendingUpload = false;
       String oldest;
@@ -1747,8 +1863,11 @@ void loopOperationalMode() {
           );
 
           // Legacy POST /api/measure - sensor sends measurement data
-          // Body chunks are streamed directly to an SD queue file so the data
-          // survives and gets uploaded to Root during the next UPLINK window.
+          // Body chunks are written into a lock-free ring buffer; the main loop
+          // drains the buffer to an SD queue file (drainMeasureBuffer()).
+          // IMPORTANT: Do NOT call SdFat/SPI from this callback – it runs in
+          // the async_tcp FreeRTOS task and causes xTaskPriorityDisinherit
+          // mutex crashes on ESP32-C6.
           sensorServer.on(
             "/api/measure",
             HTTP_POST,
@@ -1771,43 +1890,41 @@ void loopOperationalMode() {
               lastActivityMillis = millis();
               esp_task_wdt_reset();
 
-              // SoftAP mode allows only one connected sensor at a time in this
-              // protocol, so these statics are never accessed concurrently.
-              static FsFile measureQueueFile;
-              static size_t measureQueueBytes = 0;
-
               if (index == 0) {
-                // First chunk: open a new queue file for this upload.
-                // Use millis()-based name to avoid calling Preferences (NVS) from the
-                // async_tcp task context, which is unsafe on ESP32-C6.
-                // The /queue directory is pre-created in AP setup so sd.open() succeeds.
-                measureQueueBytes = 0;
-                IPAddress remoteIp = request->client()->remoteIP();
+                // First chunk: initialise ring buffer and record target SD path.
+                // The /queue directory is pre-created during AP setup.
+                s_measureRingHead   = 0;
+                s_measureRingTail   = 0;
+                s_measureSendDone   = false;
+                s_measureTotalBytes = total;
+                IPAddress remoteIp  = request->client()->remoteIP();
                 Serial.printf("[HB-LEGACY] POST /api/measure started from IP=%s (total=%u bytes)\n",
                               remoteIp.toString().c_str(), (unsigned)total);
-                char qPath[64];
-                snprintf(qPath, sizeof(qPath), "%s/measure_%08lu.bin", QUEUE_DIR, (unsigned long)millis());
-                measureQueueFile = sd.open(qPath, O_WRONLY | O_CREAT | O_TRUNC);
-                if (measureQueueFile) {
-                  Serial.printf("[HB-LEGACY] Streaming measurement to queue: %s\n", qPath);
-                } else {
-                  Serial.printf("[HB-LEGACY] ERROR: cannot open queue file %s\n", qPath);
+                snprintf(s_measureQueuePath, sizeof(s_measureQueuePath),
+                         "%s/measure_%08lu.bin", QUEUE_DIR, (unsigned long)millis());
+                s_measureActive = true;
+              }
+
+              if (!s_measureActive) return;
+
+              // Write this chunk into the ring buffer.
+              // If the ring is momentarily full, yield once to let the main loop
+              // drain it, then retry.  In practice the main loop writes to SD
+              // faster than WiFi delivers data so this branch is rarely taken.
+              size_t remaining = len;
+              const uint8_t* ptr = data;
+              while (remaining > 0) {
+                size_t wrote = measureRingWrite(ptr, remaining);
+                ptr       += wrote;
+                remaining -= wrote;
+                if (remaining > 0) {
+                  vTaskDelay(pdMS_TO_TICKS(1));
                 }
               }
 
-              // Write this chunk to the open queue file.
-              if (measureQueueFile) {
-                measureQueueFile.write(data, len);
-                measureQueueBytes += len;
-              }
-
-              // Last chunk: close the file and report.
+              // Last chunk: signal main loop that all body data is enqueued.
               if (total > 0 && index + len >= total) {
-                if (measureQueueFile) {
-                  measureQueueFile.close();
-                  Serial.printf("[HB-LEGACY] Measurement saved to queue (%u bytes).\n",
-                                (unsigned)measureQueueBytes);
-                }
+                s_measureSendDone = true;
               }
             }
           );
@@ -1824,6 +1941,11 @@ void loopOperationalMode() {
         // No active polling needed - event-driven architecture
 
         // ---- TIMEOUT CHECK ----
+        // ---- PROCESS BUFFERED MEASURE DATA (SD writes from main loop) ----
+        // Drains the ring buffer filled by POST /api/measure callbacks to SD.
+        // Must run here (main loop context) – SdFat/SPI is unsafe in callbacks.
+        drainMeasureBuffer();
+
         // ---- PROCESS BUFFERED HEARTBEATS (SD writes and job execution) ----
         // This runs in main loop context where SD and job operations are safe
         processHeartbeatBuffer();
