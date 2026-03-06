@@ -1431,6 +1431,18 @@ void goToDeepSleep(unsigned int seconds) {
   }
   
   Serial.printf("[SLEEP] Entering deep sleep for %u seconds.\n", seconds);
+  // Allow the BOOT button to wake from deep sleep so the user can press it
+  // while the device is sleeping to enter Config Mode on next boot.
+  // On ESP32-C6 the deep-sleep GPIO wakeup API differs from classic ESP32.
+#if defined(CONFIG_IDF_TARGET_ESP32C6) || defined(CONFIG_IDF_TARGET_ESP32C3) \
+ || defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3) \
+ || defined(CONFIG_IDF_TARGET_ESP32H2)
+  esp_deep_sleep_enable_gpio_wakeup(1ULL << BOOT_BUTTON_PIN,
+                                    ESP_GPIO_WAKEUP_GPIO_LOW);
+#else
+  // Classic ESP32: use ext0 RTC-GPIO wakeup
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BOOT_BUTTON_PIN, 0 /* LOW */);
+#endif
   esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
   esp_deep_sleep_start();
 }

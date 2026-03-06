@@ -63,6 +63,18 @@
 #define COLLECTOR_DATA_TIMEOUT_S    1200
 #define INITIAL_SYNC_TIMEOUT_MS     180000
 
+// BOOT button sampling windows (milliseconds).
+// Cold boot / hardware reset: give the user a comfortable 2-second window to
+// press BOOT before setup() commits to operational mode.
+// Scheduled (timer/BLE/WiFi) wakeup: 50 ms — fast resume is more important.
+#define BOOT_WINDOW_COLD_MS   2000UL
+#define BOOT_WINDOW_SCHED_MS    50UL
+// Loop-based BOOT hold thresholds:
+//   2 s → restart into Config Mode (settings preserved via RTC flag)
+//   5 s → factory reset + Config Mode
+#define BOOT_HOLD_CONFIG_MS   2000UL
+#define BOOT_HOLD_RESET_MS    5000UL
+
 // Buffer/File Defaults
 #define SD_CHUNK_SIZE           4096
 #define MESH_CHUNK_SIZE         1024

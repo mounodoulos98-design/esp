@@ -31,12 +31,37 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
     .row > div { flex:1; }
     .muted { color:#666; font-size: 0.92em; }
     .group { background:#fafafa; border:1px solid #eee; padding:12px; border-radius:8px; margin-top:16px;}
+    .upload-group { background:#fff8f0; border:1px solid #e3902a; padding:12px; border-radius:8px; margin-top:16px; }
+    .btn-upload { background:#e3902a; }
+    .btn-upload:hover { background:#c8781f; }
+    #uploadStatus { display:none; margin-top:10px; padding:8px; background:#fff3cd;
+      border:1px solid #ffc107; border-radius:4px; font-weight:bold; }
+    details > ol { margin:8px 0 0 16px; color:#444; }
   </style>
 </head>
 <body>
   <div class="container">
     <h2>Node Configuration</h2>
     <div class="id-display">Node ID: {NODE_ID}</div>
+
+    <!-- ── Firmware Upload ──────────────────────────────────────────── -->
+    <div class="upload-group">
+      <h3 style="margin-top:0">📤 Firmware Upload (Arduino IDE)</h3>
+      <div class="muted">Click below to reboot the device, then <b>immediately</b> click Upload in the Arduino IDE.<br>
+        The device will restart — esptool has a short window to begin the upload.</div>
+      <button type="button" class="btn-upload" onclick="rebootForUpload(this)">Reboot for Firmware Upload</button>
+      <div id="uploadStatus"></div>
+      <details style="margin-top:12px;">
+        <summary class="muted" style="cursor:pointer;">Manual method (if auto-reboot doesn't work)</summary>
+        <ol>
+          <li>Press and <b>hold</b> the <b>BOOT</b> button on the board</li>
+          <li>Press and release the <b>RESET</b> (EN) button</li>
+          <li>Release the <b>BOOT</b> button</li>
+          <li>Click <b>Upload</b> in Arduino IDE</li>
+        </ol>
+      </details>
+    </div>
+    <!-- ────────────────────────────────────────────────────────────── -->
     <button type="button" onclick="syncTime()">Sync Time from Browser</button>
     <div class="muted">Sets the node's clock. This is essential for scheduled operations.</div>
 
@@ -151,7 +176,38 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 
   <script>
     console.log('[CONFIG-JS] Script loaded');
-    
+
+    function rebootForUpload(btn) {
+      const status = document.getElementById('uploadStatus');
+      btn.disabled = true;
+      status.style.display = 'block';
+      status.style.background = '#fff3cd';
+      status.style.border = '1px solid #ffc107';
+      status.textContent = 'Sending reboot command…';
+      fetch('/reboot-bootloader', {method:'POST'})
+        .then(() => {
+          let t = 7;
+          status.style.background = '#f8d7da';
+          status.style.border = '1px solid #f5c6cb';
+          const iv = setInterval(() => {
+            t--;
+            status.textContent = '⚡ Device rebooting — click Upload in Arduino IDE NOW! (' + t + 's)';
+            if (t <= 0) {
+              clearInterval(iv);
+              status.style.background = '#fff3cd';
+              status.style.border = '1px solid #ffc107';
+              status.textContent = 'Device has rebooted. If upload failed, try the manual method above.';
+              btn.disabled = false;
+            }
+          }, 1000);
+        })
+        .catch(() => {
+          status.style.background = '#f8d7da';
+          status.textContent = 'Error contacting device. Try the manual method above.';
+          btn.disabled = false;
+        });
+    }
+
     async function syncTime() {
       const epoch = Math.floor(Date.now() / 1000);
       try {
@@ -390,6 +446,17 @@ void startConfigurationMode() {
   });
 
   server.onNotFound([](AsyncWebServerRequest *req){ req->redirect("/"); });
+
+  // Restart the device so esptool can catch it in the ROM bootloader window.
+  // The client should trigger the Arduino IDE upload immediately after clicking.
+  // A plain esp_restart() is used; for a guaranteed ROM-bootloader entry the
+  // user must use the manual BOOT+RESET sequence described in the UI.
+  server.on("/reboot-bootloader", HTTP_POST, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", "Rebooting...");
+    delay(300);
+    ESP.restart();
+  });
+
   server.begin();
   Serial.println("[CONFIG] Web server started.");
 }
@@ -397,5 +464,20 @@ void startConfigurationMode() {
 void loopConfigurationMode(){
   dnsServer.processNextRequest();
   esp_task_wdt_reset();
+
+  // Serial shortcut: type 'B' in the Serial Monitor while in config mode to
+  // reboot immediately.  Useful when the Serial Monitor is open and the user
+  // wants to trigger a firmware upload without leaving the monitor.
+  if (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == 'B' || c == 'b') {
+      Serial.println("[CONFIG] Serial 'B' received → rebooting for firmware upload.");
+      Serial.println("[CONFIG] Trigger Upload in Arduino IDE NOW!");
+      Serial.flush();
+      delay(300);
+      ESP.restart();
+    }
+  }
+
   delay(10);
 }
