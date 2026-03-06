@@ -272,14 +272,27 @@ time_t restoreRtcTime() {
 }
 
 
+// File-scope flag so sdForceReinit() can reset it.
+static bool sdInitialized = false;
+
+// Force the next initSdCard() call to reinitialise the bus and card.
+// Call this from the main loop when an SD file operation fails unexpectedly.
+void sdForceReinit() {
+  if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(200)) == pdFALSE) {
+    Serial.println("[SD] sdForceReinit: mutex timeout, reinit skipped");
+    return;
+  }
+  sdInitialized = false;
+  xSemaphoreGive(sdCardMutex);
+}
+
 bool initSdCard() {
   if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(500)) == pdFALSE)
     return false;
 
-  static bool sdInitialized = false;
   SdSpiConfig spiCfg(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(10));
 
-  // Αν είναι ήδη initialized, μην το ξαναδοκιμάζεις
+  // Already initialised – nothing to do.
   if (sdInitialized) {
     xSemaphoreGive(sdCardMutex);
     return true;

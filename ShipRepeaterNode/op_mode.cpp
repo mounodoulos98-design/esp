@@ -245,16 +245,23 @@ static void drainMeasureBuffer() {
   // Open the queue file the first time we are called after an upload starts.
   if (!measureFileOpen && s_measureActive) {
     if (initSdCard()) {
-      // Ensure the parent directory exists (needed for /jobs/, /firmware/, etc.)
-      {
-        String qPath = String(s_measureQueuePath);
-        int slash = qPath.lastIndexOf('/');
-        if (slash > 0) {
-          String dir = qPath.substring(0, slash);
-          if (!sd.exists(dir.c_str())) sd.mkdir(dir.c_str());
+      // Ensure the queue directory exists every time we try to open a new file.
+      // (ensureDir is called during AP setup but we re-check here in case the
+      // SD was reinitialized or the directory is missing for any other reason.)
+      ensureDir(QUEUE_DIR);
+
+      // Use O_RDWR so the open works regardless of the SdFat2 build variant.
+      measureFile = sd.open(s_measureQueuePath, O_RDWR | O_CREAT | O_TRUNC);
+      if (!measureFile) {
+        // First attempt failed. Force SD re-initialisation and retry once.
+        Serial.printf("[UPLOAD] ERROR: cannot open queue file %s – retrying after SD reinit\n",
+                      s_measureQueuePath);
+        sdForceReinit();
+        if (initSdCard()) {
+          ensureDir(QUEUE_DIR);
+          measureFile = sd.open(s_measureQueuePath, O_RDWR | O_CREAT | O_TRUNC);
         }
       }
-      measureFile = sd.open(s_measureQueuePath, O_WRONLY | O_CREAT | O_TRUNC);
       if (measureFile) {
         measureFileOpen     = true;
         measureBytesWritten = 0;
