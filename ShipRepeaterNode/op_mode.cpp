@@ -1445,6 +1445,25 @@ void goToDeepSleep(unsigned int seconds) {
   // noisy. The BOOT button is therefore NOT a valid deep-sleep wakeup source
   // on this hardware; users must use the hold-during-reset method or the
   // /reboot-bootloader web endpoint to enter Config Mode instead.
+
+  // Release the SD card and SPI bus before entering deep sleep.
+  // On ESP32-C6 the HP (digital) GPIO domain is powered off in deep sleep,
+  // so GPIO pins revert to their reset default (floating input) unless the
+  // hold function is enabled.  If SD_CS_PIN floats LOW the SD card will be
+  // selected during sleep and may receive spurious SPI traffic, leaving it in
+  // a confused state that prevents a clean init on the next wake.
+  // Solution: end the SdFat session, deassert CS explicitly, then lock the
+  // pin HIGH via gpio_hold_en() so it stays deasserted through deep sleep.
+  // sd.end() and SPI.end() are safe to call unconditionally: SdFat's end()
+  // is a no-op if begin() was never called or already failed, and the Arduino
+  // SPI class handles an unmatched end() gracefully.
+  sd.end();
+  SPI.end();
+  delay(5);
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+  gpio_hold_en((gpio_num_t)SD_CS_PIN);
+
   esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
   esp_deep_sleep_start();
 }

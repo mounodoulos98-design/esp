@@ -1,5 +1,6 @@
 #include "config.h"
 #include <LittleFS.h>
+#include <driver/gpio.h>
 
 RTC_DATA_ATTR static time_t rtc_persisted_epoch = 0;
 RTC_DATA_ATTR static uint32_t rtc_persisted_sleep_s = 0;
@@ -290,8 +291,6 @@ bool initSdCard() {
   if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(500)) == pdFALSE)
     return false;
 
-  SdSpiConfig spiCfg(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(10));
-
   // Already initialised – nothing to do.
   if (sdInitialized) {
     xSemaphoreGive(sdCardMutex);
@@ -299,20 +298,41 @@ bool initSdCard() {
   }
 
   Serial.println("[SD] (Re)Initializing SD card...");
-  SPI.end();
-  delay(50);
-  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-  delay(20);
 
-  bool success = sd.begin(spiCfg);
-  if (!success) {
-    Serial.println("[SD] Card Mount Failed – retrying...");
-    delay(100);
+  // Release any deep-sleep GPIO hold on CS so we can drive the pin freely.
+  gpio_hold_dis((gpio_num_t)SD_CS_PIN);
+
+  // Try progressively slower SPI speeds: 10 MHz → 8 MHz → 4 MHz.
+  // Lower speeds help when wiring is long or the power supply is noisy.
+  const uint32_t speeds[] = { 10, 8, 4 };
+  bool success = false;
+
+  for (size_t i = 0; i < sizeof(speeds) / sizeof(speeds[0]); i++) {
+    if (i > 0) {
+      // Clean up the previous failed SdFat session before retrying.
+      sd.end();
+      Serial.printf("[SD] Card Mount Failed at %u MHz – retrying at %u MHz...\n",
+                    speeds[i - 1], speeds[i]);
+      delay(300);
+    }
+
+    // (Re)initialise the SPI bus.
     SPI.end();
-    delay(20);
+    delay(50);
+
+    // Deassert CS HIGH before touching the bus.  SD cards require CS to be
+    // idle (HIGH) during the power-up clock pulses; a floating or LOW CS can
+    // cause the card to latch garbage and refuse to initialise.
+    pinMode(SD_CS_PIN, OUTPUT);
+    digitalWrite(SD_CS_PIN, HIGH);
+    delay(10);
+
     SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-    SdSpiConfig retryCfg(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(8));
-    success = sd.begin(retryCfg);
+    delay(20);
+
+    SdSpiConfig cfg(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(speeds[i]));
+    success = sd.begin(cfg);
+    if (success) break;
   }
 
   if (success) {
