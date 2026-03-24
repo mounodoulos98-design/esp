@@ -12,10 +12,15 @@
 //   VCC   →   3.3 V
 //   GND   →   GND
 //
-// How to enter config mode on the main firmware:
+// How to enter config mode on the main firmware (works from ALL roles):
 //   • Power-on / hardware reset: hold BOOT button (GPIO9) LOW within 2 s
 //   • While running normally:    hold BOOT button for 2 s  → Config Mode (settings kept)
 //                                hold BOOT button for 5 s  → Factory reset + Config Mode
+//
+//   COLLECTOR: hold during the AP window (device is awake and loop runs fast).
+//   REPEATER:  press and HOLD — the device wakes from light sleep on the first
+//              press; keep holding for 2 s and config mode will trigger.
+//   ROOT:      hold for 2 s at any time (loop runs continuously, no sleep).
 //
 // Open Serial Monitor at 115200 baud to see results.
 // =====================================================================

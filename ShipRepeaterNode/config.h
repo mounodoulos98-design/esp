@@ -127,6 +127,13 @@ extern SdFat sd;
 extern NodeConfig config;
 extern SemaphoreHandle_t sdCardMutex;
 extern bool isOperationalMode;
+// RTC flag set by a 2-second BOOT hold in loop() or loopOperationalMode()
+// — forces Config Mode on the next restart without erasing settings.
+extern RTC_DATA_ATTR bool rtc_force_config_mode;
+// Tracks when the BOOT button was first pressed so the hold duration can be
+// measured across multiple loop() iterations and loopOperationalMode() calls.
+// Written by both sites; they cooperate through this shared variable.
+extern unsigned long bootButtonPressTime;
 
 // Prototypes
 void loadConfiguration();

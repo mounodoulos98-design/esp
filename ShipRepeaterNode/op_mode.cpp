@@ -1559,6 +1559,28 @@ void decideAndGoToSleep() {
 void loopOperationalMode() {
   esp_task_wdt_reset();
 
+  // ── BOOT button hold check (all roles) ───────────────────────────────────
+  // Checked here — before any role-specific blocking call — so the 2 s / 5 s
+  // hold is detected reliably for REPEATER (light-sleep iterations) and ROOT
+  // (always-on AP, no deep sleep) as well as for COLLECTOR (AP-window loop).
+  // The same logic also lives in loop() as a safety net; both use the shared
+  // bootButtonPressTime variable so they cooperate correctly.
+  if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+    if (bootButtonPressTime == 0) bootButtonPressTime = millis();
+    unsigned long held = millis() - bootButtonPressTime;
+    if (held > BOOT_HOLD_RESET_MS) {
+      Serial.println("[BOOT] 5-second hold: factory reset triggered!");
+      factoryReset();
+      ESP.restart();
+    } else if (held > BOOT_HOLD_CONFIG_MS) {
+      Serial.println("[BOOT] 2-second hold: entering Config Mode (settings preserved).");
+      rtc_force_config_mode = true;
+      ESP.restart();
+    }
+  } else {
+    bootButtonPressTime = 0;
+  }
+
   // ROOT
   if (config.role == ROLE_ROOT) {
     ensureWiFiAPRoot();
@@ -1702,7 +1724,9 @@ void loopOperationalMode() {
       // Wake when a Collector BLE-scans for us.
       esp_sleep_enable_bt_wakeup();
       // Wake immediately when the BOOT button is pressed (GPIO9 = LOW) so the
-      // factory-reset / config-mode button-hold check in loop() is responsive.
+      // factory-reset / config-mode hold check at the top of this function
+      // (and in loop()) can accumulate hold-time via the shared
+      // bootButtonPressTime variable even from light sleep.
       gpio_wakeup_enable((gpio_num_t)BOOT_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
       esp_sleep_enable_gpio_wakeup();
       wakeupConfigured = true;
@@ -1713,6 +1737,15 @@ void loopOperationalMode() {
     // tasks (relay check, power log) run even when no Collector is active.
     // Using 25 s instead of 5 s lowers unnecessary CPU wake-ups by 5×.
     esp_sleep_enable_timer_wakeup(25000000ULL);
+
+    // If the BOOT button is already held when we reach this point, skip light
+    // sleep entirely.  This lets the hold-time accumulate at full loop speed
+    // (the check at the top of this function handles detection), rather than
+    // being gated behind the 25 s sleep timer.
+    if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+      setStatusLed(STATUS_OPERATIONAL_IDLE);
+      return;
+    }
 
     // Turn the LED off before sleeping: during light sleep GPIO outputs hold
     // their last state, so a green LED would stay lit the whole time, wasting
