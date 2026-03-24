@@ -26,15 +26,25 @@ RTC_DATA_ATTR bool rtc_force_config_mode = false;
 void setup() {
   // ── BOOT button → Config Mode detection ────────────────────────────────
   // Sample BOOT button (GPIO9, active LOW) as the very first action.
-  // The sampling window depends on how the chip was woken/reset so that:
-  //   • A cold boot / hardware-reset gives a comfortable 2-second window —
-  //     the user has time to press BOOT after powering the board.
-  //   • A GPIO wakeup (BOOT pressed while COLLECTOR was in deep sleep) is
-  //     treated as an immediate config-mode request.
-  //   • A scheduled timer / BLE / WiFi wakeup uses only a 50 ms window so
-  //     normal operational duties resume as quickly as possible.
+  // The sampling window depends on how the chip was woken/reset:
+  //   • Cold boot / hardware-reset: two entry paths (see below).
+  //   • Scheduled (timer / BLE / WiFi) wakeup → 50 ms window so normal
+  //     operational duties resume as quickly as possible.
   //   • The RTC flag (set by a 2-second BOOT hold during operational mode)
   //     forces config mode without requiring the button at all.
+  //
+  // Cold-boot paths:
+  //   Path 1 — hold from boot start (BOOT_HOLD_COLD_MS = 5 s):
+  //     On some boards pressing the BOOT button triggers a hardware reset.
+  //     The user holds BOOT, the reset fires, and the button remains LOW
+  //     when setup() begins.  We count from t=0; if the button is held
+  //     continuously for BOOT_HOLD_COLD_MS (5 s) → config mode.
+  //     Releasing before 5 s does NOT enter config mode (avoids accidental
+  //     entry from brief button presses that happened to cause a reset).
+  //   Path 2 — any press within BOOT_WINDOW_COLD_MS (2 s) from t=0:
+  //     Preserves the original behaviour: a brief press at any point in
+  //     the first 2 s after a cold boot triggers config mode immediately.
+  //     This fires for whatever time remains after path 1 finishes.
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
   bool forceConfigMode = false;
 
@@ -45,20 +55,37 @@ void setup() {
     forceConfigMode = true;
   } else {
     esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
-    // Cold boot / hardware reset → 2 000 ms window (plenty of time).
-    // Scheduled (timer / BLE / WiFi) wakeup → 50 ms (fast operational resume).
-    // NOTE: ESP_SLEEP_WAKEUP_GPIO cannot be triggered by GPIO9 on ESP32-C6
-    // because GPIO9 is not an LP GPIO.  All non-undefined wakeup causes
-    // therefore map to the short 50 ms window.
-    unsigned long windowMs = (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED)
-                               ? BOOT_WINDOW_COLD_MS : BOOT_WINDOW_SCHED_MS;
     unsigned long t0 = millis();
-    while (millis() - t0 < windowMs) {
+
+    if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED) {
+      // ── Cold boot / hardware reset ────────────────────────────────────
+      // Path 1: button already held at boot start → require 5 s continuous
+      // hold from t=0 to confirm intent and avoid accidental config entry.
       if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
-        forceConfigMode = true;
-        break;
+        bool heldContinuously = true;
+        while (millis() - t0 < BOOT_HOLD_COLD_MS) {
+          if (digitalRead(BOOT_BUTTON_PIN) == HIGH) { heldContinuously = false; break; }
+          delay(10);
+        }
+        if (heldContinuously) forceConfigMode = true;
       }
-      delay(10);
+      // Path 2: any press within BOOT_WINDOW_COLD_MS from t0 (runs for
+      // whatever time remains; exits immediately if already elapsed).
+      if (!forceConfigMode) {
+        while (millis() - t0 < BOOT_WINDOW_COLD_MS) {
+          if (digitalRead(BOOT_BUTTON_PIN) == LOW) { forceConfigMode = true; break; }
+          delay(10);
+        }
+      }
+    } else {
+      // Scheduled (timer / BLE / WiFi) wakeup → 50 ms window.
+      // NOTE: ESP_SLEEP_WAKEUP_GPIO cannot be triggered by GPIO9 on ESP32-C6
+      // because GPIO9 is not an LP GPIO.  All non-undefined wakeup causes
+      // therefore map to the short 50 ms window.
+      while (millis() - t0 < BOOT_WINDOW_SCHED_MS) {
+        if (digitalRead(BOOT_BUTTON_PIN) == LOW) { forceConfigMode = true; break; }
+        delay(10);
+      }
     }
   }
 
@@ -96,8 +123,8 @@ void loop() {
     // ── BOOT button hold behaviour ──────────────────────────────────────
     // 2 s hold → restart into Config Mode (all saved settings preserved).
     // 5 s hold → factory reset all settings, then restart into Config Mode.
-    // The LED feedback pattern naturally communicates the threshold:
-    //   the STATUS_SLEEPING blink changes to STATUS_ERROR (red rapid) at 2 s.
+    // LED feedback: STATUS_ERROR (red rapid blink) appears at 500 ms to
+    // signal that config mode will trigger soon — keep holding.
     if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
       if (bootButtonPressTime == 0) bootButtonPressTime = millis();
       unsigned long held = millis() - bootButtonPressTime;

@@ -69,6 +69,11 @@
 // Scheduled (timer/BLE/WiFi) wakeup: 50 ms — fast resume is more important.
 #define BOOT_WINDOW_COLD_MS   2000UL
 #define BOOT_WINDOW_SCHED_MS    50UL
+// Cold-boot hold threshold: button must be held continuously from t=0 of boot
+// for this long to trigger Config Mode.  Handles boards where pressing BOOT
+// causes a hardware reset — user holds the button through the reset and keeps
+// holding; 5 s of continuous hold from the start of setup() → config mode.
+#define BOOT_HOLD_COLD_MS     5000UL
 // Loop-based BOOT hold thresholds:
 //   2 s → restart into Config Mode (settings preserved via RTC flag)
 //   5 s → factory reset + Config Mode

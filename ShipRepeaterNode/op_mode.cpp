@@ -1565,6 +1565,8 @@ void loopOperationalMode() {
   // (always-on AP, no deep sleep) as well as for COLLECTOR (AP-window loop).
   // The same logic also lives in loop() as a safety net; both use the shared
   // bootButtonPressTime variable so they cooperate correctly.
+  // LED feedback: STATUS_ERROR (red rapid blink) is shown after 500 ms of
+  // hold so the user has visual confirmation that the gesture is registered.
   if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
     if (bootButtonPressTime == 0) bootButtonPressTime = millis();
     unsigned long held = millis() - bootButtonPressTime;
@@ -1576,8 +1578,11 @@ void loopOperationalMode() {
       Serial.println("[BOOT] 2-second hold: entering Config Mode (settings preserved).");
       rtc_force_config_mode = true;
       ESP.restart();
+    } else if (held > 500) {
+      setStatusLed(STATUS_ERROR);  // red rapid blink: keep holding for config mode
     }
   } else {
+    if (bootButtonPressTime != 0) setStatusLed(STATUS_OPERATIONAL_IDLE);
     bootButtonPressTime = 0;
   }
 
@@ -1742,8 +1747,10 @@ void loopOperationalMode() {
     // sleep entirely.  This lets the hold-time accumulate at full loop speed
     // (the check at the top of this function handles detection), rather than
     // being gated behind the 25 s sleep timer.
+    // Note: do NOT call setStatusLed here — the top-of-function check already
+    // set STATUS_ERROR as hold-in-progress feedback; overwriting it would hide
+    // the visual signal from the user.
     if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
-      setStatusLed(STATUS_OPERATIONAL_IDLE);
       return;
     }
 
