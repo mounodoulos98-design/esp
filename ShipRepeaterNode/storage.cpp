@@ -302,9 +302,10 @@ bool initSdCard() {
   // Release any deep-sleep GPIO hold on CS so we can drive the pin freely.
   gpio_hold_dis((gpio_num_t)SD_CS_PIN);
 
-  // Try progressively slower SPI speeds: 10 MHz → 8 MHz → 4 MHz.
-  // Lower speeds help when wiring is long or the power supply is noisy.
-  const uint32_t speeds[] = { 10, 8, 4 };
+  // Try progressively slower SPI speeds: 10 → 8 → 4 → 2 → 1 MHz.
+  // Lower speeds help when wiring is long, power supply is noisy, or the
+  // card is marginal.  1 MHz is well within spec for all SD cards.
+  const uint32_t speeds[] = { 10, 8, 4, 2, 1 };
   bool success = false;
 
   for (size_t i = 0; i < sizeof(speeds) / sizeof(speeds[0]); i++) {
@@ -330,6 +331,17 @@ bool initSdCard() {
     SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
     delay(20);
 
+    // Per the SD Physical Layer Spec, the host must send at least 74 clock
+    // cycles with CS HIGH (and DI/MOSI HIGH) to transition the card from
+    // SD-bus power-up mode into SPI mode.  SdFat normally issues these, but
+    // sending them explicitly here guarantees the card is in a known state
+    // before sd.begin() negotiates the protocol — particularly important
+    // after a warm reset or deep sleep where the card was not power-cycled.
+    SPI.beginTransaction(SPISettings(250000, MSBFIRST, SPI_MODE0));
+    for (int k = 0; k < 10; k++) SPI.transfer(0xFF); // 80 clock cycles
+    SPI.endTransaction();
+    delay(10);
+
     SdSpiConfig cfg(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(speeds[i]));
     success = sd.begin(cfg);
     if (success) break;
@@ -339,7 +351,9 @@ bool initSdCard() {
     Serial.println("[SD] Card initialized successfully.");
     sdInitialized = true;
   } else {
-    Serial.println("[SD] Card Mount Failed (final).");
+    Serial.printf("[SD] Card Mount Failed at %u MHz (final).\n", speeds[sizeof(speeds)/sizeof(speeds[0])-1]);
+    Serial.println("[SD] Check wiring (CLK=19 MISO=20 MOSI=21 CS=18), VCC=3.3V, card format=FAT32.");
+    Serial.println("[SD] Flash SDTest/SDTest.ino for standalone hardware diagnosis.");
     sdInitialized = false;
   }
 
