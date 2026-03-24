@@ -52,6 +52,7 @@ public:
         pServer = BLEDevice::createServer();
         if (!pServer) {
             Serial.println("[BLE-BEACON] ERROR: Failed to create BLE server");
+            BLEDevice::deinit(true);
             return;
         }
         
@@ -59,6 +60,7 @@ public:
         pAdvertising = BLEDevice::getAdvertising();
         if (!pAdvertising) {
             Serial.println("[BLE-BEACON] ERROR: Failed to get advertising object");
+            BLEDevice::deinit(true);
             return;
         }
         
@@ -170,6 +172,7 @@ public:
         pBLEScan = BLEDevice::getScan();
         if (!pBLEScan) {
             Serial.println("[BLE-SCAN] ERROR: Failed to get BLE scan object");
+            BLEDevice::deinit(true);
             return;
         }
         

@@ -1431,11 +1431,15 @@ void goToDeepSleep(unsigned int seconds) {
   rtc_last_sleep_duration_s = seconds;
   stopAPMode();
   
-  // Stop BLE before deep sleep
-  if (config.bleBeaconEnabled) {
-    bleBeacon.stop();
-    Serial.println("[BLE-MESH] Stopped BLE beacon before sleep");
-  }
+  // Stop ALL BLE before deep sleep — both the beacon (Repeater/Root) and the
+  // scanner (Collector/Repeater).  ESP-IDF requires Bluetooth to be fully
+  // stopped before calling esp_deep_sleep_start(); leaving either active can
+  // cause deep sleep to fail and the chip to reboot into download mode.
+  // Both stop() functions check their own isInitialized flag and are no-ops
+  // when the respective BLE object was never started.
+  bleBeacon.stop();
+  bleScanner.stop();
+  Serial.println("[BLE-MESH] BLE stopped before deep sleep");
   
   Serial.printf("[SLEEP] Entering deep sleep for %u seconds.\n", seconds);
   // NOTE: On ESP32-C6, deep-sleep GPIO wakeup is only supported for LP GPIOs
