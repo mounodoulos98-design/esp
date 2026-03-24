@@ -1611,7 +1611,7 @@ void loopOperationalMode() {
     ensureWiFiAPRepeater();
     ensureRepeaterHttpServer();
     
-    // Start BLE beacon once (100ms advertising interval set inside begin())
+    // Start BLE beacon once (advertising interval defined by BLE_ADV_INTERVAL_UNITS)
     if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
       String actualAPSSID = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
       bleBeacon.begin(actualAPSSID, config.nodeName, 0); // 0 = Repeater role
