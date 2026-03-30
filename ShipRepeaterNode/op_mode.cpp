@@ -1108,7 +1108,9 @@ void startOperationalMode() {
     esp_task_wdt_config_t wdt_cfg = {
       .timeout_ms       = 30000,
       .idle_core_mask   = (1 << portNUM_PROCESSORS) - 1,
-      .trigger_panic    = true
+      .trigger_panic    = false   // Don't panic on WDT — panic with WiFi/BLE active
+                                  // causes ESP32-C6 to enter boot:0x4 DOWNLOAD mode.
+                                  // WDT will still reset the chip, just cleanly.
     };
     // Arduino core v3.x already initialises the TWDT (5 s default).
     // esp_task_wdt_init() fails with ESP_ERR_INVALID_STATE in that case,

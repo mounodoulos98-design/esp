@@ -110,6 +110,18 @@ time_t restoreRtcTime() {
 }
 
 
+// Send 80 dummy SPI clock cycles (10 × 0xFF) with CS HIGH.
+// SD spec §6.4.1 requires ≥74 clocks in this state to force the card
+// from its native SD mode into SPI mode before the first CMD0.
+static void sdSendDummyClocks() {
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);   // CS de-asserted
+  for (int i = 0; i < 10; i++) {
+    SPI.transfer(0xFF);
+  }
+  delay(2);
+}
+
 bool initSdCard() {
   // Guard against NULL mutex handle (heap exhaustion at boot).
   if (sdCardMutex == nullptr) {
@@ -147,26 +159,48 @@ bool initSdCard() {
   // latched after wake, which keeps the SD card in an undefined state).
   gpio_hold_dis((gpio_num_t)SD_CS_PIN);
 
-  // Use the same init pattern that worked on the original codebase:
-  // DEDICATED_SPI + SPI.begin(SCK, MISO, MOSI, CS).
+  // SHARED_SPI is required on Arduino ESP32 core v3.x with custom SPI pins.
+  // DEDICATED_SPI makes SdFat call SPI.end()+SPI.begin() internally WITHOUT
+  // pin arguments, which resets the bus to default GPIO6/GPIO2/GPIO7 and loses
+  // our custom pin configuration.  SHARED_SPI preserves whatever SPI.begin()
+  // we set up here.
+  //
+  // SPI.begin() SS parameter MUST be -1: passing SD_CS_PIN makes the ESP32
+  // SPI hardware drive the pin as hardware-SS, conflicting with SdFat's
+  // software CS toggle and causing init failures.
+  //
   // Try progressively lower SPI speeds: 10 → 8 → 4 MHz.
   const int speeds[] = { 10, 8, 4 };
   bool success = false;
 
   for (int s = 0; s < 3 && !success; s++) {
+    // Tear down any previous SPI state
+    sd.end();
     SPI.end();
     delay(50);
-    SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+
+    // SPI.end() detaches pin muxing, so re-assert CS as a GPIO output
+    // before SPI.begin() to keep CS HIGH during the dummy-clock phase.
+    pinMode(SD_CS_PIN, OUTPUT);
+    digitalWrite(SD_CS_PIN, HIGH);
+
+    // Configure SPI bus with custom pins; SS=-1 lets SdFat handle CS.
+    SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, -1);
     delay(20);
+
+    // Send 80 dummy clocks with CS HIGH to force card into SPI mode
+    // (SD spec §6.4.1).
+    sdSendDummyClocks();
+    delay(10);
 
     esp_task_wdt_reset();
 
-    SdSpiConfig cfg(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(speeds[s]));
+    SdSpiConfig cfg(SD_CS_PIN, SHARED_SPI, SD_SCK_MHZ(speeds[s]));
     success = sd.begin(cfg);
     if (!success) {
       Serial.printf("[SD] Mount failed at %d MHz – %s\n", speeds[s],
                     (s < 2) ? "retrying..." : "(final).");
-      delay(100);
+      delay(300);
     }
   }
 

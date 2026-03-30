@@ -272,7 +272,7 @@ void startConfigurationMode() {
     esp_task_wdt_config_t wdt_cfg = {
       .timeout_ms       = 30000,
       .idle_core_mask   = (1 << portNUM_PROCESSORS) - 1,
-      .trigger_panic    = true
+      .trigger_panic    = false   // Don't panic — causes boot:0x4 DOWNLOAD on ESP32-C6
     };
     esp_err_t wdt_err = esp_task_wdt_reconfigure(&wdt_cfg);
     if (wdt_err != ESP_OK) {
