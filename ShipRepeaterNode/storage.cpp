@@ -131,11 +131,21 @@ bool initSdCard() {
     return false;
 
   static bool sdInitialized = false;
+  // Cooldown: after a failed full retry sequence, wait before trying again.
+  // Prevents main-loop starvation and WDT timeout when SD is absent/broken.
+  static unsigned long lastFailMillis = 0;
+  static constexpr unsigned long SD_RETRY_COOLDOWN_MS = 10000; // 10 seconds
 
   // Αν είναι ήδη initialized, μην το ξαναδοκιμάζεις
   if (sdInitialized) {
     xSemaphoreGive(sdCardMutex);
     return true;
+  }
+
+  // Skip retry if still within cooldown after last failure
+  if (lastFailMillis != 0 && (millis() - lastFailMillis) < SD_RETRY_COOLDOWN_MS) {
+    xSemaphoreGive(sdCardMutex);
+    return false;
   }
 
   Serial.println("[SD] (Re)Initializing SD card...");
@@ -158,6 +168,10 @@ bool initSdCard() {
   // ESP32 core v3.x SPI.end() clears the stored pin config, so the subsequent
   // SPI.begin() reverts to DEFAULT pins — which don't match the SD card wiring.
   // SHARED_SPI avoids this: we own the SPI bus and SdFat just uses it as-is.
+  //
+  // IMPORTANT: Pass -1 for SS in SPI.begin() — do NOT pass SD_CS_PIN.
+  // The SPI peripheral's hardware SS would fight SdFat's software CS toggling,
+  // keeping CS in the wrong state during transactions and preventing card init.
   const int speeds[] = { 10, 8, 4, 2 };
   bool success = false;
 
@@ -166,11 +180,19 @@ bool initSdCard() {
     SPI.end();
     delay(100);
 
-    // Re-initialize SPI with our board-specific pins every iteration.
-    // SPI.end() clears the stored pin config on ESP32 core v3.x, so we must
-    // always pass explicit pins here.
+    // Reset WDT so the retry loop (4 speeds × ~500ms each) doesn't trigger
+    // a watchdog panic during normal SD recovery after deep sleep.
+    esp_task_wdt_reset();
+
+    // SPI.end() detaches pins, so re-assert CS as GPIO output before SPI.begin().
+    pinMode(SD_CS_PIN, OUTPUT);
     digitalWrite(SD_CS_PIN, HIGH);
-    SPI.begin(SCK, MISO, MOSI, SD_CS_PIN);
+
+    // Re-initialize SPI with our board-specific pins every iteration.
+    // Pass -1 for SS: we manage CS ourselves via SdFat's SdSpiConfig.
+    // Passing the actual CS pin here makes the SPI hardware drive it,
+    // which conflicts with SdFat's software CS toggling.
+    SPI.begin(SCK, MISO, MOSI, -1);
     delay(20);
 
     // 80 dummy clocks with CS HIGH → forces SD into SPI mode
@@ -189,9 +211,11 @@ bool initSdCard() {
   if (success) {
     Serial.println("[SD] Card initialized successfully.");
     sdInitialized = true;
+    lastFailMillis = 0; // clear cooldown on success
   } else {
     Serial.println("[SD] Card Mount Failed (final).");
     sdInitialized = false;
+    lastFailMillis = millis(); // start cooldown
   }
 
   xSemaphoreGive(sdCardMutex);
