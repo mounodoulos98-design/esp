@@ -15,6 +15,7 @@
 extern "C" {
 #include "esp_event.h"
 #include "esp_pm.h"
+#include "driver/gpio.h"
 }
 
 // === SAFE AP bring-up helper (final stable) ===
@@ -108,7 +109,7 @@ static HeartbeatEntry hbBuffer[HB_BUFFER_SIZE];
 // === Measure upload ring buffer (Bug 4 fix) ===
 // Filled from AsyncWebServer onBody callback; drained to SD from main loop only.
 // NEVER call SdFat from the callback — use this ring buffer instead.
-static constexpr size_t        MEASURE_RING_SIZE        = 16384; // must stay a power of 2
+static constexpr size_t        MEASURE_RING_SIZE        = 32768; // must stay a power of 2
 static constexpr unsigned long MEASURE_DRAIN_TIMEOUT_MS = 30000;
 static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 25;    // light sleep duration (manual fallback)
 static bool s_pmAutoSleepActive = false;   // true when RTOS PM auto light-sleep is active
@@ -1189,6 +1190,15 @@ void goToDeepSleep(unsigned int seconds) {
   }
   rtc_last_sleep_duration_s = seconds;
   stopAPMode();
+  
+  // Properly shut down SD card and SPI before deep sleep so that the card
+  // wakes in a clean state.  Drive CS HIGH and hold the pin through sleep
+  // to prevent the line from floating (which confuses the SD controller).
+  sd.end();
+  SPI.end();
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+  gpio_hold_en((gpio_num_t)SD_CS_PIN);
   
   // Stop ALL BLE subsystems before deep sleep — ESP-IDF requires BT fully stopped.
   // Both stop() methods guard on isInitialized internally, so they're safe no-ops

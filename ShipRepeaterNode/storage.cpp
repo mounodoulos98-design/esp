@@ -1,4 +1,5 @@
 #include "config.h"
+#include "driver/gpio.h"
 
 RTC_DATA_ATTR static time_t rtc_persisted_epoch = 0;
 RTC_DATA_ATTR static uint32_t rtc_persisted_sleep_s = 0;
@@ -109,6 +110,16 @@ time_t restoreRtcTime() {
 }
 
 
+// Send 80 dummy SPI clock cycles with CS HIGH to force SD card into SPI mode
+// per SD Physical Layer Spec §6.4.1.  Must be done after each power cycle or
+// deep-sleep wake before the first sd.begin().
+static void sdSendDummyClocks() {
+  digitalWrite(SD_CS_PIN, HIGH);
+  for (int i = 0; i < 10; i++) {
+    SPI.transfer(0xFF);
+  }
+}
+
 bool initSdCard() {
   // Bug 2 fix: guard against NULL handle — xSemaphoreCreateMutex() in setup()
   // could have returned NULL if the FreeRTOS heap was exhausted at that point.
@@ -120,7 +131,6 @@ bool initSdCard() {
     return false;
 
   static bool sdInitialized = false;
-  SdSpiConfig spiCfg(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(10));
 
   // Αν είναι ήδη initialized, μην το ξαναδοκιμάζεις
   if (sdInitialized) {
@@ -129,20 +139,41 @@ bool initSdCard() {
   }
 
   Serial.println("[SD] (Re)Initializing SD card...");
-  SPI.end();
-  delay(50);
-  SPI.begin(SCK, MISO, MOSI, SD_CS_PIN);
-  delay(20);
 
-  bool success = sd.begin(spiCfg);
-  if (!success) {
-    Serial.println("[SD] Card Mount Failed – retrying...");
-    delay(100);
+  // Release any GPIO hold that was set before deep sleep (prevents CS staying
+  // latched LOW after wake, which keeps the SD card in an undefined state).
+  gpio_hold_dis((gpio_num_t)SD_CS_PIN);
+
+  // Drive CS HIGH before SPI init — SD spec requires CS=HIGH during
+  // the initial 80 clock cycles that switch the card to SPI mode.
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+
+  // Try progressively lower SPI speeds: 10 → 8 → 4 MHz.
+  // Between each attempt: end SPI, re-init, send dummy clocks.
+  const int speeds[] = { 10, 8, 4 };
+  bool success = false;
+
+  for (int s = 0; s < 3 && !success; s++) {
+    sd.end();
     SPI.end();
-    delay(20);
+    delay(100);
+
+    digitalWrite(SD_CS_PIN, HIGH);
     SPI.begin(SCK, MISO, MOSI, SD_CS_PIN);
-    SdSpiConfig retryCfg(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(8));
-    success = sd.begin(retryCfg);
+    delay(20);
+
+    // 80 dummy clocks with CS HIGH → forces SD into SPI mode
+    sdSendDummyClocks();
+    delay(10);
+
+    SdSpiConfig cfg(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(speeds[s]));
+    success = sd.begin(cfg);
+    if (!success) {
+      Serial.printf("[SD] Mount failed at %d MHz – %s\n", speeds[s],
+                    (s < 2) ? "retrying..." : "(final).");
+      delay(300);
+    }
   }
 
   if (success) {
