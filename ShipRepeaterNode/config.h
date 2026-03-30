@@ -15,25 +15,18 @@
 #include "esp_wifi.h"
 #include "esp_sleep.h"
 #include "esp_task_wdt.h"
-#include <Adafruit_NeoPixel.h>
 #include <time.h>
 #include <sys/time.h>
 #include <ArduinoJson.h> // **ΤΟ ΒΑΖΟΥΜΕ ΕΔΩ ΓΙΑ ΝΑ ΕΙΝΑΙ ΔΙΑΘΕΣΙΜΟ ΠΑΝΤΟΥ**
 
-// Hardware
-#define BOOT_BUTTON_PIN         38
-#define NEOPIXEL_PIN             0
-#define NEOPIXEL_POWER_PIN       2
-#define NEOPIXEL_BRIGHTNESS     20
+// ── Waveshare ESP32-C6 (16 MB) Hardware ──────────────────────────
+#define BOOT_BUTTON_PIN         9     // On-board BOOT button (active LOW)
 
-// SD Card SPI Pins — adjust to match your actual hardware wiring!
-// ⚠ ESP32-C6 defaults: SCK=6, MISO=2, MOSI=7
-//   Default MISO (GPIO 2) CONFLICTS with NEOPIXEL_POWER_PIN!
-//   Change SD_MISO_PIN (or NEOPIXEL_POWER_PIN) to avoid the clash.
-#define SD_CS_PIN               27
-#define SD_SCK_PIN              6     // SPI Clock
-#define SD_MISO_PIN             2     // SPI Master-In  (SD card DO) — ⚠ CHANGE if conflicts with NeoPixel!
-#define SD_MOSI_PIN             7     // SPI Master-Out (SD card DI)
+// SD Card SPI — uses the FSPI bus on the ESP32-C6
+#define SD_CS_PIN               10    // Chip-select (pick any free GPIO)
+#define SD_SCK_PIN              6     // FSPICLK
+#define SD_MISO_PIN             2     // FSPIQ  (SD card DO → MCU)
+#define SD_MOSI_PIN             7     // FSPID  (MCU → SD card DI)
 
 // Network Defaults
 #define ROOT_AP_SSID            "Root_AP"
@@ -106,7 +99,6 @@ extern AsyncWebServer server;
 extern DNSServer dnsServer;
 extern Preferences preferences;
 extern Scheduler userScheduler;
-extern Adafruit_NeoPixel pixel;
 extern SdFat sd;
 extern NodeConfig config;
 extern SemaphoreHandle_t sdCardMutex;

@@ -142,9 +142,6 @@ bool initSdCard() {
   // Print pin configuration for diagnostics
   Serial.printf("[SD] SPI pins: SCK=%d  MISO=%d  MOSI=%d  CS=%d\n",
                 SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-  if (SD_MISO_PIN == NEOPIXEL_POWER_PIN) {
-    Serial.println("[SD] *** ERROR: SD_MISO_PIN == NEOPIXEL_POWER_PIN! Change one of them in config.h ***");
-  }
 
   // Release any GPIO hold that was set before deep sleep (prevents CS staying
   // latched after wake, which keeps the SD card in an undefined state).

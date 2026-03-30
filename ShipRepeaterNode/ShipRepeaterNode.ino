@@ -8,7 +8,6 @@ AsyncWebServer server(80);
 DNSServer dnsServer;
 Preferences preferences;
 Scheduler userScheduler;
-Adafruit_NeoPixel pixel(1, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 SdFat sd;
 NodeConfig config;
 SemaphoreHandle_t sdCardMutex;
