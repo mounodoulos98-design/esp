@@ -617,7 +617,10 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
     Serial.printf("[TIME] STA to %s...\n", config.uplinkSSID.c_str());
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeout_ms) { delay(200); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeout_ms) {
+      esp_task_wdt_reset();
+      delay(200);
+    }
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[TIME] STA connect failed");
@@ -698,7 +701,7 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
     Serial.printf("[UPLINK] Connecting STA to %s...\n", config.uplinkSSID.c_str());
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(200); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { esp_task_wdt_reset(); delay(200); }
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[UPLINK] STA connect failed");
@@ -762,7 +765,7 @@ bool downloadFileFromRoot(const String& remotePath, const String& localPath) {
     Serial.printf("[DOWNLOAD] Connecting STA to %s...\n", config.uplinkSSID.c_str());
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(200); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { esp_task_wdt_reset(); delay(200); }
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[DOWNLOAD] STA connect failed");
@@ -1104,7 +1107,16 @@ void startOperationalMode() {
       .idle_core_mask   = (1 << portNUM_PROCESSORS) - 1,
       .trigger_panic    = true
     };
-    esp_task_wdt_init(&wdt_cfg);
+    // Arduino core v3.x already initialises the TWDT (5 s default).
+    // esp_task_wdt_init() fails with ESP_ERR_INVALID_STATE in that case,
+    // so reconfigure the existing instance to our 30 s timeout instead.
+    esp_err_t wdt_err = esp_task_wdt_reconfigure(&wdt_cfg);
+    if (wdt_err != ESP_OK) {
+      wdt_err = esp_task_wdt_init(&wdt_cfg);
+    }
+    if (wdt_err != ESP_OK) {
+      Serial.printf("[WDT] init/reconfigure failed: %s\n", esp_err_to_name(wdt_err));
+    }
   }
   esp_task_wdt_add(NULL);
   Serial.printf("[BOOT] Wake cause=%d, rtc_last_sleep_duration_s=%u\n",

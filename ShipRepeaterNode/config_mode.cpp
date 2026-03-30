@@ -274,7 +274,13 @@ void startConfigurationMode() {
       .idle_core_mask   = (1 << portNUM_PROCESSORS) - 1,
       .trigger_panic    = true
     };
-    esp_task_wdt_init(&wdt_cfg);
+    esp_err_t wdt_err = esp_task_wdt_reconfigure(&wdt_cfg);
+    if (wdt_err != ESP_OK) {
+      wdt_err = esp_task_wdt_init(&wdt_cfg);
+    }
+    if (wdt_err != ESP_OK) {
+      Serial.printf("[WDT] init/reconfigure failed: %s\n", esp_err_to_name(wdt_err));
+    }
   }
   esp_task_wdt_add(NULL);
 
