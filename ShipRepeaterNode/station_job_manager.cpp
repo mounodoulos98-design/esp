@@ -296,19 +296,19 @@ void resetJobCache() {
 // ---------------------
 extern "C" {
 #include "esp_wifi.h"
-#include "tcpip_adapter.h"
+#include "esp_netif.h"
 }
 
 static void updateStationIPs() {
     wifi_sta_list_t wifi_sta_list;
-    tcpip_adapter_sta_list_t adapter_sta_list;
+    esp_netif_sta_list_t adapter_sta_list;
     memset(&wifi_sta_list, 0, sizeof(wifi_sta_list));
     memset(&adapter_sta_list, 0, sizeof(adapter_sta_list));
 
     if (esp_wifi_ap_get_sta_list(&wifi_sta_list) != ESP_OK) {
         return;
     }
-    if (tcpip_adapter_get_sta_list(&wifi_sta_list, &adapter_sta_list) != ESP_OK) {
+    if (esp_netif_get_sta_list(&wifi_sta_list, &adapter_sta_list) != ESP_OK) {
         return;
     }
 
@@ -318,7 +318,7 @@ static void updateStationIPs() {
 
         for (int j = 0; j < adapter_sta_list.num; ++j) {
             const wifi_sta_info_t& wi = wifi_sta_list.sta[j];
-            const tcpip_adapter_sta_info_t& ai = adapter_sta_list.sta[j];
+            const esp_netif_sta_info_t& ai = adapter_sta_list.sta[j];
 
             char macStr[20];
             sprintf(macStr, "%02x:%02x:%02x:%02x:%02x:%02x",
