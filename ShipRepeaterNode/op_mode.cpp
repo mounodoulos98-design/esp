@@ -139,7 +139,7 @@ static void bufferHeartbeat(const String& sn, const String& ip, bool needsJobChe
 // mutex assertion crashes (see comment above re: SD writer task removal).
 // Instead, each incoming chunk is written into this lock-free ring buffer;
 // the main loop drains it to the SD card where SPI access is safe.
-#define MEASURE_RING_SIZE (16 * 1024)
+#define MEASURE_RING_SIZE (64 * 1024)
 static uint8_t         s_measureRing[MEASURE_RING_SIZE];
 static volatile size_t s_measureRingHead  = 0;   // written by async_tcp callback
 static volatile size_t s_measureRingTail  = 0;   // read by main loop
@@ -274,6 +274,11 @@ static void drainMeasureBuffer() {
 
   // Write all currently available ring-buffer bytes to the SD file.
   size_t avail = measureRingUsed();
+  if (avail > 0) {
+    // Treat ongoing drain as activity so the AP inactivity timer does not fire
+    // while a slow SD write is keeping the ring busy.
+    lastActivityMillis = millis();
+  }
   while (avail > 0) {
     size_t t        = s_measureRingTail;
     size_t canRead  = MEASURE_RING_SIZE - t;
@@ -2086,7 +2091,15 @@ void loopOperationalMode() {
         unsigned long now = millis();
         if (now - lastTimeoutCheck >= ACTIVITY_CHECK_INTERVAL) {
           lastTimeoutCheck = now;
-          
+
+          // Never time out while a measure upload is actively being received or
+          // drained to SD.  The ring buffer may be full and onBody blocked, so
+          // lastActivityMillis can lag behind real progress.
+          if (s_measureActive || measureRingUsed() > 0) {
+            lastActivityMillis = millis();
+            // skip timeout evaluation – come back next interval
+          } else {
+
           unsigned long timeSinceLastActivity = now - lastActivityMillis;
           unsigned long timeout;
           
@@ -2141,6 +2154,7 @@ void loopOperationalMode() {
               break;
             }
           }
+          } // end else (no active upload)
         }
 
         break;
