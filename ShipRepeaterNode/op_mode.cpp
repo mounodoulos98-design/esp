@@ -104,6 +104,19 @@ static volatile int hbBufferReadIdx = 0;
 static const int HB_BUFFER_SIZE = 10;
 static HeartbeatEntry hbBuffer[HB_BUFFER_SIZE];
 
+// === Measure upload ring buffer (Bug 4 fix) ===
+// Filled from AsyncWebServer onBody callback; drained to SD from main loop only.
+// NEVER call SdFat from the callback — use this ring buffer instead.
+static constexpr size_t        MEASURE_RING_SIZE        = 16384; // must stay a power of 2
+static constexpr unsigned long MEASURE_DRAIN_TIMEOUT_MS = 30000;
+static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 25;    // light sleep duration (Bug 1)
+static uint8_t         s_measureRing[MEASURE_RING_SIZE];
+static volatile size_t s_measureRingHead = 0;   // written only by onBody callback
+static volatile size_t s_measureRingTail = 0;   // read/advanced only by drainMeasureBuffer()
+static volatile bool   s_measureActive   = false; // upload in progress
+static volatile bool   s_measureSendDone = false; // all body chunks received
+static String          s_measureQueuePath;
+
 // Queue a heartbeat from callback (safe - no FreeRTOS calls)
 static void bufferHeartbeat(const String& sn, const String& ip, bool needsJobCheck = false, 
                             const uint8_t* statusData = nullptr, size_t statusDataLen = 0) {
@@ -286,6 +299,101 @@ static String nextQueueFilename() {
   char name[64];
   snprintf(name, sizeof(name), "%s/entry_%08lu.bin", QUEUE_DIR, (unsigned long)idx);
   return String(name);
+}
+
+// Progressive filename for /api/measure uploads: /queue/measure_XXXXXXXX.bin
+static String nextMeasureQueuePath() {
+  preferences.begin(QUEUE_NS, false);
+  uint32_t idx = preferences.getUInt("meas_idx", 0);
+  idx++;
+  preferences.putUInt("meas_idx", idx);
+  preferences.end();
+  char name[64];
+  snprintf(name, sizeof(name), "%s/measure_%08lu.bin", QUEUE_DIR, (unsigned long)idx);
+  return String(name);
+}
+
+// Drain the measure ring buffer to SD — called from the main loop each iteration.
+// Must NOT be called from AsyncWebServer callbacks (Bug 4 fix).
+static void drainMeasureBuffer() {
+  static FsFile  measureFile;
+  static bool    fileOpen     = false;
+  static unsigned long lastProgress = 0;
+
+  // Nothing to do and no open file
+  if (!s_measureActive && !fileOpen) return;
+
+  // Upload was aborted (s_measureActive cleared externally) — close open file
+  if (!s_measureActive && fileOpen) {
+    measureFile.close();
+    fileOpen = false;
+    return;
+  }
+
+  // Open queue file on first call after s_measureActive becomes true
+  if (!fileOpen) {
+    if (!initSdCard()) {
+      Serial.println("[UPLOAD] SD init failed, aborting measure drain");
+      s_measureActive  = false;
+      s_measureSendDone = false;
+      return;
+    }
+    ensureDir(QUEUE_DIR);
+    s_measureQueuePath = nextMeasureQueuePath();
+    measureFile = sd.open(s_measureQueuePath.c_str(), O_RDWR | O_CREAT | O_TRUNC);
+    if (!measureFile) {
+      Serial.printf("[UPLOAD] Failed to open queue file: %s\n", s_measureQueuePath.c_str());
+      s_measureActive  = false;
+      s_measureSendDone = false;
+      return;
+    }
+    Serial.printf("[UPLOAD] Streaming to queue: %s\n", s_measureQueuePath.c_str());
+    fileOpen     = true;
+    lastProgress = millis();
+  }
+
+  // Drain all bytes currently available in the ring buffer
+  {
+    size_t tail      = s_measureRingTail;          // local snapshot (we are the only reader)
+    size_t head      = s_measureRingHead;          // snapshot written by callback
+    // Unsigned subtraction wraps correctly for both head>tail and head<tail (after wrap-around).
+    // Masking with (MEASURE_RING_SIZE-1) gives the correct byte count in both cases because
+    // MEASURE_RING_SIZE is a power of 2 and indices are bounded to [0, MEASURE_RING_SIZE-1].
+    size_t available = (head - tail) & (MEASURE_RING_SIZE - 1);
+
+    if (available > 0) {
+      // Write in up to two contiguous chunks to handle ring wrap-around
+      size_t toEnd       = MEASURE_RING_SIZE - tail;
+      size_t firstChunk  = (available <= toEnd) ? available : toEnd;
+      measureFile.write(&s_measureRing[tail], firstChunk);
+      tail = (tail + firstChunk) & (MEASURE_RING_SIZE - 1);
+      size_t remaining = available - firstChunk;
+      if (remaining > 0) {
+        measureFile.write(&s_measureRing[tail], remaining);
+        tail = (tail + remaining) & (MEASURE_RING_SIZE - 1);
+      }
+      s_measureRingTail = tail;   // single atomic update so callback sees correct free space
+      lastProgress = millis();
+    }
+  }
+
+  // Upload complete: sender finished AND ring fully drained
+  if (s_measureSendDone && (s_measureRingTail == s_measureRingHead)) {
+    measureFile.close();
+    fileOpen        = false;
+    s_measureActive = false;
+    Serial.printf("[UPLOAD] Queue file saved: %s\n", s_measureQueuePath.c_str());
+    return;
+  }
+
+  // Watchdog: abort if no new data arrives within the timeout
+  if (millis() - lastProgress > MEASURE_DRAIN_TIMEOUT_MS) {
+    Serial.println("[UPLOAD] Drain timeout — aborting upload");
+    measureFile.close();
+    fileOpen         = false;
+    s_measureActive  = false;
+    s_measureSendDone = false;
+  }
 }
 
 // find oldest file in /queue (lexicographically)
@@ -976,6 +1084,15 @@ void initializeTime() {
 // Operational Mode
 // =============================
 void startOperationalMode() {
+  // Bug 2 fix: ensure the default event loop and sdCardMutex exist before any
+  // WiFi or BLE call that internally uses FreeRTOS sync objects.  The mutex is
+  // normally created in setup(), but a NULL-check here guards against any path
+  // (e.g. heap exhaustion at first boot) where it was skipped.
+  if (sdCardMutex == nullptr) {
+    sdCardMutex = xSemaphoreCreateMutex();
+  }
+  esp_event_loop_create_default();  // no-op if already exists (returns ESP_ERR_INVALID_STATE)
+
   WiFi.mode(WIFI_OFF);
   delay(200);
   esp_task_wdt_init(30, true);
@@ -1153,8 +1270,21 @@ void loopOperationalMode() {
       tried = true;
       syncTimeFromUplink(5000);
     }
-    // Repeater stays in light sleep with BLE beacon active
-    // No deep sleep - allows instant wake-up when collector connects
+
+    // Bug 1 fix: On ESP32-C6, calling esp_light_sleep_start() while a SoftAP
+    // station is connected blocks indefinitely and triggers the task WDT.
+    // Skip light sleep entirely when any station is connected; use a short
+    // delay() instead so the loop can service the AP and reset the WDT.
+    if (WiFi.softAPgetStationNum() == 0) {
+      esp_sleep_enable_timer_wakeup(REPEATER_LIGHT_SLEEP_S * 1000000ULL);
+      esp_sleep_enable_wifi_wakeup();                     // wake on SoftAP activity
+      Serial.println("[REPEATER] Light sleep armed: BLE + WiFi(when-AP-up) + BOOT + 25s timer");
+      esp_task_wdt_reset();
+      esp_light_sleep_start();
+    } else {
+      delay(10);
+    }
+    return;  // REPEATER manages its own loop; do not enter the state machine below.
   }
 
   // NON-ROOT STATE MACHINE
@@ -1352,33 +1482,60 @@ void loopOperationalMode() {
             }
           );
 
-          // Legacy POST /api/measure - sensor sends measurement data
+          // Legacy POST /api/measure - sensor sends measurement data.
+          // Bug 4 fix: write body chunks into a ring buffer; the main loop drains
+          // that buffer to SD via drainMeasureBuffer(). NEVER touch SdFat here.
           sensorServer.on(
             "/api/measure",
             HTTP_POST,
             [](AsyncWebServerRequest *request) {
-              // This is called AFTER all body chunks are received
+              // Called after all body chunks are received — send 200 immediately
+              // so the sensor does not time out waiting for a response.
               IPAddress remoteIp = request->client()->remoteIP();
-              Serial.printf("[HB-LEGACY] POST /api/measure completed from IP=%s\n", 
+              Serial.printf("[HB-LEGACY] POST /api/measure completed from IP=%s\n",
                            remoteIp.toString().c_str());
               request->send(200, "text/plain", "OK");
               lastActivityMillis = millis();
             },
             nullptr,
             [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-              // This is called for each chunk of data received
-              // Update activity timestamp on EVERY chunk to prevent timeout during long uploads
+              // Keep activity timer alive on every chunk (large uploads take time)
               lastActivityMillis = millis();
-              
+
               if (index == 0) {
-                // First chunk - log start with sensor info
+                // First chunk: reset ring buffer and activate drain pipeline
                 IPAddress remoteIp = request->client()->remoteIP();
-                Serial.printf("[HB-LEGACY] POST /api/measure started from IP=%s (total=%d bytes)\n", 
-                             remoteIp.toString().c_str(), total);
+                Serial.printf("[HB-LEGACY] POST /api/measure started from IP=%s (total=%d bytes)\n",
+                             remoteIp.toString().c_str(), (int)total);
+                // Reset ring — must happen before setting s_measureActive so the
+                // drain function doesn't race on stale tail/head values.
+                s_measureRingHead = 0;
+                s_measureRingTail = 0;
+                s_measureSendDone = false;
+                s_measureActive   = true;
               }
-              
-              // Just receive the data - don't send response here
-              // The response is sent in the main handler above after all chunks are received
+
+              // Write incoming bytes into the ring buffer.
+              // Use a local head to minimise volatile reads inside the hot loop.
+              size_t head = s_measureRingHead;
+              size_t tail = s_measureRingTail; // snapshot; only reader advances tail
+              for (size_t i = 0; i < len; i++) {
+                size_t nextHead = (head + 1) & (MEASURE_RING_SIZE - 1);
+                if (nextHead == tail) {
+                  // Ring full — drop remaining bytes and warn
+                  Serial.printf("[UPLOAD] Ring overflow at %u/%u, dropping %u bytes\n",
+                               (unsigned)(index + i), (unsigned)total, (unsigned)(len - i));
+                  break;
+                }
+                s_measureRing[head] = data[i];
+                head = nextHead;
+              }
+              s_measureRingHead = head; // single atomic store — visible to drain
+
+              // Set done flag AFTER updating head so drain sees all bytes first
+              if (index + len >= total) {
+                s_measureSendDone = true;
+              }
             }
           );
 
@@ -1397,6 +1554,10 @@ void loopOperationalMode() {
         // ---- PROCESS BUFFERED HEARTBEATS (SD writes and job execution) ----
         // This runs in main loop context where SD and job operations are safe
         processHeartbeatBuffer();
+
+        // ---- DRAIN MEASURE RING BUFFER TO SD (Bug 4 fix) ----
+        // Drains bytes written by the /api/measure onBody callback into the SD queue file.
+        drainMeasureBuffer();
 
         // ---- TIMEOUT CHECK ----
         // Check for any sensor activity (heartbeats OR data transfers) periodically

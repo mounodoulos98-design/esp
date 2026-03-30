@@ -40,25 +40,34 @@ public:
             Serial.println("[BLE-BEACON] ERROR: Failed to get advertising object");
             return;
         }
-        
-        // Add service UUID to advertisement
-        pAdvertising->addServiceUUID(BLE_MESH_SERVICE_UUID);
-        
-        // Set advertising parameters
-        pAdvertising->setScanResponse(true);
-        pAdvertising->setMinPreferred(0x06);  // Min connection interval
-        pAdvertising->setMaxPreferred(0x12);  // Max connection interval
-        
-        // Add manufacturer data with node role and AP SSID
-        // Format: [role_byte, apSSID_bytes...]
-        // We advertise AP SSID because that's what's needed for WiFi connection
-        BLEAdvertisementData advData;
+
+        // Bug 3 fix: split advertisement data to avoid exceeding the 31-byte PDU limit.
+        //
+        // Primary advertisement: service UUID only (18 bytes).
+        // A 128-bit UUID + manufacturer data easily overflows 31 bytes, which
+        // silently drops the UUID so the scanner never recognises the device.
+        BLEAdvertisementData primaryData;
+        primaryData.setCompleteServices(BLEUUID(BLE_MESH_SERVICE_UUID));
+        pAdvertising->setAdvertisementData(primaryData);
+
+        // Scan response: manufacturer data with a custom magic prefix.
+        // Format: [0x53, 0x4D, role_byte, apSSID_bytes...]
+        // Bytes 0x53/0x4D ("SM") are used as a non-registered custom company-ID
+        // (little-endian 16-bit field in the BT manufacturer data AD type).
+        // This lets the scanner identify mesh nodes even when the service-UUID
+        // check fails due to radio contention or advertisement PDU caching.
+        BLEAdvertisementData scanRespData;
         std::string mfgData;
-        mfgData.push_back(nodeRole); // 0=Repeater, 1=Root
-        mfgData.append(apSSID.c_str());  // Use AP SSID instead of node name
-        advData.setManufacturerData(mfgData);
-        advData.setCompleteServices(BLEUUID(BLE_MESH_SERVICE_UUID));
-        pAdvertising->setAdvertisementData(advData);
+        mfgData.push_back(0x53); // company ID low byte  (magic 'S')
+        mfgData.push_back(0x4D); // company ID high byte (magic 'M')
+        mfgData.push_back(nodeRole);
+        mfgData.append(apSSID.c_str());
+        scanRespData.setManufacturerData(mfgData);
+        pAdvertising->setScanResponseData(scanRespData);
+
+        pAdvertising->setScanResponse(true);
+        pAdvertising->setMinPreferred(0x06);
+        pAdvertising->setMaxPreferred(0x12);
         
         isInitialized = true;
         Serial.printf("[BLE-BEACON] BLE Beacon initialized (advertising AP SSID: %s)\n", apSSID.c_str());
@@ -154,66 +163,105 @@ public:
         
         Serial.printf("[BLE-SCAN] Found %d devices\n", count);
         
-        // Find the strongest signal with our service UUID
+        // Find the strongest signal matching our mesh service UUID or magic bytes.
+        // Bug 3 fix: dual detection avoids missing nodes when the UUID advertisement
+        // packet is dropped due to radio contention or advertisement PDU overflow.
         int bestRSSI = -999;
         int bestIndex = -1;
         
         for (int i = 0; i < count; i++) {
             BLEAdvertisedDevice device = foundDevices.getDevice(i);
-            
-            // Check if device has our mesh service UUID
-            if (device.haveServiceUUID() && device.isAdvertisingService(BLEUUID(BLE_MESH_SERVICE_UUID))) {
-                int rssi = device.getRSSI();
-                
-                // Extract AP SSID from manufacturer data if available
-                String apSSID = String(device.getName().c_str());  // Default to BLE name
-                if (device.haveManufacturerData()) {
-                    std::string mfgData = device.getManufacturerData();
-                    if (mfgData.length() > 1) {
-                        // Extract AP SSID from manufacturer data (skip first byte which is role)
-                        apSSID = "";
-                        for (size_t j = 1; j < mfgData.length(); j++) {
-                            apSSID += (char)mfgData[j];
-                        }
+
+            // Debug: print every found device so misses can be diagnosed
+            std::string mfgRaw = device.haveManufacturerData() ? device.getManufacturerData() : "";
+            Serial.printf("[BLE-SCAN][%d] addr=%s rssi=%d uuid=%s mfg=%d bytes\n",
+                         i,
+                         device.getAddress().toString().c_str(),
+                         device.getRSSI(),
+                         device.haveServiceUUID() ? device.getServiceUUID().toString().c_str() : "none",
+                         (int)mfgRaw.size());
+
+            // Primary detection: advertised service UUID
+            bool isMeshNode = (device.haveServiceUUID() &&
+                               device.isAdvertisingService(BLEUUID(BLE_MESH_SERVICE_UUID)));
+
+            // Fallback detection: custom magic prefix 0x53/0x4D ("SM") in the
+            // manufacturer data AD type — catches nodes whose service UUID was
+            // not returned (scan response not received or PDU overflow).
+            if (!isMeshNode && device.haveManufacturerData()) {
+                std::string mfg = device.getManufacturerData();
+                if (mfg.size() >= 2 &&
+                    (uint8_t)mfg[0] == 0x53 &&
+                    (uint8_t)mfg[1] == 0x4D) {
+                    isMeshNode = true;
+                }
+            }
+
+            if (!isMeshNode) continue;
+
+            int rssi = device.getRSSI();
+
+            // Extract AP SSID from manufacturer data if available.
+            // New format: [0x53, 0x4D, role_byte, apSSID_bytes...]
+            // Legacy format (no magic bytes): [role_byte, apSSID_bytes...]
+            String apSSID = String(device.getName().c_str());
+            if (device.haveManufacturerData()) {
+                std::string mfgData = device.getManufacturerData();
+                size_t ssidStart = 1; // legacy: role at [0], SSID from [1]
+                if (mfgData.size() >= 2 &&
+                    (uint8_t)mfgData[0] == 0x53 &&
+                    (uint8_t)mfgData[1] == 0x4D) {
+                    ssidStart = 3; // new: magic[0..1], role[2], SSID from [3]
+                }
+                if (mfgData.size() > ssidStart) {
+                    apSSID = "";
+                    for (size_t j = ssidStart; j < mfgData.size(); j++) {
+                        apSSID += (char)mfgData[j];
                     }
                 }
-                
-                Serial.printf("[BLE-SCAN] Found mesh node AP: %s, RSSI: %d\n", 
-                             apSSID.c_str(), rssi);
-                
-                if (rssi > bestRSSI) {
-                    bestRSSI = rssi;
-                    bestIndex = i;
-                }
+            }
+            
+            Serial.printf("[BLE-SCAN] Found mesh node AP: %s, RSSI: %d\n", 
+                         apSSID.c_str(), rssi);
+            
+            if (rssi > bestRSSI) {
+                bestRSSI  = rssi;
+                bestIndex = i;
             }
         }
         
         if (bestIndex >= 0) {
             BLEAdvertisedDevice bestDevice = foundDevices.getDevice(bestIndex);
-            result.found = true;
+            result.found    = true;
             result.nodeName = String(bestDevice.getName().c_str());
-            result.rssi = bestRSSI;
-            result.address = String(bestDevice.getAddress().toString().c_str());
+            result.rssi     = bestRSSI;
+            result.address  = String(bestDevice.getAddress().toString().c_str());
             
             // Extract role and AP SSID from manufacturer data
             if (bestDevice.haveManufacturerData()) {
                 std::string mfgData = bestDevice.getManufacturerData();
-                if (mfgData.length() > 0) {
-                    result.nodeRole = mfgData[0];  // First byte is role
-                    
-                    // Extract AP SSID (rest of manufacturer data)
-                    if (mfgData.length() > 1) {
-                        result.apSSID = "";
-                        for (size_t i = 1; i < mfgData.length(); i++) {
-                            result.apSSID += (char)mfgData[i];
-                        }
-                    } else {
-                        // Fallback to BLE device name if no SSID in manufacturer data
-                        result.apSSID = result.nodeName;
+                size_t ssidStart = 1; // legacy offset
+                if (mfgData.size() >= 2 &&
+                    (uint8_t)mfgData[0] == 0x53 &&
+                    (uint8_t)mfgData[1] == 0x4D) {
+                    // New format with magic bytes
+                    ssidStart = 3;
+                    if (mfgData.size() > 2) {
+                        result.nodeRole = (uint8_t)mfgData[2];
                     }
+                } else if (mfgData.size() > 0) {
+                    // Legacy format
+                    result.nodeRole = (uint8_t)mfgData[0];
+                }
+                if (mfgData.size() > ssidStart) {
+                    result.apSSID = "";
+                    for (size_t i = ssidStart; i < mfgData.size(); i++) {
+                        result.apSSID += (char)mfgData[i];
+                    }
+                } else {
+                    result.apSSID = result.nodeName;
                 }
             } else {
-                // No manufacturer data, use BLE name as fallback
                 result.apSSID = result.nodeName;
             }
             

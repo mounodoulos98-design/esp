@@ -110,6 +110,12 @@ time_t restoreRtcTime() {
 
 
 bool initSdCard() {
+  // Bug 2 fix: guard against NULL handle — xSemaphoreCreateMutex() in setup()
+  // could have returned NULL if the FreeRTOS heap was exhausted at that point.
+  if (sdCardMutex == nullptr) {
+    sdCardMutex = xSemaphoreCreateMutex();
+    if (sdCardMutex == nullptr) return false;
+  }
   if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(500)) == pdFALSE)
     return false;
 
