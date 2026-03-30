@@ -111,6 +111,7 @@ static HeartbeatEntry hbBuffer[HB_BUFFER_SIZE];
 // Filled from AsyncWebServer onBody callback; drained to SD from main loop only.
 // NEVER call SdFat from the callback — use this ring buffer instead.
 static constexpr size_t        MEASURE_RING_SIZE        = 65536; // must stay a power of 2 — 64 KB keeps up with WiFi→SD pipeline
+static_assert((MEASURE_RING_SIZE & (MEASURE_RING_SIZE - 1)) == 0, "MEASURE_RING_SIZE must be a power of 2");
 static constexpr unsigned long MEASURE_DRAIN_TIMEOUT_MS = 30000;
 static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 25;    // light sleep duration (manual fallback)
 static bool s_pmAutoSleepActive = false;   // true when RTOS PM auto light-sleep is active
