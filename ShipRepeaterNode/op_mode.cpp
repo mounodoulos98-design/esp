@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <vector>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <sys/time.h>
 #include "sensor_heartbeat_manager.h"
@@ -109,7 +110,7 @@ static HeartbeatEntry hbBuffer[HB_BUFFER_SIZE];
 // === Measure upload ring buffer (Bug 4 fix) ===
 // Filled from AsyncWebServer onBody callback; drained to SD from main loop only.
 // NEVER call SdFat from the callback — use this ring buffer instead.
-static constexpr size_t        MEASURE_RING_SIZE        = 32768; // must stay a power of 2
+static constexpr size_t        MEASURE_RING_SIZE        = 65536; // must stay a power of 2 — 64 KB keeps up with WiFi→SD pipeline
 static constexpr unsigned long MEASURE_DRAIN_TIMEOUT_MS = 30000;
 static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 25;    // light sleep duration (manual fallback)
 static bool s_pmAutoSleepActive = false;   // true when RTOS PM auto light-sleep is active
@@ -157,6 +158,11 @@ bool hadStation = false;
 unsigned long lastActivityMillis = 0;
 unsigned long lastHeartbeatMillis = 0;  // Track last actual heartbeat from any sensor
 static WiFiEventId_t stationConnectedEventId;
+
+// Track sensors whose full cycle (heartbeat → jobs → measure) is done.
+// After a sensor is marked done, subsequent heartbeats in the same AP window
+// get a "Connection: close" header so it stops reconnecting.
+static std::set<String> s_sensorsDone;
 
 // RTC Memory
 RTC_DATA_ATTR time_t rtc_last_known_time = 0;
@@ -248,6 +254,10 @@ static void processHeartbeatBuffer() {
         } else {
           Serial.printf("[HB-BUFFER] No jobs found for SN=%s\n", sn.c_str());
         }
+        // Mark sensor as "done" — subsequent heartbeats from this SN in the
+        // same AP window will receive Connection: close to stop the cycle.
+        s_sensorsDone.insert(sn);
+        Serial.printf("[HB-BUFFER] Sensor %s marked done for this AP window\n", sn.c_str());
       }
       
       entry.hasData = false;
@@ -1451,6 +1461,7 @@ void loopOperationalMode() {
           jobProcessedThisWindow = false;
           lastActivityMillis = millis();
           lastHeartbeatMillis = 0; // Reset heartbeat tracking for new session
+          s_sensorsDone.clear();   // Fresh AP window — allow all sensors through again
 
           // ======================================================
           //                HEARTBEAT INTEGRATION
@@ -1509,6 +1520,17 @@ void loopOperationalMode() {
             // Log to Serial and buffer for main loop processing
             Serial.printf("[HB-LEGACY] GET /api/heartbeat from SN=%s IP=%s\n", 
                          sensorSn.c_str(), remoteIp.toString().c_str());
+            
+            // If this sensor already completed its cycle (heartbeat → jobs → measure)
+            // in this AP window, tell it to close the connection and stop.
+            if (s_sensorsDone.count(sensorSn)) {
+              Serial.printf("[HB-LEGACY] Sensor %s already done — sending Connection: close\n", sensorSn.c_str());
+              AsyncWebServerResponse *resp = request->beginResponse(200, "text/plain", "DONE");
+              resp->addHeader("Connection", "close");
+              request->send(resp);
+              lastActivityMillis = millis();
+              return;
+            }
             
             // Buffer with job check enabled - main loop will process
             bufferHeartbeat(sensorSn, remoteIp.toString(), true);
@@ -1580,9 +1602,14 @@ void loopOperationalMode() {
               // If the drain pipeline aborted (SD failure), tell the sensor so it
               // can retry later instead of believing the upload succeeded.
               if (s_measureFailed) {
-                request->send(503, "text/plain", "SD unavailable");
+                AsyncWebServerResponse *resp = request->beginResponse(503, "text/plain", "SD unavailable");
+                resp->addHeader("Connection", "close");
+                request->send(resp);
               } else {
-                request->send(200, "text/plain", "OK");
+                // Measure upload is the final step — tell sensor to close connection.
+                AsyncWebServerResponse *resp = request->beginResponse(200, "text/plain", "OK");
+                resp->addHeader("Connection", "close");
+                request->send(resp);
               }
               lastActivityMillis = millis();
             },

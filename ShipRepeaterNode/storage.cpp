@@ -169,8 +169,8 @@ bool initSdCard() {
   // SPI hardware drive the pin as hardware-SS, conflicting with SdFat's
   // software CS toggle and causing init failures.
   //
-  // Try progressively lower SPI speeds: 10 → 8 → 4 MHz.
-  const int speeds[] = { 10, 8, 4 };
+  // Try progressively lower SPI speeds: 25 → 20 → 10 MHz.
+  const int speeds[] = { 25, 20, 10 };
   bool success = false;
 
   for (int s = 0; s < 3 && !success; s++) {

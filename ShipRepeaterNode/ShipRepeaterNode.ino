@@ -18,6 +18,7 @@ unsigned long bootButtonPressTime = 0;
 
 
 void setup() {
+  setCpuFrequencyMhz(160);  // ESP32-C6 max — ensures SD and WiFi run at full speed
   Serial.begin(115200);
   Serial.println("\n\n===================================");
   Serial.println("ShipRepeaterNode Booting...");
