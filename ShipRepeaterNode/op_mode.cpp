@@ -14,6 +14,7 @@
 
 extern "C" {
 #include "esp_event.h"
+#include "esp_pm.h"
 }
 
 // === SAFE AP bring-up helper (final stable) ===
@@ -109,7 +110,9 @@ static HeartbeatEntry hbBuffer[HB_BUFFER_SIZE];
 // NEVER call SdFat from the callback — use this ring buffer instead.
 static constexpr size_t        MEASURE_RING_SIZE        = 16384; // must stay a power of 2
 static constexpr unsigned long MEASURE_DRAIN_TIMEOUT_MS = 30000;
-static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 25;    // light sleep duration (Bug 1)
+static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 25;    // light sleep duration (manual fallback)
+static bool s_pmAutoSleepActive = false;   // true when RTOS PM auto light-sleep is active
+static bool s_btWakeupEnabled   = false;   // true after esp_sleep_enable_bt_wakeup() succeeded
 static uint8_t         s_measureRing[MEASURE_RING_SIZE];
 static volatile size_t s_measureRingHead = 0;   // written only by onBody callback
 static volatile size_t s_measureRingTail = 0;   // read/advanced only by drainMeasureBuffer()
@@ -1100,6 +1103,29 @@ void startOperationalMode() {
   Serial.printf("[BOOT] Wake cause=%d, rtc_last_sleep_duration_s=%u\n",
                 (int)esp_sleep_get_wakeup_cause(), rtc_last_sleep_duration_s);
 
+  // --- REPEATER: ESP-IDF Power Management for automatic light sleep ---
+  // Reference: efficient BLE sensor firmware pattern where esp_pm_configure()
+  // lets the RTOS enter light sleep automatically when no task is active.
+  // BLE/WiFi hardware maintain their state and wake the CPU on events.
+  // This replaces the fragile manual esp_light_sleep_start() which blocked
+  // indefinitely when SoftAP had connected stations (WDT crash on ESP32-C6).
+  if (config.role == ROLE_REPEATER) {
+    esp_pm_config_t pm_config = {
+      .max_freq_mhz = 160,   // ESP32-C6 default
+      .min_freq_mhz = 80,    // WiFi/BLE require ≥80 MHz APB clock; setting lower
+                              // would only apply when radios release their PM lock
+      .light_sleep_enable = true
+    };
+    esp_err_t err = esp_pm_configure(&pm_config);
+    if (err == ESP_OK) {
+      s_pmAutoSleepActive = true;
+      Serial.println("[PM] RTOS auto light-sleep enabled (max=160MHz, min=80MHz)");
+    } else {
+      Serial.printf("[PM] esp_pm_configure failed: %s — will use manual sleep fallback\n",
+                    esp_err_to_name(err));
+    }
+  }
+
   initializeTime();
   debugPrintTime("After initializeTime()");
 
@@ -1145,11 +1171,12 @@ void goToDeepSleep(unsigned int seconds) {
   rtc_last_sleep_duration_s = seconds;
   stopAPMode();
   
-  // Stop BLE before deep sleep
-  if (config.bleBeaconEnabled) {
-    bleBeacon.stop();
-    Serial.println("[BLE-MESH] Stopped BLE beacon before sleep");
-  }
+  // Stop ALL BLE subsystems before deep sleep — ESP-IDF requires BT fully stopped.
+  // Both stop() methods guard on isInitialized internally, so they're safe no-ops
+  // if the subsystem was never started. Leaving either active causes POWERON reset.
+  bleBeacon.stop();
+  bleScanner.stop();
+  Serial.println("[BLE-MESH] Stopped BLE before deep sleep");
   
   Serial.printf("[SLEEP] Entering deep sleep for %u seconds.\n", seconds);
   esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
@@ -1255,14 +1282,25 @@ void loopOperationalMode() {
     ensureWiFiAPRepeater();
     ensureRepeaterHttpServer();
     
-    // Repeater uses continuous BLE beacon with light sleep (not deep sleep)
-    // This allows collectors to find and wake it at any time
+    // Start BLE beacon once (low duty-cycle advertising at ~1285ms interval)
     if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
-      // Use actual AP SSID (same logic as ensureWiFiAPRepeater)
       String actualAPSSID = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
       bleBeacon.begin(actualAPSSID, config.nodeName, 0); // 0 = Repeater role
       bleBeacon.startAdvertising();
-      Serial.println("[BLE-MESH] Repeater BLE beacon active (continuous with light sleep)");
+      Serial.println("[BLE-MESH] Repeater BLE beacon active (low-power advertising)");
+
+      // Enable BLE hardware wake trigger — CPU wakes instantly on BLE connect/data.
+      // Must be called AFTER BLEDevice::init() (which happens inside bleBeacon.begin).
+      if (!s_btWakeupEnabled) {
+        esp_err_t err = esp_sleep_enable_bt_wakeup();
+        if (err == ESP_OK) {
+          s_btWakeupEnabled = true;
+          Serial.println("[PM] BLE wake trigger enabled (cpu wakes on BLE events)");
+        } else {
+          Serial.printf("[PM] esp_sleep_enable_bt_wakeup failed: %s\n",
+                        esp_err_to_name(err));
+        }
+      }
     }
     
     static bool tried = false;
@@ -1271,18 +1309,31 @@ void loopOperationalMode() {
       syncTimeFromUplink(5000);
     }
 
-    // Bug 1 fix: On ESP32-C6, calling esp_light_sleep_start() while a SoftAP
-    // station is connected blocks indefinitely and triggers the task WDT.
-    // Skip light sleep entirely when any station is connected; use a short
-    // delay() instead so the loop can service the AP and reset the WDT.
-    if (WiFi.softAPgetStationNum() == 0) {
-      esp_sleep_enable_timer_wakeup(REPEATER_LIGHT_SLEEP_S * 1000000ULL);
-      esp_sleep_enable_wifi_wakeup();                     // wake on SoftAP activity
-      Serial.println("[REPEATER] Light sleep armed: BLE + WiFi(when-AP-up) + BOOT + 25s timer");
-      esp_task_wdt_reset();
-      esp_light_sleep_start();
+    // Power management strategy (inspired by efficient BLE sensor firmware):
+    //
+    // With esp_pm_configure(light_sleep_enable=true) + esp_sleep_enable_bt_wakeup():
+    //   - The RTOS enters light sleep automatically during idle (no manual call)
+    //   - BLE hardware continues advertising at 1285ms interval during sleep
+    //   - WiFi AP maintains state; stations can connect/send data
+    //   - CPU wakes instantly on: BLE connect/data, WiFi activity, RTOS tick
+    //   - No WDT risk — WiFi subsystem holds PM locks when stations are connected
+    //
+    // Fallback: if esp_pm_configure() failed (CONFIG_PM_ENABLE not set), use
+    // the old manual esp_light_sleep_start() with the station-count guard.
+    if (s_pmAutoSleepActive) {
+      delay(10);  // yield to RTOS idle task → auto light-sleep kicks in
     } else {
-      delay(10);
+      // Manual fallback: must NOT sleep when SoftAP stations are connected
+      // (blocks forever on ESP32-C6, triggers task WDT).
+      if (WiFi.softAPgetStationNum() == 0) {
+        esp_sleep_enable_timer_wakeup(REPEATER_LIGHT_SLEEP_S * 1000000ULL);
+        esp_sleep_enable_wifi_wakeup();
+        Serial.println("[REPEATER] Light sleep armed (manual fallback)");
+        esp_task_wdt_reset();
+        esp_light_sleep_start();
+      } else {
+        delay(10);
+      }
     }
     return;  // REPEATER manages its own loop; do not enter the state machine below.
   }

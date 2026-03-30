@@ -16,7 +16,14 @@
 // Advertises the node's presence so children can discover and wake it up
 class BLEBeaconManager {
 public:
-    void begin(const String& apSSID, const String& nodeName, uint8_t nodeRole) {
+    // Default advertising interval: ~1285ms in 0.625ms units (0x0808).
+    // Low duty-cycle advertising dramatically reduces Tx power consumption.
+    // The scanner's near-continuous scan window (99/100) guarantees detection
+    // within a single 5-second scan period (~3-4 advertisement opportunities).
+    static constexpr uint16_t ADV_INTERVAL_LOW_POWER = 0x0808; // 1285ms
+
+    void begin(const String& apSSID, const String& nodeName, uint8_t nodeRole,
+               uint16_t advIntervalUnits = ADV_INTERVAL_LOW_POWER) {
         Serial.println("[BLE-BEACON] Initializing BLE Beacon...");
         
         // Initialize BLE
@@ -66,8 +73,12 @@ public:
         pAdvertising->setScanResponseData(scanRespData);
 
         pAdvertising->setScanResponse(true);
-        pAdvertising->setMinPreferred(0x06);
-        pAdvertising->setMaxPreferred(0x12);
+        // Set BLE advertising interval for low duty cycle.
+        // setMinPreferred/setMaxPreferred are connection interval hints — NOT
+        // the advertising interval. Use setMinInterval/setMaxInterval instead
+        // to control the actual time between advertisement PDU transmissions.
+        pAdvertising->setMinInterval(advIntervalUnits);
+        pAdvertising->setMaxInterval(advIntervalUnits);
         
         isInitialized = true;
         Serial.printf("[BLE-BEACON] BLE Beacon initialized (advertising AP SSID: %s)\n", apSSID.c_str());
