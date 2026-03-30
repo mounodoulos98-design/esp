@@ -25,7 +25,15 @@
 #define NEOPIXEL_PIN             0
 #define NEOPIXEL_POWER_PIN       2
 #define NEOPIXEL_BRIGHTNESS     20
+
+// SD Card SPI Pins — adjust to match your actual hardware wiring!
+// ⚠ ESP32-C6 defaults: SCK=6, MISO=2, MOSI=7
+//   Default MISO (GPIO 2) CONFLICTS with NEOPIXEL_POWER_PIN!
+//   Change SD_MISO_PIN (or NEOPIXEL_POWER_PIN) to avoid the clash.
 #define SD_CS_PIN               27
+#define SD_SCK_PIN              6     // SPI Clock
+#define SD_MISO_PIN             2     // SPI Master-In  (SD card DO) — ⚠ CHANGE if conflicts with NeoPixel!
+#define SD_MOSI_PIN             7     // SPI Master-Out (SD card DI)
 
 // Network Defaults
 #define ROOT_AP_SSID            "Root_AP"

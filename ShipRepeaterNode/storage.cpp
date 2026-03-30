@@ -139,12 +139,19 @@ bool initSdCard() {
 
   Serial.println("[SD] (Re)Initializing SD card...");
 
+  // Print pin configuration for diagnostics
+  Serial.printf("[SD] SPI pins: SCK=%d  MISO=%d  MOSI=%d  CS=%d\n",
+                SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  if (SD_MISO_PIN == NEOPIXEL_POWER_PIN) {
+    Serial.println("[SD] *** ERROR: SD_MISO_PIN == NEOPIXEL_POWER_PIN! Change one of them in config.h ***");
+  }
+
   // Release any GPIO hold that was set before deep sleep (prevents CS staying
   // latched after wake, which keeps the SD card in an undefined state).
   gpio_hold_dis((gpio_num_t)SD_CS_PIN);
 
   // Use the same init pattern that worked on the original codebase:
-  // DEDICATED_SPI + SPI.begin(SCK, MISO, MOSI, SD_CS_PIN).
+  // DEDICATED_SPI + SPI.begin(SCK, MISO, MOSI, CS).
   // Try progressively lower SPI speeds: 10 → 8 → 4 MHz.
   const int speeds[] = { 10, 8, 4 };
   bool success = false;
@@ -152,7 +159,7 @@ bool initSdCard() {
   for (int s = 0; s < 3 && !success; s++) {
     SPI.end();
     delay(50);
-    SPI.begin(SCK, MISO, MOSI, SD_CS_PIN);
+    SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
     delay(20);
 
     esp_task_wdt_reset();
