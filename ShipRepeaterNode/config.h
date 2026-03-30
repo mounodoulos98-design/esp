@@ -21,11 +21,23 @@
 #include <ArduinoJson.h> // **ΤΟ ΒΑΖΟΥΜΕ ΕΔΩ ΓΙΑ ΝΑ ΕΙΝΑΙ ΔΙΑΘΕΣΙΜΟ ΠΑΝΤΟΥ**
 
 // Hardware
-#define BOOT_BUTTON_PIN         38
-#define NEOPIXEL_PIN             0
-#define NEOPIXEL_POWER_PIN       2
+// GPIO9 is the physical BOOT button on the Waveshare ESP32-C6 board.
+// (ESP32-C6 GPIOs are 0-30; GPIO38 does not exist on this chip.)
+#define BOOT_BUTTON_PIN          9
+// Waveshare ESP32-C6-DEV: WS2812B RGB LED is on GPIO8.
+// GPIO0 is the Flash CS0 pin and must not be used as GPIO.
+#define NEOPIXEL_PIN             8
+// No separate power-enable pin on the Waveshare ESP32-C6-DEV board.
+// Set to -1 to disable the power-pin init in setupStatusLed().
+#define NEOPIXEL_POWER_PIN      -1
 #define NEOPIXEL_BRIGHTNESS     20
-#define SD_CS_PIN               27
+
+// SD card SPI pins – Waveshare ESP32-C6 (16 MB Flash)
+// Breakout wiring: CLK→GPIO19, DO(MISO)→GPIO20, DI(MOSI)→GPIO21, CS→GPIO18
+#define SD_SCK_PIN              19   // FSPICLK  / SDIO_CLK
+#define SD_MISO_PIN             20   // FSPID    / SDIO_DATA0  (SD DO)
+#define SD_MOSI_PIN             21   // FSPIQ    / SDIO_DATA1  (SD DI)
+#define SD_CS_PIN               18   // FSPICS0  / SDIO_CMD
 
 // Network Defaults
 #define ROOT_AP_SSID            "Root_AP"
@@ -50,6 +62,26 @@
 #define COLLECTOR_AP_WINDOW_S       1200
 #define COLLECTOR_DATA_TIMEOUT_S    1200
 #define INITIAL_SYNC_TIMEOUT_MS     180000
+
+// BOOT button sampling windows (milliseconds).
+// Cold boot / hardware reset: give the user a comfortable 2-second window to
+// press BOOT before setup() commits to operational mode.
+// Scheduled (timer/BLE/WiFi) wakeup: 50 ms — fast resume is more important.
+#define BOOT_WINDOW_COLD_MS   2000UL
+#define BOOT_WINDOW_SCHED_MS    50UL
+// Hold threshold (all wakeup causes): button must be held continuously from
+// t=0 of setup() for this long to trigger Config Mode.  Handles boards where
+// pressing BOOT causes a hardware reset — user holds the button through the
+// reset and keeps holding; 5 s of continuous hold from the start of setup()
+// → config mode.  Also applies when waking from deep sleep (timer/BLE/WiFi):
+// if BOOT is still held when setup() runs, the same 5 s count triggers config.
+// Zero latency added to scheduled wakeups when button is NOT held at t=0.
+#define BOOT_HOLD_COLD_MS     5000UL
+// Loop-based BOOT hold thresholds:
+//   2 s → restart into Config Mode (settings preserved via RTC flag)
+//   5 s → factory reset + Config Mode
+#define BOOT_HOLD_CONFIG_MS   2000UL
+#define BOOT_HOLD_RESET_MS    5000UL
 
 // Buffer/File Defaults
 #define SD_CHUNK_SIZE           4096
@@ -103,6 +135,13 @@ extern SdFat sd;
 extern NodeConfig config;
 extern SemaphoreHandle_t sdCardMutex;
 extern bool isOperationalMode;
+// RTC flag set by a 2-second BOOT hold in loop() or loopOperationalMode()
+// — forces Config Mode on the next restart without erasing settings.
+extern RTC_DATA_ATTR bool rtc_force_config_mode;
+// Tracks when the BOOT button was first pressed so the hold duration can be
+// measured across multiple loop() iterations and loopOperationalMode() calls.
+// Written by both sites; they cooperate through this shared variable.
+extern unsigned long bootButtonPressTime;
 
 // Prototypes
 void loadConfiguration();
@@ -116,6 +155,7 @@ void setupStatusLed();
 void setStatusLed(Status newStatus);
 void loopStatusLed();
 bool initSdCard();
+void sdForceReinit();
 void persistRtcTime(time_t epoch);
 time_t restoreRtcTime();
 

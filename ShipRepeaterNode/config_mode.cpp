@@ -31,12 +31,37 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
     .row > div { flex:1; }
     .muted { color:#666; font-size: 0.92em; }
     .group { background:#fafafa; border:1px solid #eee; padding:12px; border-radius:8px; margin-top:16px;}
+    .upload-group { background:#fff8f0; border:1px solid #e3902a; padding:12px; border-radius:8px; margin-top:16px; }
+    .btn-upload { background:#e3902a; }
+    .btn-upload:hover { background:#c8781f; }
+    #uploadStatus { display:none; margin-top:10px; padding:8px; background:#fff3cd;
+      border:1px solid #ffc107; border-radius:4px; font-weight:bold; }
+    details > ol { margin:8px 0 0 16px; color:#444; }
   </style>
 </head>
 <body>
   <div class="container">
     <h2>Node Configuration</h2>
     <div class="id-display">Node ID: {NODE_ID}</div>
+
+    <!-- ── Firmware Upload ──────────────────────────────────────────── -->
+    <div class="upload-group">
+      <h3 style="margin-top:0">📤 Firmware Upload (Arduino IDE)</h3>
+      <div class="muted">Click below to reboot the device, then <b>immediately</b> click Upload in the Arduino IDE.<br>
+        The device will restart — esptool has a short window to begin the upload.</div>
+      <button type="button" class="btn-upload" onclick="rebootForUpload(this)">Reboot for Firmware Upload</button>
+      <div id="uploadStatus"></div>
+      <details style="margin-top:12px;">
+        <summary class="muted" style="cursor:pointer;">Manual method (if auto-reboot doesn't work)</summary>
+        <ol>
+          <li>Press and <b>hold</b> the <b>BOOT</b> button on the board</li>
+          <li>Press and release the <b>RESET</b> (EN) button</li>
+          <li>Release the <b>BOOT</b> button</li>
+          <li>Click <b>Upload</b> in Arduino IDE</li>
+        </ol>
+      </details>
+    </div>
+    <!-- ────────────────────────────────────────────────────────────── -->
     <button type="button" onclick="syncTime()">Sync Time from Browser</button>
     <div class="muted">Sets the node's clock. This is essential for scheduled operations.</div>
 
@@ -132,10 +157,11 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
       <!-- ROOT -->
       <div id="rootSettings" class="group">
         <h3>Root Settings</h3>
+        <div class="muted">Root opens a WiFi AP. Your server machine connects to that AP to communicate with Root's HTTP API (192.168.10.1:8080).</div>
         <label for="apSSID_root">Root AP SSID:</label><input type="text" id="apSSID_root" name="apSSID" placeholder="Root_AP">
         <label for="apPASS_root">Root AP Password:</label><input type="text" id="apPASS_root" name="apPASS">
         <label for="uplinkPort_root">HTTP Port:</label><input type="number" id="uplinkPort_root" name="uplinkPort" value="8080">
-        
+
         <h3>BLE Configuration</h3>
         <div class="muted">Root is always on via WiFi. BLE beacon not needed.</div>
         <label>
@@ -150,7 +176,38 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 
   <script>
     console.log('[CONFIG-JS] Script loaded');
-    
+
+    function rebootForUpload(btn) {
+      const status = document.getElementById('uploadStatus');
+      btn.disabled = true;
+      status.style.display = 'block';
+      status.style.background = '#fff3cd';
+      status.style.border = '1px solid #ffc107';
+      status.textContent = 'Sending reboot command…';
+      fetch('/reboot-bootloader', {method:'POST'})
+        .then(() => {
+          let t = 7;
+          status.style.background = '#f8d7da';
+          status.style.border = '1px solid #f5c6cb';
+          const iv = setInterval(() => {
+            t--;
+            status.textContent = '⚡ Device rebooting — click Upload in Arduino IDE NOW! (' + t + 's)';
+            if (t <= 0) {
+              clearInterval(iv);
+              status.style.background = '#fff3cd';
+              status.style.border = '1px solid #ffc107';
+              status.textContent = 'Device has rebooted. If upload failed, try the manual method above.';
+              btn.disabled = false;
+            }
+          }, 1000);
+        })
+        .catch(() => {
+          status.style.background = '#f8d7da';
+          status.textContent = 'Error contacting device. Try the manual method above.';
+          btn.disabled = false;
+        });
+    }
+
     async function syncTime() {
       const epoch = Math.floor(Date.now() / 1000);
       try {
@@ -268,16 +325,26 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 
 void startConfigurationMode() {
   setStatusLed(STATUS_CONFIG_MODE);
-  esp_task_wdt_init(30, true);
+  // Arduino framework already initialises the TWDT before setup() runs.
+  // esp_task_wdt_init() would return ESP_ERR_INVALID_STATE (leaving the short
+  // default timeout unchanged), so reconfigure the running TWDT directly.
+  esp_task_wdt_config_t wdt_cfg = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
+  if (esp_task_wdt_reconfigure(&wdt_cfg) == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_init(&wdt_cfg);
+  }
   esp_task_wdt_add(NULL);
 
-  mesh.setDebugMsgTypes(ERROR | STARTUP);
-  mesh.init(MESH_SSID, MESH_PASSWORD, &userScheduler, MESH_PORT);
-  while (mesh.getNodeId() == 0) { mesh.update(); delay(10); }
-  uint32_t nodeId = mesh.getNodeId();
-  mesh.stop();
-
-  WiFi.mode(WIFI_AP_STA); // ✅ AP + STA για Wi-Fi scan
+  // Derive a unique 32-bit node ID from the WiFi station MAC address.
+  // This avoids starting the full painlessMesh stack (which hangs in a
+  // blocking loop on ESP32-C6) just to read what is essentially the chip ID.
+  // We use mac[2..5] (the lower 4 bytes after the 2-byte OUI) to produce a
+  // 32-bit value — this is the same 4-byte window painlessMesh uses internally
+  // for its own nodeId, so the AP SSID will match what the mesh stack uses.
+  WiFi.mode(WIFI_AP_STA); // AP + STA for Wi-Fi scan
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  uint32_t nodeId = ((uint32_t)mac[2] << 24) | ((uint32_t)mac[3] << 16)
+                  | ((uint32_t)mac[4] << 8)  |  (uint32_t)mac[5];
   String ap_ssid = CONFIG_AP_SSID_PREFIX + String(nodeId);
   WiFi.softAP(ap_ssid.c_str(), CONFIG_AP_PASSWORD);
   dnsServer.start(53, "*", WiFi.softAPIP());
@@ -379,6 +446,17 @@ void startConfigurationMode() {
   });
 
   server.onNotFound([](AsyncWebServerRequest *req){ req->redirect("/"); });
+
+  // Restart the device so esptool can catch it in the ROM bootloader window.
+  // The client should trigger the Arduino IDE upload immediately after clicking.
+  // A plain esp_restart() is used; for a guaranteed ROM-bootloader entry the
+  // user must use the manual BOOT+RESET sequence described in the UI.
+  server.on("/reboot-bootloader", HTTP_POST, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", "Rebooting...");
+    delay(300);
+    ESP.restart();
+  });
+
   server.begin();
   Serial.println("[CONFIG] Web server started.");
 }
@@ -386,5 +464,20 @@ void startConfigurationMode() {
 void loopConfigurationMode(){
   dnsServer.processNextRequest();
   esp_task_wdt_reset();
+
+  // Serial shortcut: type 'B' in the Serial Monitor while in config mode to
+  // reboot immediately.  Useful when the Serial Monitor is open and the user
+  // wants to trigger a firmware upload without leaving the monitor.
+  if (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == 'B' || c == 'b') {
+      Serial.println("[CONFIG] Serial 'B' received → rebooting for firmware upload.");
+      Serial.println("[CONFIG] Trigger Upload in Arduino IDE NOW!");
+      Serial.flush();
+      delay(300);
+      ESP.restart();
+    }
+  }
+
   delay(10);
 }

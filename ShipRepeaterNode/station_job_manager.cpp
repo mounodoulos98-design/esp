@@ -9,6 +9,8 @@
 
 extern SdFat sd;
 extern bool initSdCard();
+// Defined in op_mode.cpp: upload a tiny text file to Root's /received/ via POST /upload
+extern bool notifyRoot(const String& remoteFilePath, const String& body);
 
 // ---------------------
 // Εσωτερική κατάσταση
@@ -63,9 +65,9 @@ static bool writeJsonFile(const char* path, StaticJsonDocument<16384>& doc) {
 // ---------------------
 // STATUS request:
 //   - GET /api?command=STATUS&datetime=<ms>&
-//   - Παίρνουμε S/N από το body
+//   - Παίρνουμε S/N (και προαιρετικά ολόκληρο το body) από το body
 // ---------------------
-bool sjm_requestStatus(const String& ip, String& snOut) {
+bool sjm_requestStatus(const String& ip, String& snOut, String* bodyOut) {
     if (ip.length() == 0 || ip == "0.0.0.0") return false;
 
     // Wait 2s πριν το STATUS, όπως ο daemon
@@ -136,6 +138,8 @@ bool sjm_requestStatus(const String& ip, String& snOut) {
     }
 
     Serial.printf("[STATUS] SN=%s for IP=%s\n", snOut.c_str(), ip.c_str());
+    // Return the full body to the caller if requested (used for Root notification)
+    if (bodyOut) *bodyOut = body;
     return true;
 }
 
@@ -194,9 +198,39 @@ bool processJobsForSN(const String& sn, const String& ip) {
                         fw.totalTimeoutMs = jobObj["timeout_ms"] | (8UL * 60UL * 1000UL);
 
                         Serial.printf("[JOBS] Found FW job for SN=%s\n", sn.c_str());
-                        
-                        // For COLLECTOR: ensure firmware file is downloaded from root
+
+                        // Initial STATUS check before firmware update (matches sensorsdaemon
+                        // handleFirmwareUpdate: MAX_TRIES=3, 4s delay between retries).
+                        const int STATUS_MAX_TRIES = 3;
+                        String statusSn;
+                        String statusBody;
+                        bool statusOk = false;
+                        for (int t = 0; t < STATUS_MAX_TRIES; t++) {
+                            if (sjm_requestStatus(ip, statusSn, &statusBody)) {
+                                statusOk = true;
+                                break;
+                            }
+                            Serial.printf("[JOBS] STATUS try %d/%d failed for SN=%s, retrying in 4s...\n",
+                                          t + 1, STATUS_MAX_TRIES, sn.c_str());
+                            if (t < STATUS_MAX_TRIES - 1) delay(4000);
+                        }
+                        if (!statusOk) {
+                            Serial.printf("[JOBS] Aborting FW job for SN=%s: STATUS failed after %d tries\n",
+                                          sn.c_str(), STATUS_MAX_TRIES);
+                            return false;
+                        }
+
+                        // For COLLECTOR: upload full status to Root so the server can update its DB.
                         extern NodeConfig config;
+                        if (config.role == ROLE_COLLECTOR && statusBody.length() > 0) {
+                            char statusPath[96];
+                            snprintf(statusPath, sizeof(statusPath),
+                                     "/received/status_%s_%lu.txt", sn.c_str(), (unsigned long)millis());
+                            notifyRoot(String(statusPath), statusBody);
+                            Serial.printf("[JOBS] Uploaded status to Root: %s\n", statusPath);
+                        }
+
+                        // For COLLECTOR: ensure firmware file is downloaded from root
                         extern bool downloadFileFromRoot(const String& remotePath, const String& localPath);
                         if (config.role == ROLE_COLLECTOR) {
                             if (!sd.exists(fw.hexPath.c_str())) {
@@ -255,6 +289,18 @@ bool processJobsForSN(const String& sn, const String& ip) {
                         Serial.printf("[JOBS] CONFIG job result for SN=%s -> %s\n",
                                       sn.c_str(), ok ? "OK" : "FAIL");
 
+                        // After config, get fresh STATUS and upload to Root
+                        if (ok && config.role == ROLE_COLLECTOR) {
+                            String cfgStatusSn, cfgStatusBody;
+                            if (sjm_requestStatus(ip, cfgStatusSn, &cfgStatusBody) && cfgStatusBody.length() > 0) {
+                                char cfgStatusPath[96];
+                                snprintf(cfgStatusPath, sizeof(cfgStatusPath),
+                                         "/received/status_%s_%lu.txt", sn.c_str(), (unsigned long)millis());
+                                notifyRoot(String(cfgStatusPath), cfgStatusBody);
+                                Serial.printf("[JOBS] Uploaded post-config status to Root: %s\n", cfgStatusPath);
+                            }
+                        }
+
                         // Only remove job on success
                         if (ok) {
                             arr.remove(i);
@@ -296,19 +342,32 @@ void resetJobCache() {
 // ---------------------
 extern "C" {
 #include "esp_wifi.h"
-#include "tcpip_adapter.h"
+#include "esp_netif.h"
 }
 
 static void updateStationIPs() {
     wifi_sta_list_t wifi_sta_list;
-    tcpip_adapter_sta_list_t adapter_sta_list;
     memset(&wifi_sta_list, 0, sizeof(wifi_sta_list));
-    memset(&adapter_sta_list, 0, sizeof(adapter_sta_list));
 
-    if (esp_wifi_ap_get_sta_list(&wifi_sta_list) != ESP_OK) {
+    if (esp_wifi_ap_get_sta_list(&wifi_sta_list) != ESP_OK || wifi_sta_list.num == 0) {
         return;
     }
-    if (tcpip_adapter_get_sta_list(&wifi_sta_list, &adapter_sta_list) != ESP_OK) {
+
+    esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!ap_netif) {
+        return;
+    }
+
+    // esp_netif_dhcps_get_clients_by_mac: caller fills MAC, function fills IP.
+    // Available in IDF 5.0+ (official replacement for removed esp_netif_get_sta_list).
+    esp_netif_pair_mac_ip_t pairs[ESP_WIFI_MAX_CONN_NUM];
+    memset(pairs, 0, sizeof(pairs));
+    int num = (wifi_sta_list.num < ESP_WIFI_MAX_CONN_NUM) ? wifi_sta_list.num : ESP_WIFI_MAX_CONN_NUM;
+    for (int i = 0; i < num; i++) {
+        memcpy(pairs[i].mac, wifi_sta_list.sta[i].mac, sizeof(wifi_sta_list.sta[i].mac));
+    }
+
+    if (esp_netif_dhcps_get_clients_by_mac(ap_netif, num, pairs) != ESP_OK) {
         return;
     }
 
@@ -316,18 +375,15 @@ static void updateStationIPs() {
         // Αν έχουμε ήδη κανονική IP (όχι 0.0.0.0), δεν χρειάζεται update
         if (st.ip.length() > 0 && st.ip != "0.0.0.0") continue;
 
-        for (int j = 0; j < adapter_sta_list.num; ++j) {
-            const wifi_sta_info_t& wi = wifi_sta_list.sta[j];
-            const tcpip_adapter_sta_info_t& ai = adapter_sta_list.sta[j];
-
+        for (int j = 0; j < num; ++j) {
             char macStr[20];
             sprintf(macStr, "%02x:%02x:%02x:%02x:%02x:%02x",
-                    wi.mac[0], wi.mac[1], wi.mac[2],
-                    wi.mac[3], wi.mac[4], wi.mac[5]);
+                    pairs[j].mac[0], pairs[j].mac[1], pairs[j].mac[2],
+                    pairs[j].mac[3], pairs[j].mac[4], pairs[j].mac[5]);
 
             if (!st.mac.equalsIgnoreCase(String(macStr))) continue;
 
-            uint32_t ipraw = ai.ip.addr;
+            uint32_t ipraw = pairs[j].ip.addr;
             if (ipraw == 0) {
                 // DHCP δεν έχει δώσει IP ακόμα, μην γράψεις 0.0.0.0
                 continue;
@@ -339,9 +395,7 @@ static void updateStationIPs() {
                 (ipraw >> 16) & 0xFF,
                 (ipraw >> 24) & 0xFF
             );
-            String ipStr = ipAddr.toString();
-
-            st.ip = ipStr;
+            st.ip = ipAddr.toString();
             Serial.printf("[SJM] MAC %s -> IP %s\n",
                           st.mac.c_str(), st.ip.c_str());
         }

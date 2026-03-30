@@ -5,10 +5,12 @@
 #include <ArduinoJson.h>
 #include <vector>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <sys/time.h>
 #include "sensor_heartbeat_manager.h"
 #include "ble_mesh_beacon.h"
+#include <driver/gpio.h>  // gpio_wakeup_enable / esp_sleep_enable_gpio_wakeup
 
 
 
@@ -75,6 +77,7 @@ std::map<String, std::vector<uint8_t>> rxBufs;  // (kept for possible future use
 bool sdDeferredSave = false;
 State currentState;
 bool apActive = false;
+bool rptWifiAPUp = false;  // true when REPEATER WiFi AP is currently running
 bool needToSyncTime = false;
 // Κάπου δίπλα στα άλλα singletons
 static SensorHeartbeatManager heartbeatManager;
@@ -131,14 +134,73 @@ static void bufferHeartbeat(const String& sn, const String& ip, bool needsJobChe
   hbBufferWriteIdx = nextIdx;
 }
 
-// Forward declaration - implemented after ensureDir
+// === Measure Upload Ring Buffer ===
+// The /api/measure body callback runs in the async_tcp FreeRTOS task.
+// Calling SdFat (SPI) from that context causes xTaskPriorityDisinherit
+// mutex assertion crashes (see comment above re: SD writer task removal).
+// Instead, each incoming chunk is written into this lock-free ring buffer;
+// the main loop drains it to the SD card where SPI access is safe.
+#define MEASURE_RING_SIZE (64 * 1024)
+static uint8_t         s_measureRing[MEASURE_RING_SIZE];
+static volatile size_t s_measureRingHead  = 0;   // written by async_tcp callback
+static volatile size_t s_measureRingTail  = 0;   // read by main loop
+static volatile bool   s_measureActive    = false;
+static volatile bool   s_measureSendDone  = false;
+static volatile bool   s_measureDrainComplete = false; // set by main loop when file is closed
+static volatile size_t s_measureTotalBytes = 0;
+static char            s_measureQueuePath[64];
+
+static inline size_t measureRingUsed() {
+  // Volatile reads: safe on single-core ESP32-C6 where only one task runs at
+  // a time; no additional memory barriers required.
+  size_t h = s_measureRingHead, t = s_measureRingTail;
+  return (h >= t) ? (h - t) : (MEASURE_RING_SIZE - t + h);
+}
+static inline size_t measureRingFree() {
+  return MEASURE_RING_SIZE - 1 - measureRingUsed();
+}
+// Write bytes into ring buffer; returns bytes actually written.
+// Single-producer / single-consumer: safe when only the async_tcp task writes
+// and only the main-loop task reads.
+static size_t measureRingWrite(const uint8_t* src, size_t len) {
+  size_t written = 0;
+  while (written < len) {
+    size_t free = measureRingFree();
+    if (free == 0) break;
+    size_t h = s_measureRingHead;
+    size_t canWrite = MEASURE_RING_SIZE - h;
+    if (canWrite > free)       canWrite = free;
+    if (canWrite > len - written) canWrite = len - written;
+    memcpy(s_measureRing + h, src + written, canWrite);
+    s_measureRingHead = (h + canWrite) & (MEASURE_RING_SIZE - 1);
+    written += canWrite;
+  }
+  return written;
+}
+
+// Forward declarations - both functions are defined later in this file
+static void drainMeasureBuffer();
 static void processHeartbeatBuffer();
+bool notifyRoot(const String& remoteFilePath, const String& body);
 
 // Collector AP State (sensor intake / command execution)
 bool hadStation = false;
 unsigned long lastActivityMillis = 0;
 unsigned long lastHeartbeatMillis = 0;  // Track last actual heartbeat from any sensor
 static WiFiEventId_t stationConnectedEventId;
+
+// Sensor completion tracking: SNs that finished all stages this AP window
+static std::set<String> doneSensors;
+// AP session start time for uplink window miss detection
+static time_t apSessionStartTime = 0;
+// Grace period (ms) after all sensors complete their full flow before sleeping.
+// Applied both when sensors have disconnected AND when they remain connected-but-silent.
+static const unsigned long SENSOR_DONE_GRACE_MS = 30000UL; // 30 seconds
+
+// IPs that have completed a POST /api/measure this AP session.
+// Used to distinguish pre-measurement heartbeats (→ STATUS, no jobs) from
+// post-measurement heartbeats (→ check jobs/firmware, mark done).
+static std::set<String> measuredIPs;
 
 // RTC Memory
 RTC_DATA_ATTR time_t rtc_last_known_time = 0;
@@ -168,6 +230,87 @@ static void ensureDir(const char* path) {
     } else {
       Serial.printf("[SD] mkdir(%s) OK\n", path);
     }
+  }
+}
+
+// Drain the measure upload ring buffer to an SD queue file.
+// MUST be called from the main loop only – SD/SPI access is safe here.
+// Used by both COLLECTOR (POST /api/measure) and REPEATER (POST /ingest).
+static void drainMeasureBuffer() {
+  if (!s_measureActive && measureRingUsed() == 0) return;
+
+  static FsFile measureFile;
+  static bool   measureFileOpen     = false;
+  static size_t measureBytesWritten = 0;
+
+  // Open the queue file the first time we are called after an upload starts.
+  if (!measureFileOpen && s_measureActive) {
+    if (initSdCard()) {
+      // Ensure the queue directory exists every time we try to open a new file.
+      // (ensureDir is called during AP setup but we re-check here in case the
+      // SD was reinitialized or the directory is missing for any other reason.)
+      ensureDir(QUEUE_DIR);
+
+      // Use O_RDWR so the open works regardless of the SdFat2 build variant.
+      measureFile = sd.open(s_measureQueuePath, O_RDWR | O_CREAT | O_TRUNC);
+      if (!measureFile) {
+        // First attempt failed. Force SD re-initialisation and retry once.
+        Serial.printf("[UPLOAD] ERROR: cannot open queue file %s – retrying after SD reinit\n",
+                      s_measureQueuePath);
+        sdForceReinit();
+        if (initSdCard()) {
+          ensureDir(QUEUE_DIR);
+          measureFile = sd.open(s_measureQueuePath, O_RDWR | O_CREAT | O_TRUNC);
+        }
+      }
+      if (measureFile) {
+        measureFileOpen     = true;
+        measureBytesWritten = 0;
+        Serial.printf("[UPLOAD] Streaming to queue: %s\n", s_measureQueuePath);
+      } else {
+        Serial.printf("[UPLOAD] ERROR: cannot open queue file %s\n", s_measureQueuePath);
+      }
+    }
+  }
+
+  // Write all currently available ring-buffer bytes to the SD file.
+  size_t avail = measureRingUsed();
+  if (avail > 0) {
+    // Treat ongoing drain as activity so the AP inactivity timer does not fire
+    // while a slow SD write is keeping the ring busy.
+    lastActivityMillis = millis();
+  }
+  while (avail > 0) {
+    size_t t        = s_measureRingTail;
+    size_t canRead  = MEASURE_RING_SIZE - t;
+    if (canRead > avail) canRead = avail;
+    if (measureFileOpen) {
+      size_t wrote = measureFile.write(s_measureRing + t, canRead);
+      measureBytesWritten += wrote;
+      if (wrote != canRead) {
+        Serial.printf("[UPLOAD] SD write error: %u/%u bytes written\n",
+                      (unsigned)wrote, (unsigned)canRead);
+      }
+    }
+    s_measureRingTail = (t + canRead) & (MEASURE_RING_SIZE - 1);
+    avail -= canRead;
+  }
+
+  // When all data has been received AND the ring buffer is fully drained, close.
+  if (s_measureSendDone && measureRingUsed() == 0) {
+    if (measureFileOpen) {
+      measureFile.close();
+      measureFileOpen = false;
+      Serial.printf("[UPLOAD] Saved to queue: %s (%u bytes)\n",
+                    s_measureQueuePath, (unsigned)measureBytesWritten);
+      s_measureDrainComplete = true;  // signal caller (e.g. Repeater) that file is on SD
+    } else {
+      Serial.printf("[UPLOAD] Dropped (SD open failed, %u bytes lost).\n",
+                    (unsigned)s_measureTotalBytes);
+    }
+    s_measureActive    = false;
+    s_measureSendDone  = false;
+    measureBytesWritten = 0;
   }
 }
 
@@ -221,6 +364,17 @@ static void processHeartbeatBuffer() {
                          statusFile, (int)entry.statusDataLen);
           }
         }
+        
+        // For COLLECTOR: notify Root about this heartbeat so the server can track it.
+        // Root stores the tiny file in /received/hb_<SN>_<ts>.txt.
+        if (config.role == ROLE_COLLECTOR) {
+          char notifyPath[96];
+          snprintf(notifyPath, sizeof(notifyPath), "/received/hb_%s_%lu.txt",
+                   sn.c_str(), (unsigned long)now);
+          String hbBody = String(timestamp) + "," + sn + "," + ip + "\n";
+          notifyRoot(String(notifyPath), hbBody);
+          Serial.printf("[HB-BUFFER] Notified Root: %s\n", notifyPath);
+        }
       }
       
       // Execute jobs if needed
@@ -232,6 +386,10 @@ static void processHeartbeatBuffer() {
         } else {
           Serial.printf("[HB-BUFFER] No jobs found for SN=%s\n", sn.c_str());
         }
+        // Sensor has completed all stages (status → measurement → jobs/firmware).
+        // Mark it done so the AP can use a short grace period before sleeping.
+        doneSensors.insert(sn);
+        Serial.printf("[HB-BUFFER] Sensor SN=%s marked as done (all stages complete).\n", sn.c_str());
       }
       
       entry.hasData = false;
@@ -326,10 +484,10 @@ static void debugPrintTime(const char* tag) {
   time(&now);
   struct tm* t = localtime(&now);
   if (t)
-    Serial.printf("[DEBUG_TIME] %s -> %04d-%02d-%02d %02d:%02d:%02d (epoch=%ld)\n",
+    Serial.printf("[DEBUG_TIME] %s -> %04d-%02d-%02d %02d:%02d:%02d (epoch=%lld)\n",
                   tag,
                   t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-                  t->tm_hour, t->tm_min, t->tm_sec, now);
+                  t->tm_hour, t->tm_min, t->tm_sec, (long long)now);
   else
     Serial.printf("[DEBUG_TIME] %s -> invalid time\n", tag);
 }
@@ -453,35 +611,155 @@ void ensureRootHttpServer() {
   });
 
   // Multipart/form-data upload to /ingest
+  // NOTE: Do NOT call SdFat/SPI from this callback – it runs in the async_tcp
+  // FreeRTOS task and causes xTaskPriorityDisinherit mutex crashes on ESP32-C6.
+  // Write chunks into the shared ring buffer; drainMeasureBuffer() (ROOT main
+  // loop) will write them to SD where SPI access is safe.
   rootServer.on(
     "/ingest", HTTP_POST,
     [](AsyncWebServerRequest* request) {},
     [](AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final) {
-      static FsFile upFile;
-      static String current;
       if (index == 0) {
+        s_measureRingHead      = 0;
+        s_measureRingTail      = 0;
+        s_measureSendDone      = false;
+        s_measureDrainComplete = false;
         char name[64];
         snprintf(name, sizeof(name), "%lu_", (unsigned long)millis());
-        current = String(RECEIVED_DIR) + "/" + name + filename;
-        upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
-        Serial.printf("[ROOT] Receiving file: %s\n", current.c_str());
+        snprintf(s_measureQueuePath, sizeof(s_measureQueuePath),
+                 "%s/%s%s", RECEIVED_DIR, name, filename.c_str());
+        s_measureActive = true;
+        Serial.printf("[ROOT] /ingest: streaming %s\n", s_measureQueuePath);
       }
-      if (upFile) { upFile.write(data, len); }
+      if (!s_measureActive) return;
+      size_t remaining = len;
+      const uint8_t* ptr = data;
+      while (remaining > 0) {
+        size_t wrote = measureRingWrite(ptr, remaining);
+        ptr       += wrote;
+        remaining -= wrote;
+        if (remaining > 0) vTaskDelay(pdMS_TO_TICKS(1));
+      }
       if (final) {
-        if (upFile) upFile.close();
+        s_measureSendDone = true;
+        // Respond immediately: the data is buffered in RAM and will be written
+        // to SD asynchronously by drainMeasureBuffer() in the ROOT main loop.
+        // This matches the same pattern used for COLLECTOR's /api/measure.
         request->send(200, "text/plain", "OK");
-        Serial.printf("[ROOT] Saved file: %s\n", current.c_str());
+        Serial.printf("[ROOT] /ingest: all data received for %s\n", s_measureQueuePath);
       }
     });
 
+  // Server pushes jobs/firmware to Root: POST /upload?path=/jobs/config_jobs.json
+  // Body is raw file content (JSON or hex). Used by sensorsdaemon/server to deliver jobs.
+  // NOTE: Do NOT call SdFat/SPI from this callback – it runs in the async_tcp
+  // FreeRTOS task and causes xTaskPriorityDisinherit mutex crashes on ESP32-C6.
+  // Write chunks into the shared ring buffer; drainMeasureBuffer() (ROOT main
+  // loop) will write them to SD where SPI access is safe.
+  rootServer.on(
+    "/upload",
+    HTTP_POST,
+    [](AsyncWebServerRequest* request) {
+      request->send(400, "text/plain", "Expected body");
+    },
+    nullptr,
+    [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
+      if (!request->hasParam("path")) {
+        request->send(400, "text/plain", "Missing ?path= parameter");
+        return;
+      }
+      String filePath = request->getParam("path")->value();
+      // Restrict to safe directories: /jobs/, /firmware/, /received/ (Collector writes status/HB)
+      if (!filePath.startsWith("/jobs/") && !filePath.startsWith("/firmware/") && !filePath.startsWith("/received/")) {
+        request->send(403, "text/plain", "Forbidden path");
+        return;
+      }
+      if (index == 0) {
+        s_measureRingHead      = 0;
+        s_measureRingTail      = 0;
+        s_measureSendDone      = false;
+        s_measureDrainComplete = false;
+        snprintf(s_measureQueuePath, sizeof(s_measureQueuePath), "%s", filePath.c_str());
+        s_measureActive = true;
+        Serial.printf("[ROOT] /upload: streaming to %s\n", filePath.c_str());
+      }
+      if (!s_measureActive) return;
+      size_t remaining = len;
+      const uint8_t* ptr = data;
+      while (remaining > 0) {
+        size_t wrote = measureRingWrite(ptr, remaining);
+        ptr       += wrote;
+        remaining -= wrote;
+        if (remaining > 0) vTaskDelay(pdMS_TO_TICKS(1));
+      }
+      if (index + len == total) {
+        s_measureSendDone = true;
+        // Respond immediately: the data is buffered in RAM and will be written
+        // to SD asynchronously by drainMeasureBuffer() in the ROOT main loop.
+        // This matches the same pattern used for COLLECTOR's /api/measure.
+        request->send(200, "text/plain", "OK");
+        Serial.printf("[ROOT] /upload: all data received for %s (%u bytes)\n",
+                      filePath.c_str(), (unsigned)total);
+      }
+    });
+
+  // List files in a directory: GET /list?dir=/received  (returns JSON array of names)
+  rootServer.on("/list", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!req->hasParam("dir")) { req->send(400, "text/plain", "Missing ?dir="); return; }
+    String dir = req->getParam("dir")->value();
+    if (!dir.startsWith("/received") && !dir.startsWith("/jobs") && !dir.startsWith("/firmware")) {
+      req->send(403, "text/plain", "Forbidden"); return;
+    }
+    if (!initSdCard()) { req->send(503, "text/plain", "SD unavailable"); return; }
+    FsFile d = sd.open(dir.c_str());
+    if (!d || !d.isDir()) { req->send(404, "text/plain", "Directory not found"); return; }
+    String json = "[";
+    bool first = true;
+    while (true) {
+      FsFile f = d.openNextFile();
+      if (!f) break;
+      if (f.isDir()) { f.close(); continue; }
+      char fname[64];
+      f.getName(fname, sizeof(fname));
+      f.close();
+      if (!first) json += ",";
+      json += "\"";
+      json += String(fname);
+      json += "\"";
+      first = false;
+    }
+    d.close();
+    json += "]";
+    req->send(200, "application/json", json);
+  });
+
+  // Download a specific file: GET /download?path=/received/foo.csv
+  rootServer.on("/download", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!req->hasParam("path")) { req->send(400, "text/plain", "Missing ?path="); return; }
+    String filePath = req->getParam("path")->value();
+    if (!filePath.startsWith("/received/") && !filePath.startsWith("/jobs/")) {
+      req->send(403, "text/plain", "Forbidden"); return;
+    }
+    if (!initSdCard()) { req->send(503, "text/plain", "SD unavailable"); return; }
+    if (!sd.exists(filePath.c_str())) { req->send(404, "text/plain", "Not found"); return; }
+    FsFile f = sd.open(filePath.c_str(), O_RDONLY);
+    if (!f) { req->send(500, "text/plain", "Cannot open file"); return; }
+    String content = "";
+    content.reserve(f.size() + 1);
+    while (f.available()) content += (char)f.read();
+    f.close();
+    req->send(200, "application/octet-stream", content);
+  });
+
   rootServer.begin();
   rootHttpActive = true;
-  Serial.println("[ROOT] HTTP server started on :8080 (/health, /time, /ingest, /jobs, /firmware)");
+  Serial.println("[ROOT] HTTP server started on :8080 (/health /time /ingest /upload /list /download /jobs /firmware)");
 }
 
 void ensureWiFiAPRepeater() {
-  static bool up = false;
-  if (up) return;
+  // Use rptWifiAPUp (file-scope) instead of a one-shot static flag so the AP
+  // can be restarted after being shut down for idle power saving.
+  if (rptWifiAPUp) return;
   String ssid = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
   String pass = config.apPASS;
   String ipStr = config.apIP.length() ? config.apIP : String("192.168.20.1");
@@ -491,7 +769,7 @@ void ensureWiFiAPRepeater() {
   } else {
     Serial.println("[REPEATER] Failed to start AP!");
   }
-  up = ok;
+  rptWifiAPUp = ok;
 }
 
 // =============================
@@ -504,9 +782,11 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
   if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
   if (WiFi.status() != WL_CONNECTED) {
     Serial.printf("[TIME] STA to %s...\n", config.uplinkSSID.c_str());
+    WiFi.disconnect(false);
+    delay(50);
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeout_ms) { delay(200); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeout_ms) { esp_task_wdt_reset(); delay(200); }
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[TIME] STA connect failed");
@@ -554,8 +834,14 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
   return false;
 }
 
+// Set to true by the /ingest body handler when a file has been fully written to
+// the SD queue.  The main Repeater loop drains it by uploading to Root.
+static volatile bool rptPendingUpload = false;
+
 void ensureRepeaterHttpServer() {
   if (repeaterHttpActive) return;
+
+  // /time – serve current epoch so Collectors can sync their clock
   rptServer.on("/time", HTTP_GET, [](AsyncWebServerRequest* req) {
     time_t now;
     time(&now);
@@ -563,14 +849,121 @@ void ensureRepeaterHttpServer() {
     String json = String("{\"epoch\":") + String((unsigned long)now) + "}";
     req->send(200, "application/json", json);
   });
+
+  // /ingest – receive a queue file from a Collector and store it locally.
+  // The main loop will forward it to Root during the next uplink opportunity.
+  rptServer.on(
+    "/ingest",
+    HTTP_POST,
+    [](AsyncWebServerRequest* req) {
+      // Called after all body chunks have been received.
+      String senderIP = req->client()->remoteIP().toString();
+      Serial.printf("[REPEATER] /ingest complete from %s\n", senderIP.c_str());
+      // If the Collector included its current epoch, sync our clock from it.
+      // This lets a Repeater with no upstream get valid time from a connected Collector.
+      if (req->hasHeader("X-Epoch")) {
+        unsigned long senderEpoch = strtoul(req->header("X-Epoch").c_str(), nullptr, 10);
+        if (senderEpoch > 1700000000UL) {
+          time_t curEpoch;
+          time(&curEpoch);
+          if (curEpoch < 1700000000UL) {
+            struct timeval tv = { .tv_sec = (time_t)senderEpoch, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            persistRtcTime((time_t)senderEpoch);
+            needToSyncTime = false;
+            Serial.printf("[REPEATER] Clock synced from Collector: epoch=%lu\n", senderEpoch);
+          }
+        }
+      }
+      req->send(200, "text/plain", "OK");
+      // NOTE: rptPendingUpload is set by the main loop AFTER drainMeasureBuffer()
+      // confirms the file is on SD.  Do NOT set it here.
+    },
+    nullptr,
+    [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index, size_t total) {
+      // NOTE: Do NOT call SdFat/SPI here – this runs in the async_tcp FreeRTOS
+      // task and causes xTaskPriorityDisinherit mutex crashes.
+      // Write chunks to the shared ring buffer; drainMeasureBuffer() (main loop)
+      // will write them to SD and set s_measureDrainComplete when done.
+      esp_task_wdt_reset();
+
+      if (index == 0) {
+        s_measureRingHead   = 0;
+        s_measureRingTail   = 0;
+        s_measureSendDone   = false;
+        s_measureDrainComplete = false;
+        s_measureTotalBytes = total;
+        String senderIP = req->client()->remoteIP().toString();
+        Serial.printf("[REPEATER] /ingest started from %s (total=%u bytes)\n",
+                      senderIP.c_str(), (unsigned)total);
+        snprintf(s_measureQueuePath, sizeof(s_measureQueuePath),
+                 "/queue/relay_%08lu.bin", (unsigned long)millis());
+        s_measureActive = true;
+      }
+
+      if (!s_measureActive) return;
+
+      size_t remaining = len;
+      const uint8_t* ptr = data;
+      while (remaining > 0) {
+        size_t wrote = measureRingWrite(ptr, remaining);
+        ptr       += wrote;
+        remaining -= wrote;
+        if (remaining > 0) {
+          vTaskDelay(pdMS_TO_TICKS(1));
+        }
+      }
+
+      if (total > 0 && index + len >= total) {
+        s_measureSendDone = true;
+      }
+    }
+  );
+
   rptServer.begin();
   repeaterHttpActive = true;
-  Serial.println("[REPEATER] HTTP /time ready on :8080");
+  Serial.println("[REPEATER] HTTP /time + /ingest ready on :8080");
 }
 
 // =============================
 // Collector: HTTP upload to Root
 // =============================
+
+// Notify Root about a small sensor event by writing a tiny file via POST /upload.
+// Used by Collector to push heartbeat and status data to Root's /received/ directory.
+bool notifyRoot(const String& remoteFilePath, const String& body) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  String targetHost = config.uplinkHost;
+  if (targetHost.length() == 0 || targetHost == "Auto" || targetHost == "auto") {
+    IPAddress gw = WiFi.gatewayIP();
+    targetHost = gw.toString();
+  }
+
+  WiFiClient client;
+  if (!client.connect(targetHost.c_str(), config.uplinkPort)) {
+    Serial.printf("[NOTIFY] Cannot connect to root %s:%d\n", targetHost.c_str(), config.uplinkPort);
+    return false;
+  }
+
+  String url = "/upload?path=" + remoteFilePath;
+  String req = "POST " + url + " HTTP/1.1\r\n";
+  req += "Host: " + targetHost + "\r\n";
+  req += "Content-Type: text/plain\r\n";
+  req += "Content-Length: " + String(body.length()) + "\r\n";
+  req += "Connection: close\r\n\r\n";
+  req += body;
+  client.print(req);
+
+  unsigned long t0 = millis();
+  while (client.connected() && millis() - t0 < 5000) {
+    while (client.available()) { client.read(); t0 = millis(); }
+    delay(10);
+  }
+  client.stop();
+  return true;
+}
+
 bool uploadFileToRoot(const String& fullPath, const String& basename) {
   if (!initSdCard()) return false;
   FsFile f = sd.open(fullPath.c_str(), O_RDONLY);
@@ -585,9 +978,11 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
   if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
   if (WiFi.status() != WL_CONNECTED) {
     Serial.printf("[UPLINK] Connecting STA to %s...\n", config.uplinkSSID.c_str());
+    WiFi.disconnect(false);
+    delay(50);
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(200); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { esp_task_wdt_reset(); delay(200); }
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[UPLINK] STA connect failed");
@@ -614,6 +1009,12 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
   String boundary = "----esp32bound" + String(millis());
   String head = "POST /ingest HTTP/1.1\r\nHost: " + targetHost + "\r\n";
   head += "Connection: close\r\nContent-Type: multipart/form-data; boundary=" + boundary + "\r\n";
+  // Include our current epoch so the Repeater can sync its clock from us.
+  time_t nowEpoch;
+  time(&nowEpoch);
+  if (nowEpoch > 1700000000UL) {
+    head += "X-Epoch: " + String((unsigned long)nowEpoch) + "\r\n";
+  }
   String pre = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"" + basename + "\"\r\nContent-Type: application/octet-stream\r\n\r\n";
   String post = "\r\n--" + boundary + "--\r\n";
   uint32_t contentLength = pre.length() + fsize + post.length();
@@ -649,9 +1050,11 @@ bool downloadFileFromRoot(const String& remotePath, const String& localPath) {
   if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
   if (WiFi.status() != WL_CONNECTED) {
     Serial.printf("[DOWNLOAD] Connecting STA to %s...\n", config.uplinkSSID.c_str());
+    WiFi.disconnect(false);
+    delay(50);
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(200); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { esp_task_wdt_reset(); delay(200); }
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[DOWNLOAD] STA connect failed");
@@ -978,7 +1381,14 @@ void initializeTime() {
 void startOperationalMode() {
   WiFi.mode(WIFI_OFF);
   delay(200);
-  esp_task_wdt_init(30, true);
+  esp_task_wdt_config_t wdt_cfg = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
+  // Arduino framework always initialises the TWDT before setup() runs.
+  // Calling esp_task_wdt_init() again would print an error and return
+  // ESP_ERR_INVALID_STATE, so reconfigure the already-running TWDT directly.
+  // Fall back to init() only when the TWDT has not been started yet.
+  if (esp_task_wdt_reconfigure(&wdt_cfg) == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_init(&wdt_cfg);
+  }
   esp_task_wdt_add(NULL);
   Serial.printf("[BOOT] Wake cause=%d, rtc_last_sleep_duration_s=%u\n",
                 (int)esp_sleep_get_wakeup_cause(), rtc_last_sleep_duration_s);
@@ -1015,7 +1425,7 @@ void stopAPMode() {
 }
 
 void goToDeepSleep(unsigned int seconds) {
-  if (seconds < 2) seconds = 2;
+  if (seconds < 10) seconds = 10;
   setStatusLed(STATUS_SLEEPING);
   time_t now;
   time(&now);
@@ -1028,15 +1438,44 @@ void goToDeepSleep(unsigned int seconds) {
   rtc_last_sleep_duration_s = seconds;
   stopAPMode();
   
-  // Stop BLE before deep sleep
-  if (config.bleBeaconEnabled) {
-    bleBeacon.stop();
-    Serial.println("[BLE-MESH] Stopped BLE beacon before sleep");
-  }
+  // Stop ALL BLE before deep sleep — both the beacon (Repeater/Root) and the
+  // scanner (Collector/Repeater).  ESP-IDF requires Bluetooth to be fully
+  // stopped before calling esp_deep_sleep_start(); leaving either active can
+  // cause deep sleep to fail and the chip to reboot into download mode.
+  // Both stop() functions check their own isInitialized flag and are no-ops
+  // when the respective BLE object was never started.
+  bleBeacon.stop();
+  bleScanner.stop();
+  Serial.println("[BLE-MESH] BLE stopped before deep sleep");
   
   Serial.printf("[SLEEP] Entering deep sleep for %u seconds.\n", seconds);
+  // NOTE: On ESP32-C6, deep-sleep GPIO wakeup is only supported for LP GPIOs
+  // (GPIO0–7). The BOOT button is on GPIO9, which is NOT an LP GPIO, so it
+  // cannot be registered as a deep-sleep wakeup source. Attempting to do so
+  // produces "gpio 9 is an invalid deep sleep wakeup IO" and is harmless but
+  // noisy. The BOOT button is therefore NOT a valid deep-sleep wakeup source
+  // on this hardware; users must use the hold-during-reset method or the
+  // /reboot-bootloader web endpoint to enter Config Mode instead.
+
+  // Release the SD card and SPI bus before entering deep sleep.
+  // On ESP32-C6 the HP (digital) GPIO domain is powered off in deep sleep,
+  // so GPIO pins revert to their reset default (floating input) unless the
+  // hold function is enabled.  If SD_CS_PIN floats LOW the SD card will be
+  // selected during sleep and may receive spurious SPI traffic, leaving it in
+  // a confused state that prevents a clean init on the next wake.
+  // Solution: end the SdFat session, deassert CS explicitly, then lock the
+  // pin HIGH via gpio_hold_en() so it stays deasserted through deep sleep.
+  // sd.end() and SPI.end() are safe to call unconditionally: SdFat's end()
+  // is a no-op if begin() was never called or already failed, and the Arduino
+  // SPI class handles an unmatched end() gracefully.
+  sd.end();
+  SPI.end();
+  delay(5);
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+  gpio_hold_en((gpio_num_t)SD_CS_PIN);
+
   esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
-  delay(200);
   esp_deep_sleep_start();
 }
 
@@ -1066,10 +1505,27 @@ void decideAndGoToSleep() {
   printSchedulerInfo(now);
 
   uint32_t uplink_interval_s = config.meshIntervalMin * 60;  // reuse field
-  uint32_t time_to_next_uplink = uplink_interval_s - (now % uplink_interval_s);
+  uint32_t elapsed_in_interval = (uint32_t)(now % uplink_interval_s);
+  uint32_t time_to_next_uplink = uplink_interval_s - elapsed_in_interval;
   uint32_t sleep_for;
 
   if (config.role == ROLE_COLLECTOR) {
+    // If the uplink window occurred while the AP session was active (or is still active),
+    // transition directly to the uplink state instead of sleeping.
+    // last_uplink_boundary is the start of the most recent uplink window.
+    // apSessionStartTime is reset to 0 here (both branches) so this check fires at most
+    // once per AP session; the STATE_MESH_APPOINTMENT path then sets apSessionStartTime = 0
+    // (already done), preventing repeated triggering.
+    time_t last_uplink_boundary = now - (time_t)elapsed_in_interval;
+    if (apSessionStartTime > 0 && last_uplink_boundary >= apSessionStartTime) {
+      Serial.printf("[SCHEDULER] Uplink window (boundary=%lu) occurred during AP session (start=%lu); going to UPLINK now.\n",
+                    (unsigned long)last_uplink_boundary, (unsigned long)apSessionStartTime);
+      apSessionStartTime = 0; // Reset so this is a one-shot transition per AP session
+      currentState = STATE_MESH_APPOINTMENT;
+      return;  // No sleep; handle uplink in next loop iteration
+    }
+    apSessionStartTime = 0; // No uplink missed; clear for next AP session
+
     uint32_t time_to_next_ap = config.collectorApCycleSec - (now % config.collectorApCycleSec);
 
     if (time_to_next_uplink <= time_to_next_ap) {
@@ -1095,13 +1551,9 @@ void decideAndGoToSleep() {
       sleep_for = time_to_next_ap;
     }
   } else if (config.role == ROLE_REPEATER) {
-    // REPEATER → stays awake with BLE beacon active
-    // Don't go to deep sleep - allows instant wake-up by collectors
-    // Note: Light sleep is managed by the Arduino/ESP-IDF framework automatically
-    // when CPU is idle. BLE beacon continues advertising during light sleep.
-    // Original scheduling logic removed: Repeater no longer uses scheduled uplink windows,
-    // instead stays continuously available for collectors to connect at any time.
-    Serial.println("[SCHEDULER] Repeater stays active with BLE beacon (automatic light sleep)");
+    // REPEATER: light sleep is handled directly in loopOperationalMode() with
+    // BLE and WiFi wakeup sources. Reaching here is unexpected.
+    Serial.println("[SCHEDULER] WARN: Repeater reached decideAndGoToSleep() unexpectedly; light sleep managed in main loop");
     return; // Don't call goToDeepSleep
   } else {
     // ROOT → always on, should never reach here
@@ -1118,43 +1570,282 @@ void decideAndGoToSleep() {
 void loopOperationalMode() {
   esp_task_wdt_reset();
 
+  // ── BOOT button hold check (all roles) ───────────────────────────────────
+  // Checked here — before any role-specific blocking call — so the 2 s / 5 s
+  // hold is detected reliably for REPEATER (light-sleep iterations) and ROOT
+  // (always-on AP, no deep sleep) as well as for COLLECTOR (AP-window loop).
+  // The same logic also lives in loop() as a safety net; both use the shared
+  // bootButtonPressTime variable so they cooperate correctly.
+  // LED feedback: STATUS_ERROR (red rapid blink) is shown after 500 ms of
+  // hold so the user has visual confirmation that the gesture is registered.
+  if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+    if (bootButtonPressTime == 0) bootButtonPressTime = millis();
+    unsigned long held = millis() - bootButtonPressTime;
+    if (held > BOOT_HOLD_RESET_MS) {
+      Serial.println("[BOOT] 5-second hold: factory reset triggered!");
+      factoryReset();
+      ESP.restart();
+    } else if (held > BOOT_HOLD_CONFIG_MS) {
+      Serial.println("[BOOT] 2-second hold: entering Config Mode (settings preserved).");
+      rtc_force_config_mode = true;
+      ESP.restart();
+    } else if (held > 500) {
+      setStatusLed(STATUS_ERROR);  // red rapid blink: keep holding for config mode
+    }
+  } else {
+    if (bootButtonPressTime != 0) setStatusLed(STATUS_OPERATIONAL_IDLE);
+    bootButtonPressTime = 0;
+  }
+
   // ROOT
   if (config.role == ROLE_ROOT) {
     ensureWiFiAPRoot();
     ensureRootHttpServer();
-    
-    // Root doesn't need BLE - always on and accessible via WiFi
-    
+
+    // Root is always-on AP. The server connects to Root's AP (Root_AP) to
+    // communicate with Root's HTTP API. No STA connection needed from Root.
+
+    // Drain ring-buffered /ingest and /upload data to SD (safe – main loop context).
+    // Must run here; SdFat/SPI must NOT be called from async callbacks on ESP32-C6.
+    drainMeasureBuffer();
+
     static unsigned long lastPrint = 0;
     if (millis() - lastPrint > 10000) {
       debugPrintTime("Root loop");
-      lastPrint = 0;
+      lastPrint = millis();
     }
     return;
   }
 
   // REPEATER
   if (config.role == ROLE_REPEATER) {
-    ensureWiFiAPRepeater();
+    // ── Wake-on-BLE: WiFi AP power management ────────────────────────────────
+    // The Repeater keeps BLE advertising continuously and WiFi AP OFF during
+    // idle light sleep (BLE-only mode).  When the Collector performs a BLE scan
+    // it wakes the CPU (esp_sleep_enable_bt_wakeup).  The CPU then starts the
+    // WiFi AP so the Collector can connect.  After the Collector disconnects and
+    // the AP has been idle for RPT_WIFI_IDLE_MS, the AP is shut down again.
+    {
+      static bool rptWifiBootDone = false;
+      static unsigned long rptLastStationMs = 0;
+      static const unsigned long RPT_WIFI_IDLE_MS = 60000UL; // 60 s with no station → AP off
+
+      // First boot: do NOT start the WiFi AP — wait for the first BLE wakeup
+      // from the Collector.  "Wake-on-BLE" means the Repeater idles in
+      // BLE-only light sleep; the Collector's BLE scan is what triggers WiFi.
+      if (!rptWifiBootDone) {
+        rptWifiBootDone = true;
+        rptLastStationMs = millis();
+      }
+
+      if (rptWifiAPUp) {
+        // Track the last time a Collector station was connected.
+        if (WiFi.softAPgetStationNum() > 0) rptLastStationMs = millis();
+
+        // Idle shutdown: no station for RPT_WIFI_IDLE_MS → WiFi AP off.
+        if (WiFi.softAPgetStationNum() == 0
+            && millis() - rptLastStationMs > RPT_WIFI_IDLE_MS) {
+          WiFi.softAPdisconnect(false);
+          delay(50);
+          WiFi.mode(WIFI_OFF);
+          rptWifiAPUp = false;
+          Serial.println("[REPEATER] WiFi AP stopped (idle) → BLE-only light sleep");
+        }
+      } else {
+        // WiFi AP is off (BLE-only mode).  Restart the AP when the Collector
+        // wakes us via a BLE scan so it can immediately connect.
+        if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_BT) {
+          Serial.println("[REPEATER] BLE wakeup → starting WiFi AP for Collector");
+          rptLastStationMs = millis(); // fresh idle window
+          ensureWiFiAPRepeater();
+        }
+      }
+    }
     ensureRepeaterHttpServer();
     
-    // Repeater uses continuous BLE beacon with light sleep (not deep sleep)
-    // This allows collectors to find and wake it at any time
+    // Start BLE beacon once (advertising interval defined by BLE_ADV_INTERVAL_UNITS)
     if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
-      // Use actual AP SSID (same logic as ensureWiFiAPRepeater)
       String actualAPSSID = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
       bleBeacon.begin(actualAPSSID, config.nodeName, 0); // 0 = Repeater role
       bleBeacon.startAdvertising();
-      Serial.println("[BLE-MESH] Repeater BLE beacon active (continuous with light sleep)");
+      Serial.println("[BLE-MESH] Repeater BLE beacon active");
+    }
+
+    // Register WiFi SoftAP station events once so we can log when Collectors
+    // connect and disconnect.
+    static bool rptEventsRegistered = false;
+    if (!rptEventsRegistered) {
+      WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+        if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
+          char mac[20];
+          snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                   info.wifi_ap_staconnected.mac[0], info.wifi_ap_staconnected.mac[1],
+                   info.wifi_ap_staconnected.mac[2], info.wifi_ap_staconnected.mac[3],
+                   info.wifi_ap_staconnected.mac[4], info.wifi_ap_staconnected.mac[5]);
+          Serial.printf("[REPEATER] Station connected: %s (Collector uplink started)\n", mac);
+        } else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
+          Serial.println("[REPEATER] Station disconnected.");
+        }
+      });
+      rptEventsRegistered = true;
     }
     
     static bool tried = false;
     if (!tried) {
       tried = true;
-      syncTimeFromUplink(5000);
+      if (!syncTimeFromUplink(5000)) {
+        // Time sync failed; disconnect STA to clean up lingering state and
+        // avoid interference with the AP and BLE advertising.
+        WiFi.disconnect(false, false);
+        Serial.println("[REPEATER] STA disconnected after failed time sync (AP and BLE unaffected).");
+      }
     }
-    // Repeater stays in light sleep with BLE beacon active
-    // No deep sleep - allows instant wake-up when collector connects
+
+    // ── Power saving: lower CPU frequency while idle ─────────────────────────
+    // 80 MHz is more than enough for WiFi AP + BLE advertising + HTTP server.
+    // Dropping from 240 MHz → 80 MHz reduces active CPU current by ~3×.
+    // This is set once and persists for the lifetime of the repeater process.
+    static bool cpuScaled = false;
+    if (!cpuScaled) {
+      setCpuFrequencyMhz(80);
+      cpuScaled = true;
+      Serial.println("[PM] CPU frequency set to 80 MHz (Repeater idle mode)");
+    }
+
+    // ── Periodic power-consumption estimate ──────────────────────────────────
+    // ESP32-C6 in light sleep + WiFi AP + BLE beacon (1000 ms interval) ≈ 4-5 mA
+    // average.  Printed every 60 s for battery sizing.
+    static unsigned long rptLastPowerLog = 0;
+    if (millis() - rptLastPowerLog >= 60000UL) {
+      float elapsedHrs = millis() / 3600000.0f;
+      float estimatedMah = elapsedHrs * 4.5f; // ~4-5 mA average in light sleep
+      Serial.printf("[PM] Repeater uptime=%lu s | AP stations=%d | "
+                    "Est. draw ~4-5 mA (light sleep) | Est. consumed=%.2f mAh\n",
+                    millis() / 1000UL,
+                    (int)WiFi.softAPgetStationNum(),
+                    estimatedMah);
+      rptLastPowerLog = millis();
+
+      // Persist the current epoch every 5 minutes so that a future cold boot can
+      // restore a reasonable time estimate (e.g., after a power cut that forces
+      // a cold-boot on a Repeater that never goes to deep sleep).
+      static unsigned long rptLastTimePersist = 0;
+      if (millis() - rptLastTimePersist >= 300000UL) {
+        time_t nowEp;
+        time(&nowEp);
+        if (nowEp > 1700000000UL) {
+          persistRtcTime(nowEp);
+          rptLastTimePersist = millis();
+        }
+      }
+    }
+
+    // ── Relay pending uploads from /ingest to Root ───────────────────────────
+    // After the Collector uploads a file to this Repeater's /ingest endpoint,
+    // rptPendingUpload is set.  We try to forward the oldest queue file to Root
+    // via a STA connection.  AP stays up throughout (WIFI_AP_STA).
+
+    // Drain ring-buffered /ingest data to SD (safe – main loop context).
+    // When the file is fully written, s_measureDrainComplete becomes true and
+    // we trigger the relay by setting rptPendingUpload.
+    drainMeasureBuffer();
+    if (s_measureDrainComplete) {
+      s_measureDrainComplete = false;
+      rptPendingUpload = true;
+      Serial.printf("[REPEATER] Relay file saved to SD: %s\n", s_measureQueuePath);
+    }
+
+    if (rptPendingUpload) {
+      rptPendingUpload = false;
+      String oldest;
+      if (findOldestQueueFile(oldest)) {
+        String base = oldest.substring(String(QUEUE_DIR).length() + 1);
+        Serial.printf("[REPEATER] Relaying %s to Root...\n", base.c_str());
+        bool ok = uploadFileToRoot(oldest, base);
+        if (ok && initSdCard()) {
+          sd.remove(oldest.c_str());
+          Serial.printf("[REPEATER] Relay OK, removed: %s\n", base.c_str());
+        } else {
+          Serial.println("[REPEATER] Relay to Root failed; file kept for next attempt.");
+        }
+        // Disconnect STA so it does not interfere with the AP or BLE.
+        WiFi.disconnect(false, false);
+      }
+    }
+
+    // Configure light sleep wakeup sources once (timer re-armed each iteration).
+    static bool wakeupConfigured = false;
+    if (!wakeupConfigured) {
+      // Wake when a Collector connects to our WiFi AP.
+      esp_sleep_enable_wifi_wakeup();
+      // Wake when a Collector BLE-scans for us.
+      esp_sleep_enable_bt_wakeup();
+      // Wake immediately when the BOOT button is pressed (GPIO9 = LOW) so the
+      // factory-reset / config-mode hold check at the top of this function
+      // (and in loop()) can accumulate hold-time via the shared
+      // bootButtonPressTime variable even from light sleep.
+      gpio_wakeup_enable((gpio_num_t)BOOT_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+      esp_sleep_enable_gpio_wakeup();
+      wakeupConfigured = true;
+      Serial.println("[REPEATER] Light sleep armed: BLE + WiFi(when-AP-up) + BOOT + 25s timer");
+    }
+
+    // 25-second timer: keeps WDT fed (WDT timeout = 30 s) and lets periodic
+    // tasks (relay check, power log) run even when no Collector is active.
+    // Using 25 s instead of 5 s lowers unnecessary CPU wake-ups by 5×.
+    esp_sleep_enable_timer_wakeup(25000000ULL);
+
+    // If the BOOT button is already held when we reach this point, skip light
+    // sleep entirely.  This lets the hold-time accumulate at full loop speed
+    // (the check at the top of this function handles detection), rather than
+    // being gated behind the 25 s sleep timer.
+    // Note: do NOT call setStatusLed here — the top-of-function check already
+    // set STATUS_ERROR as hold-in-progress feedback; overwriting it would hide
+    // the visual signal from the user.
+    if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+      return;
+    }
+
+    // Do not enter light sleep while a Collector station is actively connected.
+    // On ESP32-C6, esp_light_sleep_start() blocks indefinitely when the WiFi
+    // modem is servicing an AP client (it cannot suspend), which exhausts the
+    // task watchdog.  Yielding briefly instead also keeps drainMeasureBuffer()
+    // running every 50 ms so the ring buffer empties during large uploads.
+    if (rptWifiAPUp && WiFi.softAPgetStationNum() > 0) {
+      esp_task_wdt_reset();
+      delay(50); // 50 ms: fast enough to drain ring buffer, slow enough to yield to TCP task
+      setStatusLed(STATUS_OPERATIONAL_IDLE);
+      return;
+    }
+
+    // Turn the LED off before sleeping: during light sleep GPIO outputs hold
+    // their last state, so a green LED would stay lit the whole time, wasting
+    // ~1–2 mA continuously.  Turn it off now and restore it after waking.
+    setStatusLed(STATUS_SLEEPING);
+    loopStatusLed();
+
+    // Reset WDT immediately before entering sleep so the WDT window is exactly
+    // the sleep duration (≤25 s, well under the 30 s WDT timeout).
+    // A second reset after wakeup feeds the WDT before the next loop body runs.
+    esp_task_wdt_reset();
+    // Enter light sleep — CPU halts; BLE beacon stays active (modem kept on by
+    // esp_sleep_enable_bt_wakeup).  WiFi AP modem is only active when the AP is
+    // running; when the AP is off the WiFi modem powers down, saving extra mA.
+    // Wakes on BLE scan (Collector discovering us), WiFi activity (if AP is up),
+    // BOOT button press, or after 25 s.
+    esp_light_sleep_start();
+    esp_task_wdt_reset();
+
+    // On ESP32-C6 the BLE controller may pause advertising during light sleep.
+    // Restart it unconditionally so the beacon stays visible to phones/scanners.
+    if (config.bleBeaconEnabled) {
+      bleBeacon.restartAdvertising();
+    }
+
+    // Restore operational-idle LED colour immediately after wakeup so the LED
+    // reflects the correct state again before the next loop iteration runs.
+    setStatusLed(STATUS_OPERATIONAL_IDLE);
+    return;
   }
 
   // NON-ROOT STATE MACHINE
@@ -1183,6 +1874,9 @@ void loopOperationalMode() {
             Serial.println("[SD] (Re)Initializing SD card failed before AP start.");
           } else {
             Serial.println("[SD] Card initialized successfully.");
+            // Pre-create /queue dir so body callbacks can open files without calling
+            // Preferences (which is unsafe from the async_tcp task context).
+            ensureDir(QUEUE_DIR);
           }
           
           // NOTE: SD writer task removed - causes mutex crashes from AsyncWebServer callbacks
@@ -1237,6 +1931,9 @@ void loopOperationalMode() {
           jobProcessedThisWindow = false;
           lastActivityMillis = millis();
           lastHeartbeatMillis = 0; // Reset heartbeat tracking for new session
+          doneSensors.clear();    // Reset sensor completion tracking for new session
+          measuredIPs.clear();    // Reset measurement tracking for new session
+          time(&apSessionStartTime); // Record AP session start for uplink window detection
 
           // ======================================================
           //                HEARTBEAT INTEGRATION
@@ -1291,13 +1988,20 @@ void loopOperationalMode() {
             
             String sensorSn = request->getParam("sensor_sn")->value();
             IPAddress remoteIp = request->client()->remoteIP();
+            String ipStr = remoteIp.toString();
             
             // Log to Serial and buffer for main loop processing
             Serial.printf("[HB-LEGACY] GET /api/heartbeat from SN=%s IP=%s\n", 
-                         sensorSn.c_str(), remoteIp.toString().c_str());
+                         sensorSn.c_str(), ipStr.c_str());
             
-            // Buffer with job check enabled - main loop will process
-            bufferHeartbeat(sensorSn, remoteIp.toString(), true);
+            // The sensor protocol has two heartbeat phases:
+            // 1. Pre-measurement: first heartbeat means "I'm here, give me STATUS".
+            //    Jobs must NOT be run yet because measurement hasn't happened.
+            // 2. Post-measurement: subsequent heartbeats mean "check for jobs/firmware".
+            // We use measuredIPs (populated when POST /api/measure completes) to
+            // distinguish the two phases.
+            bool isPostMeasurement = (measuredIPs.find(ipStr) != measuredIPs.end());
+            bufferHeartbeat(sensorSn, ipStr, isPostMeasurement);
             
             request->send(200, "text/plain", "OK");
             lastActivityMillis = millis();
@@ -1353,32 +2057,70 @@ void loopOperationalMode() {
           );
 
           // Legacy POST /api/measure - sensor sends measurement data
+          // Body chunks are written into a lock-free ring buffer; the main loop
+          // drains the buffer to an SD queue file (drainMeasureBuffer()).
+          // IMPORTANT: Do NOT call SdFat/SPI from this callback – it runs in
+          // the async_tcp FreeRTOS task and causes xTaskPriorityDisinherit
+          // mutex crashes on ESP32-C6.
           sensorServer.on(
             "/api/measure",
             HTTP_POST,
             [](AsyncWebServerRequest *request) {
-              // This is called AFTER all body chunks are received
+              // Called AFTER all body chunks have been received.
               IPAddress remoteIp = request->client()->remoteIP();
-              Serial.printf("[HB-LEGACY] POST /api/measure completed from IP=%s\n", 
-                           remoteIp.toString().c_str());
+              String ipStr = remoteIp.toString();
+              Serial.printf("[HB-LEGACY] POST /api/measure completed from IP=%s\n", ipStr.c_str());
+              // Record that this IP has sent its measurement. Any subsequent heartbeat
+              // from this IP is a post-measurement heartbeat → check jobs/firmware.
+              measuredIPs.insert(ipStr);
               request->send(200, "text/plain", "OK");
               lastActivityMillis = millis();
             },
             nullptr,
             [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-              // This is called for each chunk of data received
-              // Update activity timestamp on EVERY chunk to prevent timeout during long uploads
+              // Called for each incoming body chunk.
+              // Reset WDT and activity timer on every chunk so long uploads don't
+              // trigger a watchdog reset or an AP-window timeout.
               lastActivityMillis = millis();
-              
+              esp_task_wdt_reset();
+
               if (index == 0) {
-                // First chunk - log start with sensor info
-                IPAddress remoteIp = request->client()->remoteIP();
-                Serial.printf("[HB-LEGACY] POST /api/measure started from IP=%s (total=%d bytes)\n", 
-                             remoteIp.toString().c_str(), total);
+                // First chunk: initialise ring buffer and record target SD path.
+                // The /queue directory is pre-created during AP setup.
+                s_measureRingHead      = 0;
+                s_measureRingTail      = 0;
+                s_measureSendDone      = false;
+                s_measureDrainComplete = false;
+                s_measureTotalBytes    = total;
+                IPAddress remoteIp  = request->client()->remoteIP();
+                Serial.printf("[HB-LEGACY] POST /api/measure started from IP=%s (total=%u bytes)\n",
+                              remoteIp.toString().c_str(), (unsigned)total);
+                snprintf(s_measureQueuePath, sizeof(s_measureQueuePath),
+                         "%s/measure_%08lu.bin", QUEUE_DIR, (unsigned long)millis());
+                s_measureActive = true;
               }
-              
-              // Just receive the data - don't send response here
-              // The response is sent in the main handler above after all chunks are received
+
+              if (!s_measureActive) return;
+
+              // Write this chunk into the ring buffer.
+              // If the ring is momentarily full, yield once to let the main loop
+              // drain it, then retry.  In practice the main loop writes to SD
+              // faster than WiFi delivers data so this branch is rarely taken.
+              size_t remaining = len;
+              const uint8_t* ptr = data;
+              while (remaining > 0) {
+                size_t wrote = measureRingWrite(ptr, remaining);
+                ptr       += wrote;
+                remaining -= wrote;
+                if (remaining > 0) {
+                  vTaskDelay(pdMS_TO_TICKS(1));
+                }
+              }
+
+              // Last chunk: signal main loop that all body data is enqueued.
+              if (total > 0 && index + len >= total) {
+                s_measureSendDone = true;
+              }
             }
           );
 
@@ -1394,13 +2136,21 @@ void loopOperationalMode() {
         // No active polling needed - event-driven architecture
 
         // ---- TIMEOUT CHECK ----
+        // ---- PROCESS BUFFERED MEASURE DATA (SD writes from main loop) ----
+        // Drains the ring buffer filled by POST /api/measure callbacks to SD.
+        // Must run here (main loop context) – SdFat/SPI is unsafe in callbacks.
+        drainMeasureBuffer();
+
         // ---- PROCESS BUFFERED HEARTBEATS (SD writes and job execution) ----
-        // This runs in main loop context where SD and job operations are safe
-        processHeartbeatBuffer();
+        // Deferred while an upload is active: notifyRoot() inside is a blocking
+        // WiFiClient HTTP call (up to 5 s timeout) that would starve
+        // drainMeasureBuffer() and make measure uploads extremely slow.
+        if (!s_measureActive) {
+          processHeartbeatBuffer();
+        }
 
         // ---- TIMEOUT CHECK ----
         // Check for any sensor activity (heartbeats OR data transfers) periodically
-        // Use the configured collectorDataTimeoutSec when sensors are connected
         // Only check periodically to avoid race conditions with ongoing transfers
         static unsigned long lastTimeoutCheck = 0;
         int numConnected = WiFi.softAPgetStationNum();
@@ -1409,25 +2159,57 @@ void loopOperationalMode() {
         unsigned long now = millis();
         if (now - lastTimeoutCheck >= ACTIVITY_CHECK_INTERVAL) {
           lastTimeoutCheck = now;
-          
+
+          // Never time out while a measure upload is actively being received or
+          // drained to SD.  The ring buffer may be full and onBody blocked, so
+          // lastActivityMillis can lag behind real progress.
+          if (s_measureActive || measureRingUsed() > 0) {
+            lastActivityMillis = millis();
+            // skip timeout evaluation – come back next interval
+          } else {
+
           unsigned long timeSinceLastActivity = now - lastActivityMillis;
           unsigned long timeout;
           
           if (numConnected > 0) {
-            // Sensors connected - use data timeout (allows time for measurement uploads)
-            timeout = config.collectorDataTimeoutSec * 1000UL;
-            
-            if (timeSinceLastActivity > timeout) {
-              Serial.printf("[AP] %d sensor(s) connected but no activity for %lu sec, entering sleep.\n",
-                           numConnected, timeSinceLastActivity / 1000);
-              Serial.println("[AP] Inactivity timeout reached.");
-              stopAPMode();
-              decideAndGoToSleep();
-              break;
+            // Sensors are still physically connected.
+            // If at least one has completed all stages (status → measure → jobs),
+            // wait only the short grace period before sleeping; it likely just hasn't
+            // disconnected its WiFi yet.  Otherwise use the full data timeout so we
+            // don't interrupt an active measurement upload.
+            // NOTE: In this protocol sensors connect one at a time, so a non-empty
+            // doneSensors reliably means the active sensor is finished.  If multiple
+            // sensors ever connect simultaneously this heuristic should be revisited.
+            if (!doneSensors.empty()) {
+              timeout = SENSOR_DONE_GRACE_MS;
+              if (timeSinceLastActivity > timeout) {
+                Serial.printf("[AP] %d sensor(s) still connected but all stages done; "
+                              "no activity for %lu sec → sleeping.\n",
+                              numConnected, timeSinceLastActivity / 1000);
+                stopAPMode();
+                decideAndGoToSleep();
+                break;
+              }
+            } else {
+              timeout = config.collectorDataTimeoutSec * 1000UL;
+              if (timeSinceLastActivity > timeout) {
+                Serial.printf("[AP] %d sensor(s) connected but no activity for %lu sec, entering sleep.\n",
+                             numConnected, timeSinceLastActivity / 1000);
+                Serial.println("[AP] Inactivity timeout reached.");
+                stopAPMode();
+                decideAndGoToSleep();
+                break;
+              }
             }
           } else {
-            // No sensors connected - use shorter window timeout
-            timeout = hadStation ? (config.collectorDataTimeoutSec * 1000UL) : (config.collectorApWindowSec * 1000UL);
+            // No sensors connected
+            if (hadStation) {
+              // If at least one sensor completed all stages, use the short grace period;
+              // otherwise wait for the full data timeout in case more sensors connect.
+              timeout = doneSensors.empty() ? (config.collectorDataTimeoutSec * 1000UL) : SENSOR_DONE_GRACE_MS;
+            } else {
+              timeout = config.collectorApWindowSec * 1000UL;
+            }
             
             if (timeSinceLastActivity > timeout) {
               if (hadStation)
@@ -1440,6 +2222,7 @@ void loopOperationalMode() {
               break;
             }
           }
+          } // end else (no active upload)
         }
 
         break;
@@ -1495,6 +2278,19 @@ void loopOperationalMode() {
 
         if (config.role == ROLE_COLLECTOR) {
           processQueue();
+
+          // ── Periodic power-consumption estimate ────────────────────────────
+          // ESP32-C6 during UPLINK (WiFi STA + SD) ≈ 120 mA.
+          // Printed every 30 s so the user can track consumption for battery sizing.
+          static unsigned long lastUplinkPowerLog = 0;
+          if (millis() - lastUplinkPowerLog >= 30000UL) {
+            float elapsedHrs = millis() / 3600000.0f;
+            float estimatedMah = elapsedHrs * 120.0f; // ~120 mA active average
+            Serial.printf("[PM] Collector uptime=%lu s | UPLINK state | "
+                          "Est. draw ~120 mA | Est. consumed this session=%.2f mAh\n",
+                          millis() / 1000UL, estimatedMah);
+            lastUplinkPowerLog = millis();
+          }
 
           String still;
           if (!findOldestQueueFile(still)) {

@@ -1151,12 +1151,47 @@ if __name__ == '__main__':
     measurementsProcessingThread = Thread(target=measurementsProcessingLoop, args=())
     measurementsProcessingThread.start()
 
+    # ── Root-node polling thread ───────────────────────────────────────────────
+    # If root_node_host is set in config, start the rootdaemon polling loop.
+    # The server machine's WiFi must be connected to Root's AP (Root_AP) before
+    # sensorsdaemon starts.  Root's HTTP API is at http://<root_node_host>:<root_node_port>
+    rootDaemonThread = None
+    rootDaemonStopEvent = None
+    if 'root_node_host' in config.General and config.General['root_node_host']:
+        from rootdaemon import RootDaemon
+        rootDaemonStopEvent = Event()
+        rootDaemonInstance = RootDaemon(
+            dbm=dbm,
+            config_general=config.General,
+            hatsensors_measurements_folder=hatsensors_measurements_folder,
+            sensor_status_folder=sensor_status_folder,
+            sensor_responses_folder=sensor_responses_folder,
+            verbose=args.verbose,
+        )
+        rootDaemonThread = Thread(
+            target=rootDaemonInstance.run,
+            args=(rootDaemonStopEvent,),
+            daemon=True,
+        )
+        rootDaemonThread.start()
+        pr(f"Root-node polling started → http://{config.General.get('root_node_host')}:{config.General.get('root_node_port', 8080)}")
+    else:
+        pr("Root-node polling disabled (root_node_host not set in config)")
+    # ──────────────────────────────────────────────────────────────────────────
+
     while running:
         mainWait.wait(mainLoopWaitTime)
         mainWait.clear()
 
     #pr("(waiting for JobsManager to finish)")
     #jobsManager.join()
+
+    # stop root daemon thread
+    if rootDaemonStopEvent is not None:
+        rootDaemonStopEvent.set()
+    if rootDaemonThread is not None:
+        verbose_pr("Waiting for root-daemon thread to finish...")
+        rootDaemonThread.join(timeout=5)
 
     #join measurement processing thread
     verbose_pr("Waiting for measurements processing thread to finish...")

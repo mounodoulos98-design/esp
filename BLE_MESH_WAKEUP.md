@@ -17,6 +17,9 @@ The BLE (Bluetooth Low Energy) mesh wake-up system enables efficient power manag
 2. **Repeater Node**
    - **Light sleep with continuous BLE beacon** (not deep sleep)
    - Acts as BLE beacon continuously (advertises itself 24/7)
+   - CPU sleeps via `esp_light_sleep_start()` between events
+   - Wakes automatically on BLE activity (collector scan/connect),
+     WiFi activity (station connects to AP), or 5-second timer
    - Allows instant wake-up when Collector needs to connect
    - Forwards data from Collectors to Root
 
@@ -66,6 +69,30 @@ The BLE wake-up mechanism provides several power benefits:
 - **No blind WiFi scanning**: Avoids power-hungry WiFi scans
 - **Quick discovery**: BLE beacon detected in seconds vs. WiFi association
 
+#### Repeater power budget (all optimizations active)
+
+| Component | No optimization | After optimization | How |
+|---|---|---|---|
+| CPU | ~80 mA (always running) | **~0.8 mA** avg | `esp_light_sleep_start()` |
+| BT radio (adv) | ~10 mA (100 ms interval) | **~0.3 mA** avg | modem sleep + 1000 ms interval |
+| WiFi AP (idle) | ~30 mA | **~3 mA** avg | light sleep gates WiFi modem |
+| CPU freq (active) | 240 MHz peak | **80 MHz** peak | `setCpuFrequencyMhz(80)` |
+| **Total idle** | **~120 mA** | **~4-5 mA** | all combined |
+
+> **"Can the ESP sleep while advertising BLE beacons?"**
+> 
+> Yes — with `esp_light_sleep_start()` the CPU halts completely.  The BLE
+> hardware controller continues transmitting beacon packets at its 1000 ms
+> interval with no CPU involvement.  Deep sleep (0.01 mA) is **not possible**
+> while WiFi AP and BLE must remain active; light sleep is the floor.
+
+| Sleep mode | BLE adv | WiFi AP | CPU | Current |
+|---|---|---|---|---|
+| Fully awake (old) | ✅ | ✅ | running 240 MHz | ~120 mA |
+| Light sleep only | ✅ | ✅ | halted | ~15 mA |
+| Light sleep + modem sleep + 1000 ms interval + 80 MHz | ✅ | ✅ | halted | **~4-5 mA** |
+| Deep sleep | ❌ not possible | ❌ | halted | 0.01 mA |
+
 ## Flow Diagram
 
 ```
@@ -83,8 +110,13 @@ The BLE wake-up mechanism provides several power benefits:
 │                       REPEATER NODE                          │
 │  Continuous Operation:                                       │
 │  1. WiFi AP always active                                    │
-│  2. BLE Beacon advertising continuously (Role: 0)            │
-│  3. Light sleep mode (instant wake-up)                       │
+│  2. BLE Beacon @ 1000 ms interval (Role: 0)                 │
+│  3. BT modem sleep between advertising packets               │
+│  4. CPU @ 80 MHz (reduced from 240 MHz)                     │
+│  5. Light sleep (esp_light_sleep_start):                     │
+│     - Wakes on BLE activity (collector scan/connect)         │
+│     - Wakes on WiFi activity (station connects)              │
+│     - Wakes every 5 seconds for WDT keepalive               │
 │  4. When Collector connects:                                 │
 │     - Wake from light sleep                                  │
 │     - Receive data via WiFi                                  │
@@ -178,8 +210,10 @@ config.bleScanDurationSec = 5;   // BLE scan duration in seconds
 
 2. **Repeater Loop** (`loopOperationalMode()`)
    - Starts BLE beacon when awake
-   - Scans for parent before uplink
-   - Stops beacon before sleep
+   - Enables BLE + WiFi as wakeup sources (`esp_sleep_enable_bt_wakeup()`,
+     `esp_sleep_enable_wifi_wakeup()`)
+   - Calls `esp_light_sleep_start()` — CPU halts, BLE beacon advertises autonomously
+   - Wakes on BLE/WiFi activity or 5-second timer; loop repeats
 
 3. **Collector Uplink** (`STATE_MESH_APPOINTMENT`)
    - Scans for parent at start of uplink window
