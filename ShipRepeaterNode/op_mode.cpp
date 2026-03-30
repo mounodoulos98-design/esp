@@ -77,6 +77,7 @@ std::map<String, std::vector<uint8_t>> rxBufs;  // (kept for possible future use
 bool sdDeferredSave = false;
 State currentState;
 bool apActive = false;
+bool rptWifiAPUp = false;  // true when REPEATER WiFi AP is currently running
 bool needToSyncTime = false;
 // Κάπου δίπλα στα άλλα singletons
 static SensorHeartbeatManager heartbeatManager;
@@ -756,8 +757,9 @@ void ensureRootHttpServer() {
 }
 
 void ensureWiFiAPRepeater() {
-  static bool up = false;
-  if (up) return;
+  // Use rptWifiAPUp (file-scope) instead of a one-shot static flag so the AP
+  // can be restarted after being shut down for idle power saving.
+  if (rptWifiAPUp) return;
   String ssid = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
   String pass = config.apPASS;
   String ipStr = config.apIP.length() ? config.apIP : String("192.168.20.1");
@@ -767,7 +769,7 @@ void ensureWiFiAPRepeater() {
   } else {
     Serial.println("[REPEATER] Failed to start AP!");
   }
-  up = ok;
+  rptWifiAPUp = ok;
 }
 
 // =============================
@@ -1617,7 +1619,47 @@ void loopOperationalMode() {
 
   // REPEATER
   if (config.role == ROLE_REPEATER) {
-    ensureWiFiAPRepeater();
+    // ── Wake-on-BLE: WiFi AP power management ────────────────────────────────
+    // The Repeater keeps BLE advertising continuously and WiFi AP OFF during
+    // idle light sleep (BLE-only mode).  When the Collector performs a BLE scan
+    // it wakes the CPU (esp_sleep_enable_bt_wakeup).  The CPU then starts the
+    // WiFi AP so the Collector can connect.  After the Collector disconnects and
+    // the AP has been idle for RPT_WIFI_IDLE_MS, the AP is shut down again.
+    {
+      static bool rptWifiBootDone = false;
+      static unsigned long rptLastStationMs = 0;
+      static const unsigned long RPT_WIFI_IDLE_MS = 60000UL; // 60 s with no station → AP off
+
+      // First boot: start WiFi AP immediately and arm the idle timer.
+      if (!rptWifiBootDone) {
+        rptWifiBootDone = true;
+        rptLastStationMs = millis();
+        ensureWiFiAPRepeater();
+      }
+
+      if (rptWifiAPUp) {
+        // Track the last time a Collector station was connected.
+        if (WiFi.softAPgetStationNum() > 0) rptLastStationMs = millis();
+
+        // Idle shutdown: no station for RPT_WIFI_IDLE_MS → WiFi AP off.
+        if (WiFi.softAPgetStationNum() == 0
+            && millis() - rptLastStationMs > RPT_WIFI_IDLE_MS) {
+          WiFi.softAPdisconnect(false);
+          delay(50);
+          WiFi.mode(WIFI_OFF);
+          rptWifiAPUp = false;
+          Serial.println("[REPEATER] WiFi AP stopped (idle) → BLE-only light sleep");
+        }
+      } else {
+        // WiFi AP is off (BLE-only mode).  Restart the AP when the Collector
+        // wakes us via a BLE scan so it can immediately connect.
+        if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_BT) {
+          Serial.println("[REPEATER] BLE wakeup → starting WiFi AP for Collector");
+          rptLastStationMs = millis(); // fresh idle window
+          ensureWiFiAPRepeater();
+        }
+      }
+    }
     ensureRepeaterHttpServer();
     
     // Start BLE beacon once (advertising interval defined by BLE_ADV_INTERVAL_UNITS)
@@ -1744,7 +1786,7 @@ void loopOperationalMode() {
       gpio_wakeup_enable((gpio_num_t)BOOT_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
       esp_sleep_enable_gpio_wakeup();
       wakeupConfigured = true;
-      Serial.println("[REPEATER] Light sleep armed: wakeup = BLE + WiFi + BOOT button + 25s timer");
+      Serial.println("[REPEATER] Light sleep armed: BLE + WiFi(when-AP-up) + BOOT + 25s timer");
     }
 
     // 25-second timer: keeps WDT fed (WDT timeout = 30 s) and lets periodic
@@ -1773,8 +1815,11 @@ void loopOperationalMode() {
     // the sleep duration (≤25 s, well under the 30 s WDT timeout).
     // A second reset after wakeup feeds the WDT before the next loop body runs.
     esp_task_wdt_reset();
-    // Enter light sleep — CPU halts; BLE beacon and WiFi AP modem stay active.
-    // Wakes automatically on BLE/WiFi activity, BOOT button press, or after 25 s.
+    // Enter light sleep — CPU halts; BLE beacon stays active (modem kept on by
+    // esp_sleep_enable_bt_wakeup).  WiFi AP modem is only active when the AP is
+    // running; when the AP is off the WiFi modem powers down, saving extra mA.
+    // Wakes on BLE scan (Collector discovering us), WiFi activity (if AP is up),
+    // BOOT button press, or after 25 s.
     esp_light_sleep_start();
     esp_task_wdt_reset();
 
