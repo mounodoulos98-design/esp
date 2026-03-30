@@ -149,16 +149,26 @@ bool initSdCard() {
   pinMode(SD_CS_PIN, OUTPUT);
   digitalWrite(SD_CS_PIN, HIGH);
 
-  // Try progressively lower SPI speeds: 10 → 8 → 4 MHz.
-  // Between each attempt: end SPI, re-init, send dummy clocks.
-  const int speeds[] = { 10, 8, 4 };
+  // Try progressively lower SPI speeds: 10 → 8 → 4 → 2 MHz.
+  // Between each attempt: end SdFat + SPI, re-init SPI with explicit pins,
+  // send 80 dummy clocks, then re-attempt sd.begin().
+  //
+  // IMPORTANT: Use SHARED_SPI (not DEDICATED_SPI).  DEDICATED_SPI makes SdFat
+  // internally call SPI.end() + SPI.begin() WITHOUT pin arguments.  On Arduino
+  // ESP32 core v3.x SPI.end() clears the stored pin config, so the subsequent
+  // SPI.begin() reverts to DEFAULT pins — which don't match the SD card wiring.
+  // SHARED_SPI avoids this: we own the SPI bus and SdFat just uses it as-is.
+  const int speeds[] = { 10, 8, 4, 2 };
   bool success = false;
 
-  for (int s = 0; s < 3 && !success; s++) {
+  for (int s = 0; s < 4 && !success; s++) {
     sd.end();
     SPI.end();
     delay(100);
 
+    // Re-initialize SPI with our board-specific pins every iteration.
+    // SPI.end() clears the stored pin config on ESP32 core v3.x, so we must
+    // always pass explicit pins here.
     digitalWrite(SD_CS_PIN, HIGH);
     SPI.begin(SCK, MISO, MOSI, SD_CS_PIN);
     delay(20);
@@ -167,11 +177,11 @@ bool initSdCard() {
     sdSendDummyClocks();
     delay(10);
 
-    SdSpiConfig cfg(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(speeds[s]));
+    SdSpiConfig cfg(SD_CS_PIN, SHARED_SPI, SD_SCK_MHZ(speeds[s]));
     success = sd.begin(cfg);
     if (!success) {
       Serial.printf("[SD] Mount failed at %d MHz – %s\n", speeds[s],
-                    (s < 2) ? "retrying..." : "(final).");
+                    (s < 3) ? "retrying..." : "(final).");
       delay(300);
     }
   }
