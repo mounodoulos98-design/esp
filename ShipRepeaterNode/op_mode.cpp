@@ -1630,11 +1630,12 @@ void loopOperationalMode() {
       static unsigned long rptLastStationMs = 0;
       static const unsigned long RPT_WIFI_IDLE_MS = 60000UL; // 60 s with no station → AP off
 
-      // First boot: start WiFi AP immediately and arm the idle timer.
+      // First boot: do NOT start the WiFi AP — wait for the first BLE wakeup
+      // from the Collector.  "Wake-on-BLE" means the Repeater idles in
+      // BLE-only light sleep; the Collector's BLE scan is what triggers WiFi.
       if (!rptWifiBootDone) {
         rptWifiBootDone = true;
         rptLastStationMs = millis();
-        ensureWiFiAPRepeater();
       }
 
       if (rptWifiAPUp) {
@@ -1802,6 +1803,18 @@ void loopOperationalMode() {
     // set STATUS_ERROR as hold-in-progress feedback; overwriting it would hide
     // the visual signal from the user.
     if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+      return;
+    }
+
+    // Do not enter light sleep while a Collector station is actively connected.
+    // On ESP32-C6, esp_light_sleep_start() blocks indefinitely when the WiFi
+    // modem is servicing an AP client (it cannot suspend), which exhausts the
+    // task watchdog.  Yielding briefly instead also keeps drainMeasureBuffer()
+    // running every 50 ms so the ring buffer empties during large uploads.
+    if (rptWifiAPUp && WiFi.softAPgetStationNum() > 0) {
+      esp_task_wdt_reset();
+      delay(50); // 50 ms: fast enough to drain ring buffer, slow enough to yield to TCP task
+      setStatusLed(STATUS_OPERATIONAL_IDLE);
       return;
     }
 
