@@ -113,7 +113,7 @@ static HeartbeatEntry hbBuffer[HB_BUFFER_SIZE];
 static constexpr size_t        MEASURE_RING_SIZE        = 65536; // must stay a power of 2 — 64 KB keeps up with WiFi→SD pipeline
 static_assert((MEASURE_RING_SIZE & (MEASURE_RING_SIZE - 1)) == 0, "MEASURE_RING_SIZE must be a power of 2");
 static constexpr unsigned long MEASURE_DRAIN_TIMEOUT_MS = 30000;
-static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 25;    // light sleep duration (manual fallback)
+static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 2;     // light sleep duration (manual fallback, kept short so BLE advertising resumes quickly for collector discovery)
 static bool s_pmAutoSleepActive = false;   // true when RTOS PM auto light-sleep is active
 static bool s_btWakeupEnabled   = false;   // true after esp_sleep_enable_bt_wakeup() succeeded
 static uint8_t         s_measureRing[MEASURE_RING_SIZE];
@@ -628,6 +628,8 @@ static AsyncWebServer rptServer(8080);
 bool syncTimeFromUplink(unsigned long timeout_ms) {
   if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
   if (WiFi.status() != WL_CONNECTED) {
+    WiFi.disconnect(false);
+    delay(100);
     Serial.printf("[TIME] STA to %s...\n", config.uplinkSSID.c_str());
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
@@ -712,6 +714,8 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
 
   if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
   if (WiFi.status() != WL_CONNECTED) {
+    WiFi.disconnect(false);   // cancel any prior connect attempt (avoids "sta is connecting, cannot set config")
+    delay(100);
     Serial.printf("[UPLINK] Connecting STA to %s...\n", config.uplinkSSID.c_str());
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
@@ -776,6 +780,8 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
 bool downloadFileFromRoot(const String& remotePath, const String& localPath) {
   if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
   if (WiFi.status() != WL_CONNECTED) {
+    WiFi.disconnect(false);
+    delay(100);
     Serial.printf("[DOWNLOAD] Connecting STA to %s...\n", config.uplinkSSID.c_str());
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
@@ -1372,6 +1378,9 @@ void loopOperationalMode() {
       if (WiFi.softAPgetStationNum() == 0) {
         esp_sleep_enable_timer_wakeup(REPEATER_LIGHT_SLEEP_S * 1000000ULL);
         esp_sleep_enable_wifi_wakeup();
+        if (s_btWakeupEnabled) {
+          esp_sleep_enable_bt_wakeup();  // also wake on BLE scan-request from collector
+        }
         Serial.println("[REPEATER] Light sleep armed (manual fallback)");
         esp_task_wdt_reset();
         esp_light_sleep_start();
