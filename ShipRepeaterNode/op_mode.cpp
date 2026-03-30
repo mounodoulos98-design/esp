@@ -119,6 +119,7 @@ static volatile size_t s_measureRingHead = 0;   // written only by onBody callba
 static volatile size_t s_measureRingTail = 0;   // read/advanced only by drainMeasureBuffer()
 static volatile bool   s_measureActive   = false; // upload in progress
 static volatile bool   s_measureSendDone = false; // all body chunks received
+static volatile bool   s_measureFailed   = false; // drain aborted (SD failure etc.)
 static String          s_measureQueuePath;
 
 // Queue a heartbeat from callback (safe - no FreeRTOS calls)
@@ -175,9 +176,7 @@ static const char* QUEUE_NS = "queue_store";
 
 static void ensureDir(const char* path) {
   if (!initSdCard()) {
-    Serial.println("[SD] initSdCard() failed, retrying...");
-    delay(100);
-    initSdCard();
+    return; // SD unavailable; caller must handle this
   }
   if (!sd.exists(path)) {
     if (!sd.mkdir(path)) {
@@ -340,6 +339,7 @@ static void drainMeasureBuffer() {
       Serial.println("[UPLOAD] SD init failed, aborting measure drain");
       s_measureActive  = false;
       s_measureSendDone = false;
+      s_measureFailed  = true;
       return;
     }
     ensureDir(QUEUE_DIR);
@@ -349,6 +349,7 @@ static void drainMeasureBuffer() {
       Serial.printf("[UPLOAD] Failed to open queue file: %s\n", s_measureQueuePath.c_str());
       s_measureActive  = false;
       s_measureSendDone = false;
+      s_measureFailed  = true;
       return;
     }
     Serial.printf("[UPLOAD] Streaming to queue: %s\n", s_measureQueuePath.c_str());
@@ -397,6 +398,7 @@ static void drainMeasureBuffer() {
     fileOpen         = false;
     s_measureActive  = false;
     s_measureSendDone = false;
+    s_measureFailed  = true;
   }
 }
 
@@ -1569,12 +1571,17 @@ void loopOperationalMode() {
             "/api/measure",
             HTTP_POST,
             [](AsyncWebServerRequest *request) {
-              // Called after all body chunks are received — send 200 immediately
-              // so the sensor does not time out waiting for a response.
+              // Called after all body chunks are received.
               IPAddress remoteIp = request->client()->remoteIP();
               Serial.printf("[HB-LEGACY] POST /api/measure completed from IP=%s\n",
                            remoteIp.toString().c_str());
-              request->send(200, "text/plain", "OK");
+              // If the drain pipeline aborted (SD failure), tell the sensor so it
+              // can retry later instead of believing the upload succeeded.
+              if (s_measureFailed) {
+                request->send(503, "text/plain", "SD unavailable");
+              } else {
+                request->send(200, "text/plain", "OK");
+              }
               lastActivityMillis = millis();
             },
             nullptr,
@@ -1592,7 +1599,17 @@ void loopOperationalMode() {
                 s_measureRingHead = 0;
                 s_measureRingTail = 0;
                 s_measureSendDone = false;
+                s_measureFailed   = false;
                 s_measureActive   = true;
+              }
+
+              // If drainMeasureBuffer() has already aborted (e.g. SD init failed),
+              // s_measureActive will be false.  Stop pushing bytes into the ring —
+              // they would just overflow and flood the serial log.
+              if (!s_measureActive) {
+                // Mark done so the response handler doesn't hang
+                if (index + len >= total) s_measureSendDone = true;
+                return;
               }
 
               // Write incoming bytes into the ring buffer.
@@ -1602,9 +1619,13 @@ void loopOperationalMode() {
               for (size_t i = 0; i < len; i++) {
                 size_t nextHead = (head + 1) & (MEASURE_RING_SIZE - 1);
                 if (nextHead == tail) {
-                  // Ring full — drop remaining bytes and warn
-                  Serial.printf("[UPLOAD] Ring overflow at %u/%u, dropping %u bytes\n",
-                               (unsigned)(index + i), (unsigned)total, (unsigned)(len - i));
+                  // Ring full — drop remaining bytes and warn (rate-limited)
+                  static unsigned long lastOverflowLog = 0;
+                  if (millis() - lastOverflowLog > 2000) {
+                    Serial.printf("[UPLOAD] Ring overflow at %u/%u, dropping %u bytes\n",
+                                 (unsigned)(index + i), (unsigned)total, (unsigned)(len - i));
+                    lastOverflowLog = millis();
+                  }
                   break;
                 }
                 s_measureRing[head] = data[i];
