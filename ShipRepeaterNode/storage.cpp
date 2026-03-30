@@ -275,6 +275,9 @@ time_t restoreRtcTime() {
 
 // File-scope flag so sdForceReinit() can reset it.
 static bool sdInitialized = false;
+// After all speeds fail, remember when so we don't hammer SPI on every loop.
+static unsigned long sdFailCooldownMs = 0;
+static const unsigned long SD_FAIL_COOLDOWN_MS = 5000; // 5 s between full retries
 
 // Force the next initSdCard() call to reinitialise the bus and card.
 // Call this from the main loop when an SD file operation fails unexpectedly.
@@ -284,6 +287,7 @@ void sdForceReinit() {
     return;
   }
   sdInitialized = false;
+  sdFailCooldownMs = 0; // clear cooldown so the forced reinit is tried immediately
   xSemaphoreGive(sdCardMutex);
 }
 
@@ -295,6 +299,13 @@ bool initSdCard() {
   if (sdInitialized) {
     xSemaphoreGive(sdCardMutex);
     return true;
+  }
+
+  // After a complete failure (all speeds tried), wait before retrying to avoid
+  // hammering the SPI bus and flooding the log on every main-loop iteration.
+  if (sdFailCooldownMs != 0 && (millis() - sdFailCooldownMs) < SD_FAIL_COOLDOWN_MS) {
+    xSemaphoreGive(sdCardMutex);
+    return false;
   }
 
   Serial.println("[SD] (Re)Initializing SD card...");
@@ -350,11 +361,13 @@ bool initSdCard() {
   if (success) {
     Serial.println("[SD] Card initialized successfully.");
     sdInitialized = true;
+    sdFailCooldownMs = 0; // clear cooldown on success
   } else {
     Serial.printf("[SD] Card Mount Failed at %u MHz (final).\n", speeds[sizeof(speeds)/sizeof(speeds[0])-1]);
     Serial.println("[SD] Check wiring (CLK=19 MISO=20 MOSI=21 CS=18), VCC=3.3V, card format=FAT32.");
     Serial.println("[SD] Flash SDTest/SDTest.ino for standalone hardware diagnosis.");
     sdInitialized = false;
+    sdFailCooldownMs = millis(); // back off for SD_FAIL_COOLDOWN_MS before next attempt
   }
 
   xSemaphoreGive(sdCardMutex);
