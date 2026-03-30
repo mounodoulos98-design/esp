@@ -111,6 +111,15 @@ public:
         }
     }
 
+    // Call after waking from light sleep to ensure advertising is running.
+    // Light sleep on ESP32-C6 can pause the BLE controller; this restarts
+    // it unconditionally so the beacon stays visible to phones/scanners.
+    void restartAdvertising() {
+        if (!isInitialized) return;
+        BLEDevice::startAdvertising();
+        isAdvertising = true;
+    }
+
     void stopAdvertising() {
         if (isAdvertising) {
             pAdvertising->stop();

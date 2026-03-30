@@ -1778,6 +1778,12 @@ void loopOperationalMode() {
     esp_light_sleep_start();
     esp_task_wdt_reset();
 
+    // On ESP32-C6 the BLE controller may pause advertising during light sleep.
+    // Restart it unconditionally so the beacon stays visible to phones/scanners.
+    if (config.bleBeaconEnabled) {
+      bleBeacon.restartAdvertising();
+    }
+
     // Restore operational-idle LED colour immediately after wakeup so the LED
     // reflects the correct state again before the next loop iteration runs.
     setStatusLed(STATUS_OPERATIONAL_IDLE);
@@ -2078,8 +2084,12 @@ void loopOperationalMode() {
         drainMeasureBuffer();
 
         // ---- PROCESS BUFFERED HEARTBEATS (SD writes and job execution) ----
-        // This runs in main loop context where SD and job operations are safe
-        processHeartbeatBuffer();
+        // Deferred while an upload is active: notifyRoot() inside is a blocking
+        // WiFiClient HTTP call (up to 5 s timeout) that would starve
+        // drainMeasureBuffer() and make measure uploads extremely slow.
+        if (!s_measureActive) {
+          processHeartbeatBuffer();
+        }
 
         // ---- TIMEOUT CHECK ----
         // Check for any sensor activity (heartbeats OR data transfers) periodically
