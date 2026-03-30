@@ -23,11 +23,17 @@ void setup() {
   Serial.println("ShipRepeaterNode Booting...");
 
   setupStatusLed();
+#if BOOT_BUTTON_PIN >= 0
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+#endif
   sdCardMutex = xSemaphoreCreateMutex();
 
   delay(50);  // Debounce for boot button
+#if BOOT_BUTTON_PIN >= 0
   bool forceConfigMode = (digitalRead(BOOT_BUTTON_PIN) == LOW);
+#else
+  bool forceConfigMode = false;
+#endif
   WiFi.mode(WIFI_OFF);
   delay(200);
 
@@ -52,6 +58,7 @@ void loop() {
   if (isOperationalMode) {
     loopOperationalMode();
 
+#if BOOT_BUTTON_PIN >= 0
     if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
       if (bootButtonPressTime == 0) {
         bootButtonPressTime = millis();
@@ -63,6 +70,7 @@ void loop() {
     } else {
       bootButtonPressTime = 0;
     }
+#endif
   } else {
     loopConfigurationMode();
   }

@@ -20,13 +20,17 @@
 #include <ArduinoJson.h> // **ΤΟ ΒΑΖΟΥΜΕ ΕΔΩ ΓΙΑ ΝΑ ΕΙΝΑΙ ΔΙΑΘΕΣΙΜΟ ΠΑΝΤΟΥ**
 
 // ── Waveshare ESP32-C6 (16 MB) Hardware ──────────────────────────
-#define BOOT_BUTTON_PIN         9     // On-board BOOT button (active LOW)
+// NOTE: The on-board BOOT button (GPIO9) is occupied by SD_CS_PIN,
+//       so software-based boot-button detection is disabled.
+//       Use "factoryReset" via the config web UI instead, or
+//       reassign SD_CS_PIN to free GPIO9 for the button.
+#define BOOT_BUTTON_PIN         -1    // Disabled — GPIO9 used by SD CS
 
-// SD Card SPI — uses the FSPI bus on the ESP32-C6
-#define SD_CS_PIN               10    // Chip-select (pick any free GPIO)
-#define SD_SCK_PIN              6     // FSPICLK
-#define SD_MISO_PIN             2     // FSPIQ  (SD card DO → MCU)
-#define SD_MOSI_PIN             7     // FSPID  (MCU → SD card DI)
+// SD Card SPI — user wiring on the Waveshare ESP32-C6
+#define SD_CS_PIN               9     // Chip-select  (user wired to GPIO9)
+#define SD_SCK_PIN              18    // SPI Clock    (user wired to GPIO18)
+#define SD_MISO_PIN             19    // SD card DO → MCU  (user wired to GPIO19)
+#define SD_MOSI_PIN             20    // MCU → SD card DI  (user wired to GPIO20)
 
 // Network Defaults
 #define ROOT_AP_SSID            "Root_AP"
