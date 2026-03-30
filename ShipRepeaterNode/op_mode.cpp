@@ -1098,7 +1098,14 @@ void startOperationalMode() {
 
   WiFi.mode(WIFI_OFF);
   delay(200);
-  esp_task_wdt_init(30, true);
+  {
+    esp_task_wdt_config_t wdt_cfg = {
+      .timeout_ms       = 30000,
+      .idle_core_mask   = (1 << portNUM_PROCESSORS) - 1,
+      .trigger_panic    = true
+    };
+    esp_task_wdt_init(&wdt_cfg);
+  }
   esp_task_wdt_add(NULL);
   Serial.printf("[BOOT] Wake cause=%d, rtc_last_sleep_duration_s=%u\n",
                 (int)esp_sleep_get_wakeup_cause(), rtc_last_sleep_duration_s);

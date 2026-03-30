@@ -64,11 +64,11 @@ public:
         // This lets the scanner identify mesh nodes even when the service-UUID
         // check fails due to radio contention or advertisement PDU caching.
         BLEAdvertisementData scanRespData;
-        std::string mfgData;
-        mfgData.push_back(0x53); // company ID low byte  (magic 'S')
-        mfgData.push_back(0x4D); // company ID high byte (magic 'M')
-        mfgData.push_back(nodeRole);
-        mfgData.append(apSSID.c_str());
+        String mfgData;
+        mfgData += (char)0x53; // company ID low byte  (magic 'S')
+        mfgData += (char)0x4D; // company ID high byte (magic 'M')
+        mfgData += (char)nodeRole;
+        mfgData += apSSID;
         scanRespData.setManufacturerData(mfgData);
         pAdvertising->setScanResponseData(scanRespData);
 
@@ -169,7 +169,12 @@ public:
 
         Serial.printf("[BLE-SCAN] Starting scan for %d seconds...\n", scanDurationSeconds);
         
-        BLEScanResults foundDevices = pBLEScan->start(scanDurationSeconds, false);
+        BLEScanResults* pFoundDevices = pBLEScan->start(scanDurationSeconds, false);
+        if (!pFoundDevices) {
+            Serial.println("[BLE-SCAN] Scan returned null");
+            return result;
+        }
+        BLEScanResults& foundDevices = *pFoundDevices;
         int count = foundDevices.getCount();
         
         Serial.printf("[BLE-SCAN] Found %d devices\n", count);
@@ -184,13 +189,13 @@ public:
             BLEAdvertisedDevice device = foundDevices.getDevice(i);
 
             // Debug: print every found device so misses can be diagnosed
-            std::string mfgRaw = device.haveManufacturerData() ? device.getManufacturerData() : "";
+            String mfgRaw = device.haveManufacturerData() ? device.getManufacturerData() : String("");
             Serial.printf("[BLE-SCAN][%d] addr=%s rssi=%d uuid=%s mfg=%d bytes\n",
                          i,
                          device.getAddress().toString().c_str(),
                          device.getRSSI(),
                          device.haveServiceUUID() ? device.getServiceUUID().toString().c_str() : "none",
-                         (int)mfgRaw.size());
+                          (int)mfgRaw.length());
 
             // Primary detection: advertised service UUID
             bool isMeshNode = (device.haveServiceUUID() &&
@@ -200,8 +205,8 @@ public:
             // manufacturer data AD type — catches nodes whose service UUID was
             // not returned (scan response not received or PDU overflow).
             if (!isMeshNode && device.haveManufacturerData()) {
-                std::string mfg = device.getManufacturerData();
-                if (mfg.size() >= 2 &&
+                String mfg = device.getManufacturerData();
+                if (mfg.length() >= 2 &&
                     (uint8_t)mfg[0] == 0x53 &&
                     (uint8_t)mfg[1] == 0x4D) {
                     isMeshNode = true;
@@ -217,16 +222,16 @@ public:
             // Legacy format (no magic bytes): [role_byte, apSSID_bytes...]
             String apSSID = String(device.getName().c_str());
             if (device.haveManufacturerData()) {
-                std::string mfgData = device.getManufacturerData();
+                String mfgData = device.getManufacturerData();
                 size_t ssidStart = 1; // legacy: role at [0], SSID from [1]
-                if (mfgData.size() >= 2 &&
+                if (mfgData.length() >= 2 &&
                     (uint8_t)mfgData[0] == 0x53 &&
                     (uint8_t)mfgData[1] == 0x4D) {
                     ssidStart = 3; // new: magic[0..1], role[2], SSID from [3]
                 }
-                if (mfgData.size() > ssidStart) {
+                if (mfgData.length() > ssidStart) {
                     apSSID = "";
-                    for (size_t j = ssidStart; j < mfgData.size(); j++) {
+                    for (size_t j = ssidStart; j < mfgData.length(); j++) {
                         apSSID += (char)mfgData[j];
                     }
                 }
@@ -250,23 +255,23 @@ public:
             
             // Extract role and AP SSID from manufacturer data
             if (bestDevice.haveManufacturerData()) {
-                std::string mfgData = bestDevice.getManufacturerData();
+                String mfgData = bestDevice.getManufacturerData();
                 size_t ssidStart = 1; // legacy offset
-                if (mfgData.size() >= 2 &&
+                if (mfgData.length() >= 2 &&
                     (uint8_t)mfgData[0] == 0x53 &&
                     (uint8_t)mfgData[1] == 0x4D) {
                     // New format with magic bytes
                     ssidStart = 3;
-                    if (mfgData.size() > 2) {
+                    if (mfgData.length() > 2) {
                         result.nodeRole = (uint8_t)mfgData[2];
                     }
-                } else if (mfgData.size() > 0) {
+                } else if (mfgData.length() > 0) {
                     // Legacy format
                     result.nodeRole = (uint8_t)mfgData[0];
                 }
-                if (mfgData.size() > ssidStart) {
+                if (mfgData.length() > ssidStart) {
                     result.apSSID = "";
-                    for (size_t i = ssidStart; i < mfgData.size(); i++) {
+                    for (size_t i = ssidStart; i < mfgData.length(); i++) {
                         result.apSSID += (char)mfgData[i];
                     }
                 } else {

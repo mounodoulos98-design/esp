@@ -297,28 +297,27 @@ void resetJobCache() {
 extern "C" {
 #include "esp_wifi.h"
 #include "esp_netif.h"
+#include "dhcpserver/dhcpserver.h"
 }
 
 static void updateStationIPs() {
     wifi_sta_list_t wifi_sta_list;
-    esp_netif_sta_list_t adapter_sta_list;
     memset(&wifi_sta_list, 0, sizeof(wifi_sta_list));
-    memset(&adapter_sta_list, 0, sizeof(adapter_sta_list));
 
     if (esp_wifi_ap_get_sta_list(&wifi_sta_list) != ESP_OK) {
         return;
     }
-    if (esp_netif_get_sta_list(&wifi_sta_list, &adapter_sta_list) != ESP_OK) {
-        return;
-    }
+
+    // Get the SoftAP netif handle for DHCP lease lookup
+    esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!ap_netif) return;
 
     for (auto& st : g_stations) {
         // Αν έχουμε ήδη κανονική IP (όχι 0.0.0.0), δεν χρειάζεται update
         if (st.ip.length() > 0 && st.ip != "0.0.0.0") continue;
 
-        for (int j = 0; j < adapter_sta_list.num; ++j) {
+        for (int j = 0; j < wifi_sta_list.num; ++j) {
             const wifi_sta_info_t& wi = wifi_sta_list.sta[j];
-            const esp_netif_sta_info_t& ai = adapter_sta_list.sta[j];
 
             char macStr[20];
             sprintf(macStr, "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -327,12 +326,16 @@ static void updateStationIPs() {
 
             if (!st.mac.equalsIgnoreCase(String(macStr))) continue;
 
-            uint32_t ipraw = ai.ip.addr;
-            if (ipraw == 0) {
-                // DHCP δεν έχει δώσει IP ακόμα, μην γράψεις 0.0.0.0
+            // Look up IP via DHCP server lease table
+            esp_netif_pair_mac_ip_t pair;
+            memcpy(pair.mac, wi.mac, 6);
+            pair.ip.addr = 0;
+            if (esp_netif_dhcps_get_clients_by_mac(ap_netif, 1, &pair) != ESP_OK ||
+                pair.ip.addr == 0) {
                 continue;
             }
 
+            uint32_t ipraw = pair.ip.addr;
             IPAddress ipAddr(
                 ipraw & 0xFF,
                 (ipraw >> 8) & 0xFF,
