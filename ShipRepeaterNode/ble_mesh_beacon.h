@@ -115,6 +115,8 @@ public:
     // Light sleep on ESP32-C6 pauses the BLE controller; explicitly stopping
     // advertising first clears stale GAP state, then startAdvertising() issues
     // a fresh esp_ble_gap_start_advertising() so the beacon is visible on phones.
+    // The 10 ms pause gives the BLE stack time to process the stop command
+    // before the start is issued (empirically sufficient; BLE stop is async).
     void restartAdvertising() {
         if (!isInitialized) return;
         if (pAdvertising) pAdvertising->stop();

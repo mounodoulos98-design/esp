@@ -275,7 +275,11 @@ time_t restoreRtcTime() {
 
 // File-scope flag so sdForceReinit() can reset it.
 static bool sdInitialized = false;
-// After all speeds fail, remember when so we don't hammer SPI on every loop.
+// After a complete failure (all speeds tried), back off before retrying so the
+// main loop does not hammer the SPI bus and flood the log every few ms.
+// Use a dedicated boolean rather than a 0-sentinel on the timestamp so the
+// cooldown check is rollover-safe via plain unsigned subtraction.
+static bool          sdFailPending    = false;
 static unsigned long sdFailCooldownMs = 0;
 static const unsigned long SD_FAIL_COOLDOWN_MS = 5000; // 5 s between full retries
 
@@ -287,7 +291,7 @@ void sdForceReinit() {
     return;
   }
   sdInitialized = false;
-  sdFailCooldownMs = 0; // clear cooldown so the forced reinit is tried immediately
+  sdFailPending  = false; // clear cooldown so the forced reinit is tried immediately
   xSemaphoreGive(sdCardMutex);
 }
 
@@ -303,7 +307,7 @@ bool initSdCard() {
 
   // After a complete failure (all speeds tried), wait before retrying to avoid
   // hammering the SPI bus and flooding the log on every main-loop iteration.
-  if (sdFailCooldownMs != 0 && (millis() - sdFailCooldownMs) < SD_FAIL_COOLDOWN_MS) {
+  if (sdFailPending && (millis() - sdFailCooldownMs) < SD_FAIL_COOLDOWN_MS) {
     xSemaphoreGive(sdCardMutex);
     return false;
   }
@@ -361,12 +365,13 @@ bool initSdCard() {
   if (success) {
     Serial.println("[SD] Card initialized successfully.");
     sdInitialized = true;
-    sdFailCooldownMs = 0; // clear cooldown on success
+    sdFailPending = false; // clear cooldown on success
   } else {
     Serial.printf("[SD] Card Mount Failed at %u MHz (final).\n", speeds[sizeof(speeds)/sizeof(speeds[0])-1]);
     Serial.println("[SD] Check wiring (CLK=19 MISO=20 MOSI=21 CS=18), VCC=3.3V, card format=FAT32.");
     Serial.println("[SD] Flash SDTest/SDTest.ino for standalone hardware diagnosis.");
-    sdInitialized = false;
+    sdInitialized    = false;
+    sdFailPending    = true;
     sdFailCooldownMs = millis(); // back off for SD_FAIL_COOLDOWN_MS before next attempt
   }
 
