@@ -1365,7 +1365,7 @@ void loopOperationalMode() {
     //
     // With esp_pm_configure(light_sleep_enable=true) + esp_sleep_enable_bt_wakeup():
     //   - The RTOS enters light sleep automatically during idle (no manual call)
-    //   - BLE hardware continues advertising at 1285ms interval during sleep
+    //   - BLE hardware continues advertising at ~200ms interval during sleep
     //   - WiFi AP maintains state; stations can connect/send data
     //   - CPU wakes instantly on: BLE connect/data, WiFi activity, RTOS tick
     //   - No WDT risk — WiFi subsystem holds PM locks when stations are connected
