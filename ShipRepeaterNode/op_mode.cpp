@@ -1372,36 +1372,12 @@ void loopOperationalMode() {
     //
     // Fallback: if esp_pm_configure() failed (CONFIG_PM_ENABLE not set), use
     // the old manual esp_light_sleep_start() with the station-count guard.
-    if (s_pmAutoSleepActive) {
-      delay(10);  // yield to RTOS idle task → auto light-sleep kicks in
-    } else {
-      // Manual fallback: must NOT sleep when SoftAP stations are connected
-      // (blocks forever on ESP32-C6, triggers task WDT).
-      if (WiFi.softAPgetStationNum() == 0) {
-        esp_sleep_enable_timer_wakeup(REPEATER_LIGHT_SLEEP_S * 1000000ULL);
-        esp_sleep_enable_wifi_wakeup();
-        if (s_btWakeupEnabled) {
-          esp_sleep_enable_bt_wakeup();  // also wake on BLE scan-request from collector
-        }
-        Serial.println("[REPEATER] Light sleep armed (manual fallback)");
-        esp_task_wdt_reset();
-        esp_light_sleep_start();
-        // On ESP32-C6, BLE advertising does NOT auto-resume reliably after
-        // manual esp_light_sleep_start(). Explicitly re-trigger advertising
-        // so the collector's BLE scan can detect us during the awake window.
-        if (config.bleBeaconEnabled && bleBeacon.isActive()) {
-          BLEDevice::startAdvertising();
-        }
-        // After waking from light sleep, stay awake long enough for the BLE
-        // controller to fire multiple advertisements (~200ms interval).
-        // Without this delay the loop re-enters sleep in <1ms and the
-        // collector's scan never sees the repeater's beacon.
-        esp_task_wdt_reset();
-        delay(REPEATER_AWAKE_AFTER_SLEEP_MS);
-      } else {
-        delay(10);
-      }
-    }
+    // ── DIAGNOSTIC TEST: continuous advertising, NO sleep ──────────
+    // Light sleep is disabled so the repeater advertises non-stop.
+    // If the collector now detects the repeater, the sleep/wake timing
+    // was the root cause; re-enable after confirming.
+    esp_task_wdt_reset();
+    delay(100);  // yield; BLE advertising continues uninterrupted
     return;  // REPEATER manages its own loop; do not enter the state machine below.
   }
 
