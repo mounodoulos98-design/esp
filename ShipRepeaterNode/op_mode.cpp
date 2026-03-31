@@ -790,6 +790,8 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
   WiFiClient client;
   Serial.printf("[HTTP UP] Connecting to %s:%d...\n", targetHost.c_str(), config.uplinkPort);
   esp_task_wdt_reset();  // feed WDT before potentially slow TCP connect
+  // 5 s timeout: long enough for WiFi handshake on a busy mesh link,
+  // short enough to stay well within the 30 s WDT window.
   if (!client.connect(targetHost.c_str(), config.uplinkPort, 5000)) {
     Serial.println("[HTTP UP] Connect failed");
     f.close();
