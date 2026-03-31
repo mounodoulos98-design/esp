@@ -114,7 +114,7 @@ static HeartbeatEntry hbBuffer[HB_BUFFER_SIZE];
 static constexpr size_t        MEASURE_RING_SIZE        = 65536; // must stay a power of 2 — 64 KB keeps up with WiFi→SD pipeline
 static_assert((MEASURE_RING_SIZE & (MEASURE_RING_SIZE - 1)) == 0, "MEASURE_RING_SIZE must be a power of 2");
 static constexpr unsigned long MEASURE_DRAIN_TIMEOUT_MS = 30000;
-static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 2;     // light sleep duration (manual fallback, kept short so BLE advertising resumes quickly for collector discovery)
+static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 2;     // light sleep duration (timer wake for periodic housekeeping; also wakes instantly on BLE events)
 static constexpr unsigned long REPEATER_AWAKE_AFTER_SLEEP_MS = 2500; // stay awake after light-sleep so BLE sends ≥10 advertisements (adv interval ~200ms)
 static constexpr unsigned long WIFI_DISCONNECT_SETTLE_MS = 100;  // delay after WiFi.disconnect() before WiFi.begin() to let radio settle
 static bool s_pmAutoSleepActive = false;   // true when RTOS PM auto light-sleep is active
@@ -807,6 +807,7 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
   while (f.available()) {
     int rd = f.read(buf, sizeof(buf));
     if (rd > 0) client.write(buf, rd);
+    esp_task_wdt_reset();   // feed WDT — large files (>900 KB) can take >30 s over WiFi
     delay(0);
   }
   client.print(post);
@@ -818,6 +819,7 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
       client.read();
       t0 = millis();
     }
+    esp_task_wdt_reset();
     delay(10);
   }
   client.stop();
@@ -1457,9 +1459,11 @@ void loopOperationalMode() {
     // When no WiFi stations are connected (no collector actively transferring),
     // enter light sleep to save power.  BLE hardware keeps advertising during
     // light sleep on ESP32-C6, and esp_sleep_enable_bt_wakeup() (registered
-    // above) causes instant CPU wake on any BLE event (scan response / connect).
-    // A timer wake-up is also registered as a fallback so the repeater
-    // periodically wakes to check its queue and forward files to root.
+    // once above) causes instant CPU wake on any BLE event (scan response /
+    // connect).  Wake sources persist across multiple esp_light_sleep_start()
+    // calls — no need to re-register them each iteration.
+    // A timer wake-up is also registered so the repeater periodically wakes
+    // for housekeeping (queue forwarding to root).
     int connectedStations = WiFi.softAPgetStationNum();
     if (connectedStations == 0 && !s_measureActive && s_btWakeupEnabled && !s_pmAutoSleepActive) {
       // Register a timer wake so we don't sleep forever — wake every
