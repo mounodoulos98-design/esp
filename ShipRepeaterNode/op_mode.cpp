@@ -1202,12 +1202,11 @@ void startOperationalMode() {
   Serial.printf("[BOOT] Wake cause=%d, rtc_last_sleep_duration_s=%u\n",
                 (int)esp_sleep_get_wakeup_cause(), rtc_last_sleep_duration_s);
 
-  // --- REPEATER: ESP-IDF Power Management for automatic light sleep ---
-  // Reference: efficient BLE sensor firmware pattern where esp_pm_configure()
-  // lets the RTOS enter light sleep automatically when no task is active.
-  // BLE/WiFi hardware maintain their state and wake the CPU on events.
-  // This replaces the fragile manual esp_light_sleep_start() which blocked
-  // indefinitely when SoftAP had connected stations (WDT crash on ESP32-C6).
+  // --- REPEATER: Power Management ---
+  // Try RTOS automatic light sleep first (esp_pm_configure).  If the build
+  // doesn't have CONFIG_PM_ENABLE the call fails; the repeater then falls
+  // back to manual esp_light_sleep_start() in its main loop, waking on
+  // BLE events (esp_sleep_enable_bt_wakeup) or a timer.
   if (config.role == ROLE_REPEATER) {
     esp_pm_config_t pm_config = {
       .max_freq_mhz = 160,   // ESP32-C6 default
@@ -1365,13 +1364,10 @@ void decideAndGoToSleep() {
       sleep_for = time_to_next_ap;
     }
   } else if (config.role == ROLE_REPEATER) {
-    // REPEATER → stays awake with BLE beacon active
-    // Don't go to deep sleep - allows instant wake-up by collectors
-    // Note: Light sleep is managed by the Arduino/ESP-IDF framework automatically
-    // when CPU is idle. BLE beacon continues advertising during light sleep.
-    // Original scheduling logic removed: Repeater no longer uses scheduled uplink windows,
-    // instead stays continuously available for collectors to connect at any time.
-    Serial.println("[SCHEDULER] Repeater stays active with BLE beacon (automatic light sleep)");
+    // REPEATER → stays awake with BLE beacon active, uses light sleep
+    // between collector visits.  Light sleep + BLE wake is handled in
+    // loopOperationalMode(); the repeater never enters deep sleep.
+    Serial.println("[SCHEDULER] Repeater uses light sleep + BLE wake (handled in loop)");
     return; // Don't call goToDeepSleep
   } else {
     // ROOT → always on, should never reach here
@@ -1456,7 +1452,46 @@ void loopOperationalMode() {
     }
 
     esp_task_wdt_reset();
-    delay(100);  // yield; BLE advertising continues uninterrupted
+
+    // --- Light sleep with BLE wake ---
+    // When no WiFi stations are connected (no collector actively transferring),
+    // enter light sleep to save power.  BLE hardware keeps advertising during
+    // light sleep on ESP32-C6, and esp_sleep_enable_bt_wakeup() (registered
+    // above) causes instant CPU wake on any BLE event (scan response / connect).
+    // A timer wake-up is also registered as a fallback so the repeater
+    // periodically wakes to check its queue and forward files to root.
+    int connectedStations = WiFi.softAPgetStationNum();
+    if (connectedStations == 0 && !s_measureActive && s_btWakeupEnabled && !s_pmAutoSleepActive) {
+      // Register a timer wake so we don't sleep forever — wake every
+      // REPEATER_LIGHT_SLEEP_S seconds for housekeeping / queue forwarding.
+      esp_sleep_enable_timer_wakeup(REPEATER_LIGHT_SLEEP_S * 1000000ULL);
+
+      Serial.printf("[PM] Repeater entering light sleep (%lus, BLE wake armed)\n",
+                    REPEATER_LIGHT_SLEEP_S);
+      Serial.flush();
+
+      esp_light_sleep_start();
+
+      // --- woke up ---
+      esp_task_wdt_reset();  // feed WDT immediately after wake
+      esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
+      Serial.printf("[PM] Repeater woke from light sleep (cause=%d)\n", (int)wc);
+
+      // BLE advertising does NOT auto-resume after esp_light_sleep_start()
+      // on ESP32-C6.  Explicitly restart it so collectors can discover us.
+      if (bleBeacon.isActive()) {
+        bleBeacon.startAdvertising();
+      }
+
+      // Stay awake briefly so the BLE advertisements actually go out and
+      // any incoming HTTP requests can be serviced before we sleep again.
+      delay(REPEATER_AWAKE_AFTER_SLEEP_MS);
+    } else {
+      // Stations connected or transfer in progress — stay awake and let
+      // the async HTTP server handle traffic.  Short delay to yield CPU.
+      delay(50);
+    }
+
     return;  // REPEATER manages its own loop; do not enter the state machine below.
   }
 
