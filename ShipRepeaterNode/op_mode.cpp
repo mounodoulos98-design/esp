@@ -1127,7 +1127,7 @@ void startOperationalMode() {
   // never held (returns ESP_ERR_INVALID_ARG silently).
   gpio_hold_dis((gpio_num_t)SD_CS_PIN);
   gpio_hold_dis(GPIO_NUM_8);   // boot strapping pin – held HIGH to prevent DOWNLOAD mode
-  gpio_deep_sleep_hold_dis();
+  esp_sleep_disable_gpio_hold();
 
   WiFi.mode(WIFI_OFF);
   delay(200);
@@ -1248,7 +1248,7 @@ void goToDeepSleep(unsigned int seconds) {
 
   // Global enable: without this call, gpio_hold_en() only survives light sleep,
   // NOT deep sleep.  This makes both SD_CS_PIN and GPIO8 holds persist.
-  gpio_deep_sleep_hold_en();
+  esp_sleep_enable_gpio_hold();
   
   // Stop ALL BLE subsystems before deep sleep — ESP-IDF requires BT fully stopped.
   // Both stop() methods guard on isInitialized internally, so they're safe no-ops
