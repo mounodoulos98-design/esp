@@ -1181,10 +1181,9 @@ void startOperationalMode() {
   // Release any GPIO holds set before the previous deep sleep, so pins can be
   // reconfigured freely.  gpio_hold_dis is safe to call even if the pin was
   // never held (returns ESP_ERR_INVALID_ARG silently).
-  // On ESP32-C6 (SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP), the per-pin hold
-  // survives deep sleep, but only if esp_sleep_enable_gpio_hold() was called
-  // before entering deep sleep.  Disable the global hold first, then each pin.
-  esp_sleep_disable_gpio_hold();
+  // On ESP32-C6 (SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP=1), the per-pin
+  // gpio_hold_en() already persists through deep sleep — no global
+  // enable/disable needed.  Just release each pin individually.
   gpio_hold_dis((gpio_num_t)SD_CS_PIN);
   gpio_hold_dis(GPIO_NUM_8);   // boot strapping pin – held HIGH to prevent DOWNLOAD mode
 
@@ -1324,11 +1323,8 @@ void goToDeepSleep(unsigned int seconds) {
   gpio_set_drive_capability(GPIO_NUM_8, GPIO_DRIVE_CAP_3);   // max drive
   gpio_set_level(GPIO_NUM_8, 1);
   gpio_hold_en(GPIO_NUM_8);
-  // On ESP32-C6 (SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP), gpio_hold_en()
-  // sets the per-pin hold, but esp_sleep_enable_gpio_hold() is ALSO needed
-  // to make holds persist through deep sleep.  Without the global enable,
-  // GPIO8 floats LOW on wake → boot:0x4 DOWNLOAD mode.
-  esp_sleep_enable_gpio_hold();
+  // On ESP32-C6 (SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP=1), gpio_hold_en()
+  // already persists through deep sleep — no global enable needed.
   Serial.printf("[GPIO8] Strapping pin forced HIGH, hold enabled (level=%d)\n",
                 gpio_get_level(GPIO_NUM_8));
   
