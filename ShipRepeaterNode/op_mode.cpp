@@ -1121,6 +1121,13 @@ void startOperationalMode() {
   }
   esp_event_loop_create_default();  // no-op if already exists (returns ESP_ERR_INVALID_STATE)
 
+  // Release any GPIO holds set before the previous deep sleep, so pins can be
+  // reconfigured freely.  gpio_hold_dis is safe to call even if the pin was
+  // never held (returns ESP_ERR_INVALID_ARG silently).
+  gpio_hold_dis((gpio_num_t)SD_CS_PIN);
+  gpio_hold_dis(GPIO_NUM_8);   // boot strapping pin – held HIGH to prevent DOWNLOAD mode
+  gpio_deep_sleep_hold_dis();
+
   WiFi.mode(WIFI_OFF);
   delay(200);
   {
@@ -1213,6 +1220,11 @@ void goToDeepSleep(unsigned int seconds) {
   }
   rtc_last_sleep_duration_s = seconds;
   stopAPMode();
+
+  // Ensure WiFi radio is fully OFF even if stopAPMode() was a no-op
+  // (e.g. apActive was already false after an uplink STA session).
+  WiFi.mode(WIFI_OFF);
+  delay(100);
   
   // Properly shut down SD card and SPI before deep sleep so that the card
   // wakes in a clean state.  Drive CS HIGH and hold the pin through sleep
@@ -1222,6 +1234,20 @@ void goToDeepSleep(unsigned int seconds) {
   pinMode(SD_CS_PIN, OUTPUT);
   digitalWrite(SD_CS_PIN, HIGH);
   gpio_hold_en((gpio_num_t)SD_CS_PIN);
+
+  // GPIO8 is the boot strapping pin on ESP32-C6:
+  //   HIGH → normal SPI boot,  LOW → download mode.
+  // The onboard RGB LED on GPIO8 can pull the line LOW during a power-on
+  // reset after deep sleep, intermittently causing boot:0x4 (DOWNLOAD mode)
+  // and the "waiting for download" hang.  Force GPIO8 HIGH and hold it
+  // through deep sleep so the strapping read always sees the correct level.
+  pinMode(8, OUTPUT);
+  digitalWrite(8, HIGH);
+  gpio_hold_en(GPIO_NUM_8);
+
+  // Global enable: without this call, gpio_hold_en() only survives light sleep,
+  // NOT deep sleep.  This makes both SD_CS_PIN and GPIO8 holds persist.
+  gpio_deep_sleep_hold_en();
   
   // Stop ALL BLE subsystems before deep sleep — ESP-IDF requires BT fully stopped.
   // Both stop() methods guard on isInitialized internally, so they're safe no-ops
@@ -1231,6 +1257,7 @@ void goToDeepSleep(unsigned int seconds) {
   Serial.println("[BLE-MESH] Stopped BLE before deep sleep");
   
   Serial.printf("[SLEEP] Entering deep sleep for %u seconds.\n", seconds);
+  Serial.flush();
   esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
   delay(200);
   esp_deep_sleep_start();
