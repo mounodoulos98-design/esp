@@ -1181,8 +1181,10 @@ void startOperationalMode() {
   // Release any GPIO holds set before the previous deep sleep, so pins can be
   // reconfigured freely.  gpio_hold_dis is safe to call even if the pin was
   // never held (returns ESP_ERR_INVALID_ARG silently).
-  // On ESP32-C6 (SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP), gpio_hold_en()
-  // already persists through deep sleep, so no global enable/disable is needed.
+  // On ESP32-C6 (SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP), the per-pin hold
+  // survives deep sleep, but only if esp_sleep_enable_gpio_hold() was called
+  // before entering deep sleep.  Disable the global hold first, then each pin.
+  esp_sleep_disable_gpio_hold();
   gpio_hold_dis((gpio_num_t)SD_CS_PIN);
   gpio_hold_dis(GPIO_NUM_8);   // boot strapping pin – held HIGH to prevent DOWNLOAD mode
 
@@ -1292,24 +1294,29 @@ void goToDeepSleep(unsigned int seconds) {
   digitalWrite(SD_CS_PIN, HIGH);
   gpio_hold_en((gpio_num_t)SD_CS_PIN);
 
-  // GPIO8 is the boot strapping pin on ESP32-C6:
-  //   HIGH → normal SPI boot,  LOW → download mode.
-  // The onboard RGB LED on GPIO8 can pull the line LOW during a power-on
-  // reset after deep sleep, intermittently causing boot:0x4 (DOWNLOAD mode)
-  // and the "waiting for download" hang.  Force GPIO8 HIGH and hold it
-  // through deep sleep so the strapping read always sees the correct level.
-  pinMode(8, OUTPUT);
-  digitalWrite(8, HIGH);
-  gpio_hold_en(GPIO_NUM_8);
-  // On ESP32-C6 (SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP), gpio_hold_en()
-  // already persists through deep sleep — no global enable call is needed.
-
   // Stop ALL BLE subsystems before deep sleep — ESP-IDF requires BT fully stopped.
   // Both stop() methods guard on isInitialized internally, so they're safe no-ops
   // if the subsystem was never started. Leaving either active causes POWERON reset.
   bleBeacon.stop();
   bleScanner.stop();
   Serial.println("[BLE-MESH] Stopped BLE before deep sleep");
+
+  // GPIO8 is the boot strapping pin on ESP32-C6:
+  //   HIGH → normal SPI boot,  LOW → download mode.
+  // The onboard RGB LED on GPIO8 can pull the line LOW during a power-on
+  // reset after deep sleep, intermittently causing boot:0x4 (DOWNLOAD mode)
+  // and the "waiting for download" hang.  Force GPIO8 HIGH and hold it
+  // through deep sleep so the strapping read always sees the correct level.
+  // Done AFTER BLE stop to prevent BLEDevice::deinit() from interfering
+  // with the GPIO state.
+  pinMode(8, OUTPUT);
+  digitalWrite(8, HIGH);
+  gpio_hold_en(GPIO_NUM_8);
+  // On ESP32-C6 (SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP), gpio_hold_en()
+  // sets the per-pin hold, but esp_sleep_enable_gpio_hold() is ALSO needed
+  // to make holds persist through deep sleep.  Without the global enable,
+  // GPIO8 floats LOW on wake → boot:0x4 DOWNLOAD mode.
+  esp_sleep_enable_gpio_hold();
   
   Serial.printf("[SLEEP] Entering deep sleep for %u seconds.\n", seconds);
   Serial.flush();
