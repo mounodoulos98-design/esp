@@ -18,6 +18,7 @@ extern "C" {
 #include "esp_pm.h"
 #include "driver/gpio.h"
 #include "esp_sleep.h"
+#include "esp_wifi.h"
 }
 
 // === SAFE AP bring-up helper (final stable) ===
@@ -119,6 +120,7 @@ static constexpr unsigned long REPEATER_AWAKE_AFTER_SLEEP_MS = 2500; // stay awa
 static constexpr unsigned long WIFI_DISCONNECT_SETTLE_MS = 100;  // delay after WiFi.disconnect() before WiFi.begin() to let radio settle
 static bool s_pmAutoSleepActive = false;   // true when RTOS PM auto light-sleep is active
 static bool s_btWakeupEnabled   = false;   // true after esp_sleep_enable_bt_wakeup() succeeded
+static bool s_wifiWakeupEnabled = false;   // true after esp_sleep_enable_wifi_wakeup() succeeded
 static uint8_t         s_measureRing[MEASURE_RING_SIZE];
 static volatile size_t s_measureRingHead = 0;   // written only by onBody callback
 static volatile size_t s_measureRingTail = 0;   // read/advanced only by drainMeasureBuffer()
@@ -787,7 +789,8 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
   
   WiFiClient client;
   Serial.printf("[HTTP UP] Connecting to %s:%d...\n", targetHost.c_str(), config.uplinkPort);
-  if (!client.connect(targetHost.c_str(), config.uplinkPort)) {
+  esp_task_wdt_reset();  // feed WDT before potentially slow TCP connect
+  if (!client.connect(targetHost.c_str(), config.uplinkPort, 5000)) {
     Serial.println("[HTTP UP] Connect failed");
     f.close();
     return false;
@@ -803,6 +806,7 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
 
   client.print(head);
   client.print(pre);
+  esp_task_wdt_reset();  // feed WDT after header send (can block on slow link)
   uint8_t buf[SD_CHUNK_SIZE];
   while (f.available()) {
     int rd = f.read(buf, sizeof(buf));
@@ -812,6 +816,7 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
   }
   client.print(post);
   f.close();
+  esp_task_wdt_reset();  // feed WDT after file send completes
 
   unsigned long t0 = millis();
   while (client.connected() && millis() - t0 < 10000) {
@@ -1425,6 +1430,22 @@ void loopOperationalMode() {
                         esp_err_to_name(err));
         }
       }
+
+      // Enable WiFi hardware wake trigger — CPU wakes instantly when a collector
+      // connects to our SoftAP.  Without this, WiFi frames arrive but the CPU
+      // stays asleep until the next timer wake, causing STA connect timeouts on
+      // the collector side.
+      if (!s_wifiWakeupEnabled) {
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);   // required for WiFi light-sleep coexistence
+        esp_err_t err = esp_sleep_enable_wifi_wakeup();
+        if (err == ESP_OK) {
+          s_wifiWakeupEnabled = true;
+          Serial.println("[PM] WiFi wake trigger enabled (cpu wakes on AP events)");
+        } else {
+          Serial.printf("[PM] esp_sleep_enable_wifi_wakeup failed: %s\n",
+                        esp_err_to_name(err));
+        }
+      }
     }
     
     static bool tried = false;
@@ -1455,22 +1476,21 @@ void loopOperationalMode() {
 
     esp_task_wdt_reset();
 
-    // --- Light sleep with BLE wake ---
+    // --- Light sleep with BLE + WiFi wake ---
     // When no WiFi stations are connected (no collector actively transferring),
-    // enter light sleep to save power.  BLE hardware keeps advertising during
-    // light sleep on ESP32-C6, and esp_sleep_enable_bt_wakeup() (registered
-    // once above) causes instant CPU wake on any BLE event (scan response /
-    // connect).  Wake sources persist across multiple esp_light_sleep_start()
-    // calls — no need to re-register them each iteration.
-    // A timer wake-up is also registered so the repeater periodically wakes
-    // for housekeeping (queue forwarding to root).
+    // enter light sleep to save power.  Wake sources (registered once above):
+    //  • esp_sleep_enable_bt_wakeup()   — instant wake on BLE scan/connect
+    //  • esp_sleep_enable_wifi_wakeup() — instant wake when a collector
+    //    associates to the SoftAP (probe/auth/data frames)
+    //  • timer — periodic housekeeping / queue forwarding
+    // Wake sources persist across multiple esp_light_sleep_start() calls.
     int connectedStations = WiFi.softAPgetStationNum();
     if (connectedStations == 0 && !s_measureActive && s_btWakeupEnabled && !s_pmAutoSleepActive) {
       // Register a timer wake so we don't sleep forever — wake every
       // REPEATER_LIGHT_SLEEP_S seconds for housekeeping / queue forwarding.
       esp_sleep_enable_timer_wakeup(REPEATER_LIGHT_SLEEP_S * 1000000ULL);
 
-      Serial.printf("[PM] Repeater entering light sleep (%lus, BLE wake armed)\n",
+      Serial.printf("[PM] Repeater entering light sleep (%lus, BLE+WiFi wake armed)\n",
                     REPEATER_LIGHT_SLEEP_S);
       Serial.flush();
 
