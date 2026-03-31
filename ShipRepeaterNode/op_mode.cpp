@@ -1125,9 +1125,10 @@ void startOperationalMode() {
   // Release any GPIO holds set before the previous deep sleep, so pins can be
   // reconfigured freely.  gpio_hold_dis is safe to call even if the pin was
   // never held (returns ESP_ERR_INVALID_ARG silently).
+  // On ESP32-C6 (SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP), gpio_hold_en()
+  // already persists through deep sleep, so no global enable/disable is needed.
   gpio_hold_dis((gpio_num_t)SD_CS_PIN);
   gpio_hold_dis(GPIO_NUM_8);   // boot strapping pin – held HIGH to prevent DOWNLOAD mode
-  esp_sleep_disable_gpio_hold();
 
   WiFi.mode(WIFI_OFF);
   delay(200);
@@ -1245,11 +1246,9 @@ void goToDeepSleep(unsigned int seconds) {
   pinMode(8, OUTPUT);
   digitalWrite(8, HIGH);
   gpio_hold_en(GPIO_NUM_8);
+  // On ESP32-C6 (SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP), gpio_hold_en()
+  // already persists through deep sleep — no global enable call is needed.
 
-  // Global enable: without this call, gpio_hold_en() only survives light sleep,
-  // NOT deep sleep.  This makes both SD_CS_PIN and GPIO8 holds persist.
-  esp_sleep_enable_gpio_hold();
-  
   // Stop ALL BLE subsystems before deep sleep — ESP-IDF requires BT fully stopped.
   // Both stop() methods guard on isInitialized internally, so they're safe no-ops
   // if the subsystem was never started. Leaving either active causes POWERON reset.
