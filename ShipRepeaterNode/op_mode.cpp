@@ -1309,14 +1309,28 @@ void goToDeepSleep(unsigned int seconds) {
   // through deep sleep so the strapping read always sees the correct level.
   // Done AFTER BLE stop to prevent BLEDevice::deinit() from interfering
   // with the GPIO state.
-  pinMode(8, OUTPUT);
-  digitalWrite(8, HIGH);
+  //
+  // gpio_reset_pin() detaches any peripheral (RMT, SPI, etc.) that may have
+  // been routed to GPIO8 and restores it to a clean GPIO state.  Without
+  // this, a lingering peripheral connection can override the output driver
+  // and the hold latch, letting the LED circuit pull the pin LOW.
+  gpio_reset_pin(GPIO_NUM_8);
+  gpio_config_t io8 = {};
+  io8.pin_bit_mask  = (1ULL << GPIO_NUM_8);
+  io8.mode          = GPIO_MODE_OUTPUT;
+  io8.pull_up_en    = GPIO_PULLUP_ENABLE;   // internal pull-up as safety net
+  io8.pull_down_en  = GPIO_PULLDOWN_DISABLE;
+  gpio_config(&io8);
+  gpio_set_drive_capability(GPIO_NUM_8, GPIO_DRIVE_CAP_3);   // max drive
+  gpio_set_level(GPIO_NUM_8, 1);
   gpio_hold_en(GPIO_NUM_8);
   // On ESP32-C6 (SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP), gpio_hold_en()
   // sets the per-pin hold, but esp_sleep_enable_gpio_hold() is ALSO needed
   // to make holds persist through deep sleep.  Without the global enable,
   // GPIO8 floats LOW on wake → boot:0x4 DOWNLOAD mode.
   esp_sleep_enable_gpio_hold();
+  Serial.printf("[GPIO8] Strapping pin forced HIGH, hold enabled (level=%d)\n",
+                gpio_get_level(GPIO_NUM_8));
   
   Serial.printf("[SLEEP] Entering deep sleep for %u seconds.\n", seconds);
   Serial.flush();
