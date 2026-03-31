@@ -17,6 +17,7 @@ extern "C" {
 #include "esp_event.h"
 #include "esp_pm.h"
 #include "driver/gpio.h"
+#include "esp_sleep.h"
 }
 
 // === SAFE AP bring-up helper (final stable) ===
