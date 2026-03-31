@@ -16,14 +16,17 @@
 // Advertises the node's presence so children can discover and wake it up
 class BLEBeaconManager {
 public:
-    // Default advertising interval: ~1285ms in 0.625ms units (0x0808).
-    // Low duty-cycle advertising dramatically reduces Tx power consumption.
-    // The scanner's near-continuous scan window (99/100) guarantees detection
-    // within a single 5-second scan period (~3-4 advertisement opportunities).
-    static constexpr uint16_t ADV_INTERVAL_LOW_POWER = 0x0808; // 1285ms
+    // Advertising interval: ~200ms in 0.625ms units (0x0140 = 320 units).
+    // On ESP32-C6 with manual light sleep, advertising pauses during sleep
+    // and only fires during the short awake window (~2.5s). A 200ms interval
+    // produces ~10-12 advertisements per awake window, making detection very
+    // reliable within the collector's 10-second scan.
+    // (Previous value 0x0808 = 1285ms gave ≤1 advertisement per awake window,
+    // which was too unreliable — the collector often missed it entirely.)
+    static constexpr uint16_t ADV_INTERVAL_DEFAULT = 0x0140; // 200ms
 
     void begin(const String& apSSID, const String& nodeName, uint8_t nodeRole,
-               uint16_t advIntervalUnits = ADV_INTERVAL_LOW_POWER) {
+               uint16_t advIntervalUnits = ADV_INTERVAL_DEFAULT) {
         Serial.println("[BLE-BEACON] Initializing BLE Beacon...");
         
         // Initialize BLE
@@ -109,6 +112,9 @@ public:
         if (isInitialized) {
             BLEDevice::deinit(true);
             isInitialized = false;
+            // Same delay as BLEScannerManager::stop() — let the BT controller
+            // fully release the shared radio before WiFi operations.
+            delay(500);
             Serial.println("[BLE-BEACON] BLE Beacon stopped");
         }
     }
@@ -297,6 +303,11 @@ public:
             pBLEScan->stop();
             BLEDevice::deinit(true);
             isInitialized = false;
+            // On ESP32-C6 the BLE and WiFi share the same radio controller.
+            // BLEDevice::deinit(true) releases BT resources asynchronously;
+            // calling WiFi.begin() too soon causes a hardware POWERON reset.
+            // 500ms is sufficient for the BT controller to fully shut down.
+            delay(500);
             Serial.println("[BLE-SCAN] BLE Scanner stopped");
         }
     }

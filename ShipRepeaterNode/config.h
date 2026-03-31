@@ -90,7 +90,7 @@ struct NodeConfig {
   
   // BLE Mesh Wake-up Configuration
   bool bleBeaconEnabled = true;  // Enable BLE beacon for parent discovery (Repeater/Root)
-  int bleScanDurationSec = 5;    // Duration to scan for parent nodes (Collector/Repeater)
+  int bleScanDurationSec = 10;   // Duration to scan for parent nodes (Collector/Repeater)
 };
 
 // Extern declarations
