@@ -644,7 +644,7 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
     }
   }
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[TIME] STA connect failed");
+    Serial.printf("[TIME] STA connect failed (status=%d)\n", (int)WiFi.status());
     return false;
   }
   // Auto-detect parent IP if not configured (use gateway IP from DHCP)
@@ -774,7 +774,7 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { esp_task_wdt_reset(); delay(200); }
   }
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[UPLINK] STA connect failed");
+    Serial.printf("[UPLINK] STA connect failed (status=%d)\n", (int)WiFi.status());
     f.close();
     return false;
   }
@@ -1456,7 +1456,7 @@ void loopOperationalMode() {
       syncTimeFromUplink(5000);
     }
 
-    // Periodically forward queued files (received from collectors) to root.
+    // Periodically maintain uplink STA connection and forward queued files.
     // Check every 60 seconds to avoid thrashing WiFi STA while AP is active.
     // The repeater runs in AP_STA mode, so the AP remains active while STA
     // connects to root for forwarding.
@@ -1464,6 +1464,28 @@ void loopOperationalMode() {
     static constexpr unsigned long QUEUE_CHECK_INTERVAL_MS = 60000;
     if (millis() - lastQueueCheck > QUEUE_CHECK_INTERVAL_MS) {
       lastQueueCheck = millis();
+
+      // Maintain uplink STA connection — retry periodically if disconnected.
+      // Without this the repeater sits in the light-sleep loop forever after
+      // the initial connect attempt fails (STA never retries).
+      if (config.uplinkSSID.length() > 0 && WiFi.status() != WL_CONNECTED) {
+        WiFi.disconnect(false);
+        delay(WIFI_DISCONNECT_SETTLE_MS);
+        Serial.printf("[UPLINK] Connecting STA to %s...\n", config.uplinkSSID.c_str());
+        WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
+        unsigned long t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+          esp_task_wdt_reset();
+          delay(200);
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+          Serial.printf("[UPLINK] STA connected to %s (IP=%s)\n",
+                        config.uplinkSSID.c_str(), WiFi.localIP().toString().c_str());
+        } else {
+          Serial.printf("[UPLINK] STA connect failed (status=%d)\n", (int)WiFi.status());
+        }
+      }
+
       String oldest;
       if (findOldestQueueFile(oldest)) {
         String base = oldest.substring(String(QUEUE_DIR).length() + 1);
