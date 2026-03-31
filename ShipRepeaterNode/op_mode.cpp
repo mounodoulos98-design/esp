@@ -114,6 +114,7 @@ static constexpr size_t        MEASURE_RING_SIZE        = 65536; // must stay a 
 static_assert((MEASURE_RING_SIZE & (MEASURE_RING_SIZE - 1)) == 0, "MEASURE_RING_SIZE must be a power of 2");
 static constexpr unsigned long MEASURE_DRAIN_TIMEOUT_MS = 30000;
 static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 2;     // light sleep duration (manual fallback, kept short so BLE advertising resumes quickly for collector discovery)
+static constexpr unsigned long REPEATER_AWAKE_AFTER_SLEEP_MS = 1500; // stay awake after light-sleep so BLE sends ≥1 advertisement (adv interval ~1285ms)
 static constexpr unsigned long WIFI_DISCONNECT_SETTLE_MS = 100;  // delay after WiFi.disconnect() before WiFi.begin() to let radio settle
 static bool s_pmAutoSleepActive = false;   // true when RTOS PM auto light-sleep is active
 static bool s_btWakeupEnabled   = false;   // true after esp_sleep_enable_bt_wakeup() succeeded
@@ -1385,6 +1386,12 @@ void loopOperationalMode() {
         Serial.println("[REPEATER] Light sleep armed (manual fallback)");
         esp_task_wdt_reset();
         esp_light_sleep_start();
+        // After waking from light sleep, stay awake long enough for the BLE
+        // controller to fire at least one advertisement (~1285ms interval).
+        // Without this delay the loop re-enters sleep in <1ms and the
+        // collector's 5-second scan never sees the repeater's beacon.
+        esp_task_wdt_reset();
+        delay(REPEATER_AWAKE_AFTER_SLEEP_MS);
       } else {
         delay(10);
       }
