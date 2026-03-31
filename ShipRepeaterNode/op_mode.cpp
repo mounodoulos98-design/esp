@@ -689,6 +689,16 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
 
 void ensureRepeaterHttpServer() {
   if (repeaterHttpActive) return;
+  if (!initSdCard()) {
+    Serial.println("[REPEATER] SD card init failed — HTTP server not started");
+    return;
+  }
+  ensureDir(QUEUE_DIR);
+
+  rptServer.on("/health", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send(200, "application/json", "{\"ok\":true}");
+  });
+
   rptServer.on("/time", HTTP_GET, [](AsyncWebServerRequest* req) {
     time_t now;
     time(&now);
@@ -696,9 +706,46 @@ void ensureRepeaterHttpServer() {
     String json = String("{\"epoch\":") + String((unsigned long)now) + "}";
     req->send(200, "application/json", json);
   });
+
+  // Receive measure/data files from collectors and save to SD queue
+  // for later forwarding to root during the repeater's uplink window.
+  rptServer.on(
+    "/ingest", HTTP_POST,
+    [](AsyncWebServerRequest* request) {},
+    [](AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final) {
+      static FsFile upFile;
+      static String current;
+      if (index == 0) {
+        if (!initSdCard()) {
+          request->send(500, "text/plain", "SD unavailable");
+          return;
+        }
+        ensureDir(QUEUE_DIR);
+        char name[96];
+        snprintf(name, sizeof(name), "%s/%lu_%s", QUEUE_DIR, (unsigned long)millis(), filename.c_str());
+        current = String(name);
+        upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+        if (!upFile) {
+          Serial.printf("[REPEATER] Failed to open queue file: %s\n", current.c_str());
+        } else {
+          Serial.printf("[REPEATER] Receiving file: %s\n", current.c_str());
+        }
+      }
+      if (upFile) { upFile.write(data, len); }
+      if (final) {
+        if (upFile) {
+          upFile.close();
+          request->send(200, "text/plain", "OK");
+          Serial.printf("[REPEATER] Saved file to queue: %s\n", current.c_str());
+        } else {
+          request->send(500, "text/plain", "Write failed");
+        }
+      }
+    });
+
   rptServer.begin();
   repeaterHttpActive = true;
-  Serial.println("[REPEATER] HTTP /time ready on :8080");
+  Serial.println("[REPEATER] HTTP /time, /health, /ingest ready on :8080");
 }
 
 // =============================
@@ -1388,21 +1435,26 @@ void loopOperationalMode() {
       syncTimeFromUplink(5000);
     }
 
-    // Power management strategy (inspired by efficient BLE sensor firmware):
-    //
-    // With esp_pm_configure(light_sleep_enable=true) + esp_sleep_enable_bt_wakeup():
-    //   - The RTOS enters light sleep automatically during idle (no manual call)
-    //   - BLE hardware continues advertising at ~200ms interval during sleep
-    //   - WiFi AP maintains state; stations can connect/send data
-    //   - CPU wakes instantly on: BLE connect/data, WiFi activity, RTOS tick
-    //   - No WDT risk — WiFi subsystem holds PM locks when stations are connected
-    //
-    // Fallback: if esp_pm_configure() failed (CONFIG_PM_ENABLE not set), use
-    // the old manual esp_light_sleep_start() with the station-count guard.
-    // ── DIAGNOSTIC TEST: continuous advertising, NO sleep ──────────
-    // Light sleep is disabled so the repeater advertises non-stop.
-    // If the collector now detects the repeater, the sleep/wake timing
-    // was the root cause; re-enable after confirming.
+    // Periodically forward queued files (received from collectors) to root.
+    // Check every 60 seconds to avoid thrashing WiFi STA while AP is active.
+    // The repeater runs in AP_STA mode, so the AP remains active while STA
+    // connects to root for forwarding.
+    static unsigned long lastQueueCheck = 0;
+    static constexpr unsigned long QUEUE_CHECK_INTERVAL_MS = 60000;
+    if (millis() - lastQueueCheck > QUEUE_CHECK_INTERVAL_MS) {
+      lastQueueCheck = millis();
+      String oldest;
+      if (findOldestQueueFile(oldest)) {
+        String base = oldest.substring(String(QUEUE_DIR).length() + 1);
+        Serial.printf("[REPEATER] Forwarding queued file to root: %s\n", base.c_str());
+        bool ok = uploadFileToRoot(oldest, base);
+        if (ok && initSdCard()) {
+          sd.remove(oldest.c_str());
+          Serial.printf("[REPEATER] Forwarded and removed: %s\n", oldest.c_str());
+        }
+      }
+    }
+
     esp_task_wdt_reset();
     delay(100);  // yield; BLE advertising continues uninterrupted
     return;  // REPEATER manages its own loop; do not enter the state machine below.
