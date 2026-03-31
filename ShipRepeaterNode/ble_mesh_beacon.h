@@ -92,11 +92,15 @@ public:
             Serial.println("[BLE-BEACON] Error: Not initialized");
             return;
         }
+        // Always call BLEDevice::startAdvertising() because on ESP32-C6,
+        // light sleep silently stops hardware advertising while the
+        // isAdvertising flag stays true.  Calling start when already
+        // active is harmless (the BLE stack treats it as a no-op).
+        BLEDevice::startAdvertising();
         if (!isAdvertising) {
-            BLEDevice::startAdvertising();
-            isAdvertising = true;
             Serial.println("[BLE-BEACON] Started advertising");
         }
+        isAdvertising = true;
     }
 
     void stopAdvertising() {
@@ -121,6 +125,12 @@ public:
 
     bool isActive() const {
         return isAdvertising;
+    }
+
+    // Called before light sleep to reset the flag.  Light sleep silently
+    // stops BLE hardware advertising, so the software flag must match.
+    void markAdvertisingStopped() {
+        isAdvertising = false;
     }
 
 private:

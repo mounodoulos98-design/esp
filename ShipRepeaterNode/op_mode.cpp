@@ -1531,6 +1531,10 @@ void loopOperationalMode() {
       // REPEATER_LIGHT_SLEEP_S seconds for housekeeping / queue forwarding.
       esp_sleep_enable_timer_wakeup(REPEATER_LIGHT_SLEEP_S * 1000000ULL);
 
+      // Light sleep silently stops BLE hardware advertising.  Reset the
+      // flag so startAdvertising() logs the restart after wake.
+      bleBeacon.markAdvertisingStopped();
+
       Serial.printf("[PM] Repeater entering light sleep (%lus, BLE+WiFi wake armed)\n",
                     REPEATER_LIGHT_SLEEP_S);
       Serial.flush();
@@ -1544,9 +1548,8 @@ void loopOperationalMode() {
 
       // BLE advertising does NOT auto-resume after esp_light_sleep_start()
       // on ESP32-C6.  Explicitly restart it so collectors can discover us.
-      if (bleBeacon.isActive()) {
-        bleBeacon.startAdvertising();
-      }
+      // (startAdvertising() already checks isInitialized internally.)
+      bleBeacon.startAdvertising();
 
       // Stay awake briefly so the BLE advertisements actually go out and
       // any incoming HTTP requests can be serviced before we sleep again.
