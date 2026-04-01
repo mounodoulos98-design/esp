@@ -16,14 +16,12 @@
 // Advertises the node's presence so children can discover and wake it up
 class BLEBeaconManager {
 public:
-    // Advertising interval: ~200ms in 0.625ms units (0x0140 = 320 units).
+    // Advertising interval: ~20ms in 0.625ms units (0x0020 = 32 units).
     // On ESP32-C6 with manual light sleep, advertising pauses during sleep
-    // and only fires during the short awake window (~2.5s). A 200ms interval
-    // produces ~10-12 advertisements per awake window, making detection very
-    // reliable within the collector's 10-second scan.
-    // (Previous value 0x0808 = 1285ms gave ≤1 advertisement per awake window,
-    // which was too unreliable — the collector often missed it entirely.)
-    static constexpr uint16_t ADV_INTERVAL_DEFAULT = 0x0140; // 200ms
+    // and only fires during the awake window (~15 min). A 20ms interval
+    // produces a very high advertisement rate, maximising the chance the
+    // collector's 5-10 second BLE scan picks up the repeater.
+    static constexpr uint16_t ADV_INTERVAL_DEFAULT = 0x0020; // 20ms
 
     void begin(const String& apSSID, const String& nodeName, uint8_t nodeRole,
                uint16_t advIntervalUnits = ADV_INTERVAL_DEFAULT) {

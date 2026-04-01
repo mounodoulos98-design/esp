@@ -116,7 +116,7 @@ static constexpr size_t        MEASURE_RING_SIZE        = 65536; // must stay a 
 static_assert((MEASURE_RING_SIZE & (MEASURE_RING_SIZE - 1)) == 0, "MEASURE_RING_SIZE must be a power of 2");
 static constexpr unsigned long MEASURE_DRAIN_TIMEOUT_MS = 30000;
 static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 2;     // light sleep duration (timer wake for periodic housekeeping; also wakes instantly on BLE events)
-static constexpr unsigned long REPEATER_AWAKE_AFTER_SLEEP_MS = 2500; // stay awake after light-sleep so BLE sends ≥10 advertisements (adv interval ~200ms)
+static constexpr unsigned long REPEATER_AWAKE_AFTER_SLEEP_MS = 900000; // stay awake 15 min after light-sleep so BLE sends many advertisements (adv interval ~20ms)
 static constexpr unsigned long WIFI_DISCONNECT_SETTLE_MS = 100;  // delay after WiFi.disconnect() before WiFi.begin() to let radio settle
 static bool s_pmAutoSleepActive = false;   // true when RTOS PM auto light-sleep is active
 static bool s_btWakeupEnabled   = false;   // true after esp_sleep_enable_bt_wakeup() succeeded
@@ -1430,7 +1430,7 @@ void loopOperationalMode() {
     ensureWiFiAPRepeater();
     ensureRepeaterHttpServer();
     
-    // Start BLE beacon once (~200ms advertising interval for reliable detection)
+    // Start BLE beacon once (~20ms advertising interval for reliable detection)
     if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
       String actualAPSSID = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
       bleBeacon.begin(actualAPSSID, config.nodeName, 0); // 0 = Repeater role
