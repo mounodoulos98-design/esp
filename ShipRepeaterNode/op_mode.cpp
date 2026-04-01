@@ -1525,8 +1525,17 @@ void loopOperationalMode() {
     //    associates to the SoftAP (probe/auth/data frames)
     //  • timer — periodic housekeeping / queue forwarding
     // Wake sources persist across multiple esp_light_sleep_start() calls.
+    //
+    // The repeater stays awake for REPEATER_AWAKE_AFTER_SLEEP_MS (15 min)
+    // continuously advertising at 20ms intervals, then briefly enters a 2s
+    // light sleep before the next awake window.  This non-blocking approach
+    // lets the main loop keep feeding the WDT and servicing HTTP requests.
+    static unsigned long s_lastWakeMillis = 0;  // timestamp of last light-sleep wake
+
     int connectedStations = WiFi.softAPgetStationNum();
-    if (connectedStations == 0 && !s_measureActive && s_btWakeupEnabled && !s_pmAutoSleepActive) {
+    bool awakeWindowExpired = (millis() - s_lastWakeMillis) >= REPEATER_AWAKE_AFTER_SLEEP_MS;
+
+    if (connectedStations == 0 && !s_measureActive && s_btWakeupEnabled && !s_pmAutoSleepActive && awakeWindowExpired) {
       // Register a timer wake so we don't sleep forever — wake every
       // REPEATER_LIGHT_SLEEP_S seconds for housekeeping / queue forwarding.
       esp_sleep_enable_timer_wakeup(REPEATER_LIGHT_SLEEP_S * 1000000ULL);
@@ -1551,12 +1560,13 @@ void loopOperationalMode() {
       // (startAdvertising() already checks isInitialized internally.)
       bleBeacon.startAdvertising();
 
-      // Stay awake briefly so the BLE advertisements actually go out and
-      // any incoming HTTP requests can be serviced before we sleep again.
-      delay(REPEATER_AWAKE_AFTER_SLEEP_MS);
+      // Record wake time — the loop will keep running (non-blocking) for
+      // REPEATER_AWAKE_AFTER_SLEEP_MS before entering light sleep again.
+      s_lastWakeMillis = millis();
     } else {
-      // Stations connected or transfer in progress — stay awake and let
-      // the async HTTP server handle traffic.  Short delay to yield CPU.
+      // Either still in the awake window, stations connected, or transfer
+      // in progress — stay awake and let the async HTTP server handle
+      // traffic.  Short delay to yield CPU.
       delay(50);
     }
 
