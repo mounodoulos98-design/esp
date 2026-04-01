@@ -790,6 +790,9 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
   WiFiClient client;
   Serial.printf("[HTTP UP] Connecting to %s:%d...\n", targetHost.c_str(), config.uplinkPort);
   esp_task_wdt_reset();  // feed WDT before potentially slow TCP connect
+  delay(1);              // yield to IDLE task — on single-core ESP32-C6,
+                         // client.connect() blocks without yielding and
+                         // consecutive uploads can starve the IDLE WDT.
   // 5 s timeout: long enough for WiFi handshake on a busy mesh link,
   // short enough to stay well within the 30 s WDT window.
   if (!client.connect(targetHost.c_str(), config.uplinkPort, 5000)) {
@@ -814,7 +817,7 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
     int rd = f.read(buf, sizeof(buf));
     if (rd > 0) client.write(buf, rd);
     esp_task_wdt_reset();   // feed WDT — large files (>900 KB) can take >30 s over WiFi
-    delay(0);
+    delay(1);               // yield to IDLE task (delay(0) may not context-switch on single-core C6)
   }
   client.print(post);
   f.close();
@@ -1503,14 +1506,20 @@ void loopOperationalMode() {
         }
       }
 
-      String oldest;
-      if (findOldestQueueFile(oldest)) {
-        String base = oldest.substring(String(QUEUE_DIR).length() + 1);
-        Serial.printf("[REPEATER] Forwarding queued file to root: %s\n", base.c_str());
-        bool ok = uploadFileToRoot(oldest, base);
-        if (ok && initSdCard()) {
-          sd.remove(oldest.c_str());
-          Serial.printf("[REPEATER] Forwarded and removed: %s\n", oldest.c_str());
+      // Only forward queued files when STA is connected to a real parent.
+      // Without this guard the auto-detected gateway may resolve to the
+      // repeater's own SoftAP IP, causing an infinite self-upload loop
+      // that eventually triggers the WDT.
+      if (WiFi.status() == WL_CONNECTED) {
+        String oldest;
+        if (findOldestQueueFile(oldest)) {
+          String base = oldest.substring(String(QUEUE_DIR).length() + 1);
+          Serial.printf("[REPEATER] Forwarding queued file to root: %s\n", base.c_str());
+          bool ok = uploadFileToRoot(oldest, base);
+          if (ok && initSdCard()) {
+            sd.remove(oldest.c_str());
+            Serial.printf("[REPEATER] Forwarded and removed: %s\n", oldest.c_str());
+          }
         }
       }
     }
