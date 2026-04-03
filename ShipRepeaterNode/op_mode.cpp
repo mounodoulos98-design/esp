@@ -74,6 +74,11 @@ extern void resetSdCard();
 #define INITIAL_SYNC_TIMEOUT_MS 180000
 #endif
 
+// TCP connect timeout used for all outgoing HTTP requests.
+// 5 s is long enough for a WiFi mesh handshake, short enough to stay
+// well within the 30 s WDT window even with a WDT-reset before connect.
+static constexpr int HTTP_CONNECT_TIMEOUT_MS = 5000;
+
 // =============================
 // State & Global Variables
 // =============================
@@ -659,7 +664,7 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
   WiFiClient client;
   esp_task_wdt_reset();
   delay(1);   // yield to IDLE task before blocking connect
-  if (!client.connect(targetHost.c_str(), config.uplinkPort, 5000)) {
+  if (!client.connect(targetHost.c_str(), config.uplinkPort, HTTP_CONNECT_TIMEOUT_MS)) {
     Serial.println("[TIME] Connect host failed");
     return false;
   }
@@ -809,7 +814,7 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
                          // consecutive uploads can starve the IDLE WDT.
   // 5 s timeout: long enough for WiFi handshake on a busy mesh link,
   // short enough to stay well within the 30 s WDT window.
-  if (!client.connect(targetHost.c_str(), config.uplinkPort, 5000)) {
+  if (!client.connect(targetHost.c_str(), config.uplinkPort, HTTP_CONNECT_TIMEOUT_MS)) {
     Serial.println("[HTTP UP] Connect failed");
     f.close();
     return false;
@@ -882,7 +887,7 @@ bool downloadFileFromRoot(const String& remotePath, const String& localPath) {
   
   esp_task_wdt_reset();
   delay(1);   // yield to IDLE task before blocking connect
-  if (!client.connect(targetHost.c_str(), config.uplinkPort, 5000)) {
+  if (!client.connect(targetHost.c_str(), config.uplinkPort, HTTP_CONNECT_TIMEOUT_MS)) {
     Serial.println("[DOWNLOAD] Connect failed");
     return false;
   }
@@ -1036,7 +1041,7 @@ static bool doSimpleHttpGet(const String& url, String& bodyOut, unsigned long ti
 
   esp_task_wdt_reset();
   delay(1);   // yield to IDLE task before blocking connect
-  if (!client.connect(host.c_str(), 80, 5000)) {
+  if (!client.connect(host.c_str(), 80, HTTP_CONNECT_TIMEOUT_MS)) {
     Serial.println("[HTTP] connect() failed");
     return false;
   }
