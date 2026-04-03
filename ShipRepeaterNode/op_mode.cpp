@@ -1649,8 +1649,8 @@ void loopOperationalMode() {
     //  • timer — periodic housekeeping / queue forwarding
     // Wake sources persist across multiple esp_light_sleep_start() calls.
     //
-    // The repeater stays awake for REPEATER_AWAKE_AFTER_SLEEP_MS (15 min)
-    // continuously advertising at 20ms intervals, then briefly enters a 2s
+    // The repeater stays awake for REPEATER_AWAKE_AFTER_SLEEP_MS (60s)
+    // continuously advertising at ~100ms intervals, then briefly enters a 2s
     // light sleep before the next awake window.  This non-blocking approach
     // lets the main loop keep feeding the WDT and servicing HTTP requests.
     static unsigned long s_lastWakeMillis = 0;  // timestamp of last light-sleep wake
