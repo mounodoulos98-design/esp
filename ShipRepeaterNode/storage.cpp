@@ -90,6 +90,12 @@ void factoryReset() {
 
 // **ΝΕΕΣ ΣΥΝΑΡΤΗΣΕΙΣ ΓΙΑ ΜΟΝΙΜΗ ΑΠΟΘΗΚΕΥΣΗ ΩΡΑΣ**
 void persistRtcTime(time_t epoch) {
+  // Only persist plausible epochs (after 2023-11-15 ~ 1700000000).
+  // A corrupted or pre-sync RTC value should not overwrite a good one.
+  if (epoch < 1700000000) {
+    Serial.printf("[STORAGE] Skipping persist — epoch %llu looks invalid.\n", (uint64_t)epoch);
+    return;
+  }
   preferences.begin(RTC_NAMESPACE, false);
   preferences.putULong64("epoch", epoch);
   preferences.end();

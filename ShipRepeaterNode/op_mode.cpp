@@ -123,7 +123,7 @@ static constexpr size_t        MEASURE_RING_SIZE        = 65536; // must stay a 
 static_assert((MEASURE_RING_SIZE & (MEASURE_RING_SIZE - 1)) == 0, "MEASURE_RING_SIZE must be a power of 2");
 static constexpr unsigned long MEASURE_DRAIN_TIMEOUT_MS = 30000;
 static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 2;     // light sleep duration (timer wake for periodic housekeeping; also wakes instantly on BLE events)
-static constexpr unsigned long REPEATER_AWAKE_AFTER_SLEEP_MS = 900000; // stay awake 15 min after light-sleep so BLE sends many advertisements (adv interval ~20ms)
+static constexpr unsigned long REPEATER_AWAKE_AFTER_SLEEP_MS = 60000; // stay awake 60s after light-sleep — enough for BLE discovery + data transfer while saving battery
 static constexpr unsigned long WIFI_DISCONNECT_SETTLE_MS = 100;  // delay after WiFi.disconnect() before WiFi.begin() to let radio settle
 static bool s_pmAutoSleepActive = false;   // true when RTOS PM auto light-sleep is active
 static bool s_btWakeupEnabled   = false;   // true after esp_sleep_enable_bt_wakeup() succeeded
@@ -193,7 +193,21 @@ static const char* RECEIVED_DIR = "/received";
 static const char* JOB_FILE = "/jobs/job.json";
 static const char* QUEUE_NS = "queue_store";
 
+static bool s_queueDirVerified    = false;  // cache: /queue exists
+static bool s_receivedDirVerified = false;  // cache: /received exists
+
+// Invalidate ensureDir cache — call alongside markSdStale() so a full
+// reinit also re-checks directory existence.
+static void invalidateEnsureDirCache() {
+  s_queueDirVerified    = false;
+  s_receivedDirVerified = false;
+}
+
 static void ensureDir(const char* path) {
+  // Fast path: if we already verified this directory exists this boot, skip SD I/O.
+  if (strcmp(path, QUEUE_DIR) == 0 && s_queueDirVerified) return;
+  if (strcmp(path, RECEIVED_DIR) == 0 && s_receivedDirVerified) return;
+
   if (!initSdCard()) {
     Serial.printf("[SD] ensureDir(%s): SD unavailable\n", path);
     return; // SD unavailable; caller must handle this
@@ -204,10 +218,14 @@ static void ensureDir(const char* path) {
     if (!sd.mkdir(path)) {
       Serial.printf("[SD] mkdir(%s) failed! (err=0x%02X data=0x%02X)\n",
                     path, sd.sdErrorCode(), sd.sdErrorData());
+      return; // don't cache on failure
     } else {
       Serial.printf("[SD] mkdir(%s) OK\n", path);
     }
   }
+  // Mark as verified so subsequent calls skip the SD check.
+  if (strcmp(path, QUEUE_DIR) == 0) s_queueDirVerified = true;
+  if (strcmp(path, RECEIVED_DIR) == 0) s_receivedDirVerified = true;
 }
 
 // Process buffered heartbeats from main loop (safe for SD and job operations)
@@ -318,7 +336,7 @@ static void appendToHeartbeatLog(const String& sensorSn) {
   }
 }
 
-// next progressive filename: /queue/entry_00000001.bin
+// next progressive filename: /queue/e0000001.bin  (8.3 compatible)
 static String nextQueueFilename() {
   ensureDir(QUEUE_DIR);
   preferences.begin(QUEUE_NS, false);
@@ -327,11 +345,11 @@ static String nextQueueFilename() {
   preferences.putUInt("idx", idx);
   preferences.end();
   char name[64];
-  snprintf(name, sizeof(name), "%s/entry_%08lu.bin", QUEUE_DIR, (unsigned long)idx);
+  snprintf(name, sizeof(name), "%s/e%07lu.bin", QUEUE_DIR, (unsigned long)(idx % 10000000UL));
   return String(name);
 }
 
-// Progressive filename for /api/measure uploads: /queue/measure_XXXXXXXX.bin
+// Progressive filename for /api/measure uploads: /queue/m0000001.bin  (8.3 compatible)
 static String nextMeasureQueuePath() {
   preferences.begin(QUEUE_NS, false);
   uint32_t idx = preferences.getUInt("meas_idx", 0);
@@ -339,7 +357,7 @@ static String nextMeasureQueuePath() {
   preferences.putUInt("meas_idx", idx);
   preferences.end();
   char name[64];
-  snprintf(name, sizeof(name), "%s/measure_%08lu.bin", QUEUE_DIR, (unsigned long)idx);
+  snprintf(name, sizeof(name), "%s/m%07lu.bin", QUEUE_DIR, (unsigned long)(idx % 10000000UL));
   return String(name);
 }
 
@@ -1566,6 +1584,7 @@ void loopOperationalMode() {
       // EMI on shared power rail).  Mark SD stale so the next SD access forces
       // a full reinit rather than using the possibly-corrupted SPI state.
       markSdStale();
+      invalidateEnsureDirCache();
     }
 
     // Periodically maintain uplink STA connection and forward queued files.
@@ -1598,6 +1617,7 @@ void loopOperationalMode() {
         }
         // WiFi TX may have disrupted SPI bus — force SD reinit on next access
         markSdStale();
+        invalidateEnsureDirCache();
       }
 
       // Only forward queued files when STA is connected to a real parent.
@@ -1661,6 +1681,7 @@ void loopOperationalMode() {
       // SPI peripheral may lose state during light sleep — mark SD as stale
       // so the next SD operation forces a full reinit.
       markSdStale();
+      invalidateEnsureDirCache();
 
       // BLE advertising does NOT auto-resume after esp_light_sleep_start()
       // on ESP32-C6.  Explicitly restart it so collectors can discover us.
