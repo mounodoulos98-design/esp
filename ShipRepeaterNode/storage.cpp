@@ -220,6 +220,31 @@ void resetSdCard() {
   if (sdCardMutex == nullptr) return;
   if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(500)) == pdFALSE) return;
   sd.end();
+  SPI.end();
+
+  // Drive all SPI lines LOW to drain the SD card's internal capacitors.
+  // This forces a full power-cycle of the card's logic — a simple SPI reinit
+  // is not enough when the card enters an error state after a brown-out or
+  // EMI from WiFi TX activity.
+  pinMode(SD_CS_PIN,   OUTPUT);  digitalWrite(SD_CS_PIN,   LOW);
+  pinMode(SD_SCK_PIN,  OUTPUT);  digitalWrite(SD_SCK_PIN,  LOW);
+  pinMode(SD_MOSI_PIN, OUTPUT);  digitalWrite(SD_MOSI_PIN, LOW);
+  pinMode(SD_MISO_PIN, INPUT_PULLDOWN);
+  delay(200);  // allow card to fully discharge
+
+  // Return CS HIGH (deselected) before re-init
+  digitalWrite(SD_CS_PIN, HIGH);
+
+  sdInitialized = false;
+  lastFailMillis = 0;
+  xSemaphoreGive(sdCardMutex);
+}
+
+// Mark SD as needing re-init without tearing down the bus.
+// Call after light sleep wake — the SPI peripheral may have lost state.
+void markSdStale() {
+  if (sdCardMutex == nullptr) return;
+  if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(500)) == pdFALSE) return;
   sdInitialized = false;
   lastFailMillis = 0;
   xSemaphoreGive(sdCardMutex);

@@ -69,6 +69,7 @@ static bool safeBringUpAP(const String& ssidIn, const String& passIn, const Stri
 // External SD init / reset
 extern bool initSdCard();
 extern void resetSdCard();
+extern void markSdStale();
 
 #ifndef INITIAL_SYNC_TIMEOUT_MS
 #define INITIAL_SYNC_TIMEOUT_MS 180000
@@ -368,7 +369,8 @@ static void drainMeasureBuffer() {
     s_measureQueuePath = nextMeasureQueuePath();
     measureFile = sd.open(s_measureQueuePath.c_str(), O_RDWR | O_CREAT | O_TRUNC);
     if (!measureFile) {
-      Serial.printf("[UPLOAD] Failed to open queue file: %s\n", s_measureQueuePath.c_str());
+      Serial.printf("[UPLOAD] Failed to open queue file (err=0x%02X data=0x%02X): %s\n",
+                    sd.sdErrorCode(), sd.sdErrorData(), s_measureQueuePath.c_str());
       s_measureActive  = false;
       s_measureSendDone = false;
       s_measureFailed  = true;
@@ -739,15 +741,19 @@ void ensureRepeaterHttpServer() {
         current = String(name);
         upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
         if (!upFile) {
-          // SD card may have become unresponsive — force full re-init and retry once.
-          Serial.printf("[REPEATER] sd.open failed, forcing SD reinit for: %s\n", current.c_str());
-          resetSdCard();
+          // SD card may have lost SPI state (WiFi TX brown-out, light sleep, EMI).
+          // Force a full power-cycle reset (drives SPI lines LOW to drain the card)
+          // and retry.
+          Serial.printf("[REPEATER] sd.open failed (err=0x%02X data=0x%02X), forcing SD power-cycle for: %s\n",
+                        sd.sdErrorCode(), sd.sdErrorData(), current.c_str());
+          resetSdCard();          // full SPI power-cycle + sd.end()
           if (initSdCard()) {
             ensureDir(QUEUE_DIR);
             upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
           }
           if (!upFile) {
-            Serial.printf("[REPEATER] Failed to open queue file after reinit: %s\n", current.c_str());
+            Serial.printf("[REPEATER] Failed to open queue file after reinit (err=0x%02X data=0x%02X): %s\n",
+                          sd.sdErrorCode(), sd.sdErrorData(), current.c_str());
             openFailed = true;
             request->send(500, "text/plain", "SD write failed");
             return;
@@ -1505,6 +1511,10 @@ void loopOperationalMode() {
     if (!tried) {
       tried = true;
       syncTimeFromUplink(5000);
+      // WiFi TX during time sync may have disrupted the SPI bus (brown-out /
+      // EMI on shared power rail).  Mark SD stale so the next SD access forces
+      // a full reinit rather than using the possibly-corrupted SPI state.
+      markSdStale();
     }
 
     // Periodically maintain uplink STA connection and forward queued files.
@@ -1535,6 +1545,8 @@ void loopOperationalMode() {
         } else {
           Serial.printf("[UPLINK] STA connect failed (status=%d)\n", (int)WiFi.status());
         }
+        // WiFi TX may have disrupted SPI bus — force SD reinit on next access
+        markSdStale();
       }
 
       // Only forward queued files when STA is connected to a real parent.
@@ -1594,6 +1606,10 @@ void loopOperationalMode() {
       esp_task_wdt_reset();  // feed WDT immediately after wake
       esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
       Serial.printf("[PM] Repeater woke from light sleep (cause=%d)\n", (int)wc);
+
+      // SPI peripheral may lose state during light sleep — mark SD as stale
+      // so the next SD operation forces a full reinit.
+      markSdStale();
 
       // BLE advertising does NOT auto-resume after esp_light_sleep_start()
       // on ESP32-C6.  Explicitly restart it so collectors can discover us.
