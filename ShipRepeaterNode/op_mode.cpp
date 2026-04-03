@@ -750,38 +750,61 @@ void ensureRepeaterHttpServer() {
           // SD card may have lost SPI state (WiFi TX brown-out, light sleep, EMI).
           // Force a full power-cycle reset (drives SPI lines LOW to drain the card)
           // and retry.
+          uint8_t e1 = sd.sdErrorCode(), d1 = sd.sdErrorData();
           Serial.printf("[REPEATER] sd.open failed (err=0x%02X data=0x%02X), forcing SD power-cycle for: %s\n",
-                        sd.sdErrorCode(), sd.sdErrorData(), current.c_str());
+                        e1, d1, current.c_str());
           resetSdCard();          // full SPI power-cycle + sd.end()
           if (initSdCard()) {
             ensureDir(QUEUE_DIR);
+
             // --- DEBUG: diagnose why sd.open() fails after successful reinit ---
+            bool qExists = sd.exists(QUEUE_DIR);
             Serial.printf("[REPEATER][DBG] /queue exists=%d  fatType=%d  cardType=%d\n",
-                          sd.exists(QUEUE_DIR), sd.fatType(), sd.card()->type());
+                          qExists, sd.fatType(), sd.card()->type());
             Serial.printf("[REPEATER][DBG] filename len=%u  name='%s'\n",
-                          (unsigned)strlen(current.c_str()), current.c_str());
-            uint32_t freeKB = sd.vol()->freeClusterCount() * sd.vol()->sectorsPerCluster() / 2;
-            Serial.printf("[REPEATER][DBG] free space ~%lu KB\n", (unsigned long)freeKB);
+                          (unsigned)current.length(), current.c_str());
+
+            // Count existing files in /queue (detect directory-full)
+            int qCount = 0;
+            {
+              FsFile qDir = sd.open(QUEUE_DIR);
+              if (qDir && qDir.isDir()) {
+                FsFile tmp;
+                while (tmp.openNext(&qDir, O_RDONLY)) { qCount++; tmp.close(); }
+                qDir.close();
+              }
+            }
+            Serial.printf("[REPEATER][DBG] /queue file count=%d\n", qCount);
             // -----------------------------------------------------------------
+
             upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
           }
           if (!upFile) {
+            uint8_t e2 = sd.sdErrorCode(), d2 = sd.sdErrorData();
             Serial.printf("[REPEATER] Failed to open queue file after reinit (err=0x%02X data=0x%02X): %s\n",
-                          sd.sdErrorCode(), sd.sdErrorData(), current.c_str());
-            // --- DEBUG: dump extra diagnostics on the failed open ---
-            Serial.printf("[REPEATER][DBG] post-fail: /queue exists=%d  sdInit=%d\n",
-                          sd.exists(QUEUE_DIR), (int)sd.vol()->fatType());
-            // Try opening a minimal-name test file to see if it's a name issue
+                          e2, d2, current.c_str());
+
+            // --- DEBUG: try a short 8.3-compatible name to distinguish
+            //     filename-length issues from SD/volume issues.
             FsFile testFile = sd.open("/queue/_test.bin", O_WRONLY | O_CREAT | O_TRUNC);
             if (testFile) {
-              Serial.println("[REPEATER][DBG] short-name test file opened OK → filename issue");
+              Serial.println("[REPEATER][DBG] short-name test file opened OK — likely filename/length issue");
               testFile.close();
               sd.remove("/queue/_test.bin");
+
+              // Retry with a truncated fallback name so the upload is not lost
+              char fallback[48];
+              snprintf(fallback, sizeof(fallback), "%s/%lu_ingest.bin",
+                       QUEUE_DIR, (unsigned long)millis());
+              Serial.printf("[REPEATER][DBG] retrying with fallback name: %s\n", fallback);
+              current = String(fallback);
+              upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
             } else {
-              Serial.printf("[REPEATER][DBG] short-name test also failed (err=0x%02X) → SD/dir issue\n",
+              Serial.printf("[REPEATER][DBG] short-name test also failed (err=0x%02X) — SD/volume broken\n",
                             sd.sdErrorCode());
             }
-            // ---------------------------------------------------------
+          }
+          if (!upFile) {
             openFailed = true;
             request->send(500, "text/plain", "SD write failed");
             return;

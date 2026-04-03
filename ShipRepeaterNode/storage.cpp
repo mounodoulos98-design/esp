@@ -203,6 +203,11 @@ bool initSdCard() {
   }
 
   if (success) {
+    // Allow the FAT filesystem to stabilise after mount — the card's
+    // internal controller may still be finishing housekeeping.  Without
+    // this delay the very first sd.open() after a power-cycle reinit
+    // can fail with err=0x00 (no SPI error, but volume not yet ready).
+    delay(50);
     Serial.println("[SD] Card initialized successfully.");
     sdInitialized = true;
     lastFailMillis = 0;
