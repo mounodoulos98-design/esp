@@ -793,7 +793,7 @@ void ensureRepeaterHttpServer() {
               sd.remove("/queue/_test.bin");
 
               // Retry with a truncated fallback name so the upload is not lost
-              char fallback[48];
+              char fallback[64];
               snprintf(fallback, sizeof(fallback), "%s/%lu_ingest.bin",
                        QUEUE_DIR, (unsigned long)millis());
               Serial.printf("[REPEATER][DBG] retrying with fallback name: %s\n", fallback);
