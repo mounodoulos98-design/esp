@@ -229,7 +229,7 @@ void resetSdCard() {
   pinMode(SD_CS_PIN,   OUTPUT);  digitalWrite(SD_CS_PIN,   LOW);
   pinMode(SD_SCK_PIN,  OUTPUT);  digitalWrite(SD_SCK_PIN,  LOW);
   pinMode(SD_MOSI_PIN, OUTPUT);  digitalWrite(SD_MOSI_PIN, LOW);
-  pinMode(SD_MISO_PIN, INPUT_PULLDOWN);
+  pinMode(SD_MISO_PIN, INPUT);          // high-impedance — don't fight SD card's DO driver
   delay(200);  // allow card to fully discharge
 
   // Return CS HIGH (deselected) before re-init
