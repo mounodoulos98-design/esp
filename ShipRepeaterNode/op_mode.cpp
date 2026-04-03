@@ -646,7 +646,7 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
     unsigned long t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeout_ms) {
       esp_task_wdt_reset();
-      delay(200);
+      delay(50);  // shorter yield — keeps lwIP responsive for SoftAP clients on single-core C6
     }
   }
   if (WiFi.status() != WL_CONNECTED) {
@@ -725,8 +725,11 @@ void ensureRepeaterHttpServer() {
     [](AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final) {
       static FsFile upFile;
       static String current;
+      static bool openFailed;  // track SD failure across chunks
       if (index == 0) {
+        openFailed = false;
         if (!initSdCard()) {
+          openFailed = true;
           request->send(500, "text/plain", "SD unavailable");
           return;
         }
@@ -745,6 +748,9 @@ void ensureRepeaterHttpServer() {
           }
           if (!upFile) {
             Serial.printf("[REPEATER] Failed to open queue file after reinit: %s\n", current.c_str());
+            openFailed = true;
+            request->send(500, "text/plain", "SD write failed");
+            return;
           } else {
             Serial.printf("[REPEATER] Receiving file (after reinit): %s\n", current.c_str());
           }
@@ -752,6 +758,8 @@ void ensureRepeaterHttpServer() {
           Serial.printf("[REPEATER] Receiving file: %s\n", current.c_str());
         }
       }
+      // If open already failed on first chunk, skip all subsequent chunks.
+      if (openFailed) return;
       if (upFile) { upFile.write(data, len); }
       if (final) {
         if (upFile) {
@@ -790,7 +798,7 @@ bool uploadFileToRoot(const String& fullPath, const String& basename) {
     Serial.printf("[UPLINK] Connecting STA to %s...\n", config.uplinkSSID.c_str());
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { esp_task_wdt_reset(); delay(200); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { esp_task_wdt_reset(); delay(50); }
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.printf("[UPLINK] STA connect failed (status=%d)\n", (int)WiFi.status());
@@ -866,7 +874,7 @@ bool downloadFileFromRoot(const String& remotePath, const String& localPath) {
     Serial.printf("[DOWNLOAD] Connecting STA to %s...\n", config.uplinkSSID.c_str());
     WiFi.begin(config.uplinkSSID.c_str(), config.uplinkPASS.c_str());
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { esp_task_wdt_reset(); delay(200); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { esp_task_wdt_reset(); delay(50); }
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[DOWNLOAD] STA connect failed");
@@ -1519,7 +1527,7 @@ void loopOperationalMode() {
         unsigned long t0 = millis();
         while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
           esp_task_wdt_reset();
-          delay(200);
+          delay(50);  // shorter yield — keeps lwIP responsive for SoftAP clients on single-core C6
         }
         if (WiFi.status() == WL_CONNECTED) {
           Serial.printf("[UPLINK] STA connected to %s (IP=%s)\n",
