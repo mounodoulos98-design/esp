@@ -116,6 +116,7 @@ void setupStatusLed();
 void setStatusLed(Status newStatus);
 void loopStatusLed();
 bool initSdCard();
+void resetSdCard();
 void persistRtcTime(time_t epoch);
 time_t restoreRtcTime();
 

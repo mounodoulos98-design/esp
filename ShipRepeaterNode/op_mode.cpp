@@ -66,8 +66,9 @@ static bool safeBringUpAP(const String& ssidIn, const String& passIn, const Stri
   return ok_cfg && ok_ap;
 }
 
-// External SD init
+// External SD init / reset
 extern bool initSdCard();
+extern void resetSdCard();
 
 #ifndef INITIAL_SYNC_TIMEOUT_MS
 #define INITIAL_SYNC_TIMEOUT_MS 180000
@@ -656,7 +657,9 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
   }
   
   WiFiClient client;
-  if (!client.connect(targetHost.c_str(), config.uplinkPort)) {
+  esp_task_wdt_reset();
+  delay(1);   // yield to IDLE task before blocking connect
+  if (!client.connect(targetHost.c_str(), config.uplinkPort, 5000)) {
     Serial.println("[TIME] Connect host failed");
     return false;
   }
@@ -728,7 +731,18 @@ void ensureRepeaterHttpServer() {
         current = String(name);
         upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
         if (!upFile) {
-          Serial.printf("[REPEATER] Failed to open queue file: %s\n", current.c_str());
+          // SD card may have become unresponsive — force full re-init and retry once.
+          Serial.printf("[REPEATER] sd.open failed, forcing SD reinit for: %s\n", current.c_str());
+          resetSdCard();
+          if (initSdCard()) {
+            ensureDir(QUEUE_DIR);
+            upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+          }
+          if (!upFile) {
+            Serial.printf("[REPEATER] Failed to open queue file after reinit: %s\n", current.c_str());
+          } else {
+            Serial.printf("[REPEATER] Receiving file (after reinit): %s\n", current.c_str());
+          }
         } else {
           Serial.printf("[REPEATER] Receiving file: %s\n", current.c_str());
         }
@@ -866,7 +880,9 @@ bool downloadFileFromRoot(const String& remotePath, const String& localPath) {
   Serial.printf("[DOWNLOAD] Fetching http://%s:%d%s...\n", 
                 targetHost.c_str(), config.uplinkPort, remotePath.c_str());
   
-  if (!client.connect(targetHost.c_str(), config.uplinkPort)) {
+  esp_task_wdt_reset();
+  delay(1);   // yield to IDLE task before blocking connect
+  if (!client.connect(targetHost.c_str(), config.uplinkPort, 5000)) {
     Serial.println("[DOWNLOAD] Connect failed");
     return false;
   }
@@ -1018,7 +1034,9 @@ static bool doSimpleHttpGet(const String& url, String& bodyOut, unsigned long ti
     return false;
   }
 
-  if (!client.connect(host.c_str(), 80)) {
+  esp_task_wdt_reset();
+  delay(1);   // yield to IDLE task before blocking connect
+  if (!client.connect(host.c_str(), 80, 5000)) {
     Serial.println("[HTTP] connect() failed");
     return false;
   }
@@ -1987,6 +2005,9 @@ void loopOperationalMode() {
 
         if (config.role == ROLE_COLLECTOR) {
           processQueue();
+          esp_task_wdt_reset();   // feed WDT between consecutive file uploads
+          delay(10);              // yield to IDLE task — prevents WDT starvation
+                                  // when uploading many queued files back-to-back
 
           String still;
           if (!findOldestQueueFile(still)) {

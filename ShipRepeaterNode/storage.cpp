@@ -122,6 +122,10 @@ static void sdSendDummyClocks() {
   delay(2);
 }
 
+static bool sdInitialized = false;
+static unsigned long lastFailMillis = 0;
+static constexpr unsigned long SD_RETRY_COOLDOWN_MS = 10000; // 10 seconds
+
 bool initSdCard() {
   // Guard against NULL mutex handle (heap exhaustion at boot).
   if (sdCardMutex == nullptr) {
@@ -130,12 +134,6 @@ bool initSdCard() {
   }
   if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(500)) == pdFALSE)
     return false;
-
-  static bool sdInitialized = false;
-  // Cooldown: after a failed retry sequence, wait before trying again.
-  // Prevents main-loop starvation when SD is absent/broken.
-  static unsigned long lastFailMillis = 0;
-  static constexpr unsigned long SD_RETRY_COOLDOWN_MS = 10000; // 10 seconds
 
   // Αν είναι ήδη initialized, μην το ξαναδοκιμάζεις
   if (sdInitialized) {
@@ -216,5 +214,14 @@ bool initSdCard() {
 
   xSemaphoreGive(sdCardMutex);
   return success;
+}
+
+void resetSdCard() {
+  if (sdCardMutex == nullptr) return;
+  if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(500)) == pdFALSE) return;
+  sd.end();
+  sdInitialized = false;
+  lastFailMillis = 0;
+  xSemaphoreGive(sdCardMutex);
 }
 
