@@ -195,11 +195,15 @@ static const char* QUEUE_NS = "queue_store";
 
 static void ensureDir(const char* path) {
   if (!initSdCard()) {
+    Serial.printf("[SD] ensureDir(%s): SD unavailable\n", path);
     return; // SD unavailable; caller must handle this
   }
-  if (!sd.exists(path)) {
+  bool exists = sd.exists(path);
+  Serial.printf("[SD] ensureDir(%s): exists=%d\n", path, exists);
+  if (!exists) {
     if (!sd.mkdir(path)) {
-      Serial.printf("[SD] mkdir(%s) failed!\n", path);
+      Serial.printf("[SD] mkdir(%s) failed! (err=0x%02X data=0x%02X)\n",
+                    path, sd.sdErrorCode(), sd.sdErrorData());
     } else {
       Serial.printf("[SD] mkdir(%s) OK\n", path);
     }
@@ -739,6 +743,8 @@ void ensureRepeaterHttpServer() {
         char name[96];
         snprintf(name, sizeof(name), "%s/%lu_%s", QUEUE_DIR, (unsigned long)millis(), filename.c_str());
         current = String(name);
+        Serial.printf("[REPEATER][DBG] opening: '%s' (len=%u, buf=%u)\n",
+                      current.c_str(), (unsigned)current.length(), (unsigned)sizeof(name));
         upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
         if (!upFile) {
           // SD card may have lost SPI state (WiFi TX brown-out, light sleep, EMI).
@@ -749,11 +755,33 @@ void ensureRepeaterHttpServer() {
           resetSdCard();          // full SPI power-cycle + sd.end()
           if (initSdCard()) {
             ensureDir(QUEUE_DIR);
+            // --- DEBUG: diagnose why sd.open() fails after successful reinit ---
+            Serial.printf("[REPEATER][DBG] /queue exists=%d  fatType=%d  cardType=%d\n",
+                          sd.exists(QUEUE_DIR), sd.fatType(), sd.card()->type());
+            Serial.printf("[REPEATER][DBG] filename len=%u  name='%s'\n",
+                          (unsigned)strlen(current.c_str()), current.c_str());
+            uint32_t freeKB = sd.vol()->freeClusterCount() * sd.vol()->sectorsPerCluster() / 2;
+            Serial.printf("[REPEATER][DBG] free space ~%lu KB\n", (unsigned long)freeKB);
+            // -----------------------------------------------------------------
             upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
           }
           if (!upFile) {
             Serial.printf("[REPEATER] Failed to open queue file after reinit (err=0x%02X data=0x%02X): %s\n",
                           sd.sdErrorCode(), sd.sdErrorData(), current.c_str());
+            // --- DEBUG: dump extra diagnostics on the failed open ---
+            Serial.printf("[REPEATER][DBG] post-fail: /queue exists=%d  sdInit=%d\n",
+                          sd.exists(QUEUE_DIR), (int)sd.vol()->fatType());
+            // Try opening a minimal-name test file to see if it's a name issue
+            FsFile testFile = sd.open("/queue/_test.bin", O_WRONLY | O_CREAT | O_TRUNC);
+            if (testFile) {
+              Serial.println("[REPEATER][DBG] short-name test file opened OK → filename issue");
+              testFile.close();
+              sd.remove("/queue/_test.bin");
+            } else {
+              Serial.printf("[REPEATER][DBG] short-name test also failed (err=0x%02X) → SD/dir issue\n",
+                            sd.sdErrorCode());
+            }
+            // ---------------------------------------------------------
             openFailed = true;
             request->send(500, "text/plain", "SD write failed");
             return;
