@@ -1626,9 +1626,9 @@ void loopOperationalMode() {
   // On wake: start WiFi AP → accept uploads → forward queue → stop WiFi → sleep
   if (config.role == ROLE_REPEATER) {
 
-    // Start BLE beacon once (persists across sleep/wake cycles).
-    // BLE advertising runs during light sleep on ESP32-C6 when
-    // esp_sleep_enable_bt_wakeup() is active — no WiFi AP needed.
+    // Start BLE beacon once.  Advertising is restarted before each
+    // light sleep entry (WiFi.mode(WIFI_OFF) kills it on ESP32-C6's
+    // shared radio) and again after each wake.
     if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
       String actualAPSSID = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
       bleBeacon.begin(actualAPSSID, config.nodeName, 0); // 0 = Repeater role
@@ -1786,9 +1786,14 @@ void loopOperationalMode() {
       // Register a timer wake for periodic queue forwarding
       esp_sleep_enable_timer_wakeup(REPEATER_LIGHT_SLEEP_S * 1000000ULL);
 
-      // Reset the software flag — on wake we will always restart advertising
-      // regardless of whether the BLE controller kept it alive during sleep.
-      bleBeacon.markAdvertisingStopped();
+      // WiFi.mode(WIFI_OFF) in stopRepeaterWiFiAP() silently kills BLE
+      // hardware advertising on the shared ESP32-C6 radio.  Restart it
+      // so the BLE controller is actively advertising when we enter
+      // light sleep — this is required for esp_sleep_enable_bt_wakeup()
+      // to actually wake us (a sleeping-but-not-advertising radio
+      // cannot receive scan requests).
+      bleBeacon.startAdvertising();
+      delay(50); // let BLE controller stabilise before sleep
 
       Serial.printf("[PM] Repeater entering light sleep (%lus, BLE wake armed, WiFi OFF, awake was %lums)\n",
                     REPEATER_LIGHT_SLEEP_S, awakeWindowMs);
@@ -1811,7 +1816,9 @@ void loopOperationalMode() {
       markSdStale();
       invalidateEnsureDirCache();
 
-      // Restart BLE advertising immediately after wake
+      // Light sleep stops BLE hardware advertising even though the
+      // controller was active before sleep.  Restart it immediately.
+      bleBeacon.markAdvertisingStopped();
       bleBeacon.startAdvertising();
 
       // Record wake time — WiFi AP will be started on next loop iteration

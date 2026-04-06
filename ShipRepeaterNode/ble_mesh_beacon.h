@@ -125,8 +125,10 @@ public:
         return isAdvertising;
     }
 
-    // Called before light sleep to reset the flag.  Light sleep silently
-    // stops BLE hardware advertising, so the software flag must match.
+    // Called after light sleep wake to reset the flag before calling
+    // startAdvertising().  Light sleep silently stops BLE hardware
+    // advertising, so the software flag must be cleared to trigger
+    // the "Started advertising" log on restart.
     void markAdvertisingStopped() {
         isAdvertising = false;
     }
