@@ -122,12 +122,12 @@ static HeartbeatEntry hbBuffer[HB_BUFFER_SIZE];
 static constexpr size_t        MEASURE_RING_SIZE        = 65536; // must stay a power of 2 — 64 KB keeps up with WiFi→SD pipeline
 static_assert((MEASURE_RING_SIZE & (MEASURE_RING_SIZE - 1)) == 0, "MEASURE_RING_SIZE must be a power of 2");
 static constexpr unsigned long MEASURE_DRAIN_TIMEOUT_MS = 30000;
-static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 2;     // light sleep duration (timer wake for periodic housekeeping; also wakes instantly on BLE events)
-static constexpr unsigned long REPEATER_AWAKE_AFTER_SLEEP_MS = 60000; // stay awake 60s after light-sleep — enough for BLE discovery + data transfer while saving battery
+static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 300;   // 5-min timer wake for periodic queue forwarding (BLE wake is instant)
+static constexpr unsigned long REPEATER_AWAKE_AFTER_SLEEP_MS = 10000; // stay awake 10s after wake — enough for data transfer, then back to sleep
 static constexpr unsigned long WIFI_DISCONNECT_SETTLE_MS = 100;  // delay after WiFi.disconnect() before WiFi.begin() to let radio settle
 static bool s_pmAutoSleepActive = false;   // true when RTOS PM auto light-sleep is active
 static bool s_btWakeupEnabled   = false;   // true after esp_sleep_enable_bt_wakeup() succeeded
-static bool s_wifiWakeupEnabled = false;   // true after esp_sleep_enable_wifi_wakeup() succeeded
+static bool s_repeaterWiFiAPActive = false; // true when repeater WiFi AP is running (off during sleep)
 static uint8_t         s_measureRing[MEASURE_RING_SIZE];
 static volatile size_t s_measureRingHead = 0;   // written only by onBody callback
 static volatile size_t s_measureRingTail = 0;   // read/advanced only by drainMeasureBuffer()
@@ -639,25 +639,43 @@ void ensureRootHttpServer() {
   Serial.println("[ROOT] HTTP server started on :8080 (/health, /time, /ingest, /jobs, /firmware)");
 }
 
+static bool s_repeaterAPUp = false;
+
 void ensureWiFiAPRepeater() {
-  static bool up = false;
-  if (up) return;
+  if (s_repeaterAPUp) return;
   String ssid = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
   String pass = config.apPASS;
   String ipStr = config.apIP.length() ? config.apIP : String("192.168.20.1");
   bool ok = safeBringUpAP(ssid, pass, ipStr, "REPEATER");
   if (ok) {
     Serial.printf("[REPEATER] SoftAP %s: OK | IP=%s\n", ssid.c_str(), WiFi.softAPIP().toString().c_str());
+    s_repeaterWiFiAPActive = true;
   } else {
     Serial.println("[REPEATER] Failed to start AP!");
   }
-  up = ok;
+  s_repeaterAPUp = ok;
+}
+
+// Shut down repeater WiFi AP before light sleep to eliminate antenna
+// contention with BLE advertising and save ~80mA.  WiFi AP restarts
+// on-demand when the repeater wakes from BLE or timer.
+void stopRepeaterWiFiAP() {
+  if (!s_repeaterAPUp) return;
+  WiFi.softAPdisconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  s_repeaterAPUp = false;
+  s_repeaterWiFiAPActive = false;
+  repeaterHttpActive = false;  // server needs begin() after WiFi restart
+  Serial.println("[REPEATER] WiFi AP stopped for light sleep (BLE-only mode)");
 }
 
 // =============================
 // REPEATER: lightweight /time relay
 // =============================
-static bool repeaterHttpActive = false;
+static bool repeaterHttpActive = false;       // handlers registered AND server.begin() called
+static bool repeaterHttpRoutesRegistered = false;  // handlers registered (once — re-registration duplicates routes)
 static AsyncWebServer rptServer(8080);
 
 bool syncTimeFromUplink(unsigned long timeout_ms) {
@@ -722,6 +740,13 @@ bool syncTimeFromUplink(unsigned long timeout_ms) {
 }
 
 void ensureRepeaterHttpServer() {
+  // If server was running before (WiFi restart cycle), just re-bind
+  if (repeaterHttpRoutesRegistered && !repeaterHttpActive) {
+    rptServer.begin();
+    repeaterHttpActive = true;
+    Serial.println("[REPEATER] HTTP server restarted on :8080 (routes already registered)");
+    return;
+  }
   if (repeaterHttpActive) return;
   if (!initSdCard()) {
     Serial.println("[REPEATER] SD card init failed — HTTP server not started");
@@ -847,9 +872,54 @@ void ensureRepeaterHttpServer() {
       }
     });
 
+  // Serve job definitions to collectors — relay from local SD cache
+  // (downloaded from root during periodic timer wake).
+  rptServer.on("/jobs/config_jobs.json", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!initSdCard()) { req->send(404, "text/plain", "SD unavailable"); return; }
+    const char* path = "/jobs/config_jobs.json";
+    if (sd.exists(path)) {
+      FsFile f = sd.open(path, O_RDONLY);
+      if (f) {
+        size_t sz = f.size();
+        String content;
+        content.reserve(sz);
+        while (f.available()) content += (char)f.read();
+        f.close();
+        req->send(200, "application/json", content);
+        Serial.println("[REPEATER] Served /jobs/config_jobs.json to collector");
+      } else {
+        req->send(404, "text/plain", "Not found");
+      }
+    } else {
+      req->send(404, "text/plain", "Not found");
+    }
+  });
+
+  rptServer.on("/jobs/firmware_jobs.json", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!initSdCard()) { req->send(404, "text/plain", "SD unavailable"); return; }
+    const char* path = "/jobs/firmware_jobs.json";
+    if (sd.exists(path)) {
+      FsFile f = sd.open(path, O_RDONLY);
+      if (f) {
+        size_t sz = f.size();
+        String content;
+        content.reserve(sz);
+        while (f.available()) content += (char)f.read();
+        f.close();
+        req->send(200, "application/json", content);
+        Serial.println("[REPEATER] Served /jobs/firmware_jobs.json to collector");
+      } else {
+        req->send(404, "text/plain", "Not found");
+      }
+    } else {
+      req->send(404, "text/plain", "Not found");
+    }
+  });
+
   rptServer.begin();
+  repeaterHttpRoutesRegistered = true;
   repeaterHttpActive = true;
-  Serial.println("[REPEATER] HTTP /time, /health, /ingest ready on :8080");
+  Serial.println("[REPEATER] HTTP /time, /health, /ingest, /jobs ready on :8080");
 }
 
 // =============================
@@ -1534,20 +1604,29 @@ void loopOperationalMode() {
     return;
   }
 
-  // REPEATER
+  // REPEATER — "BLE Wake-on-Demand" architecture
+  // ─────────────────────────────────────────────────────────────────
+  // The repeater sleeps in light sleep with ONLY BLE advertising active
+  // (no WiFi AP).  This eliminates WiFi/BLE antenna contention and
+  // reduces sleep current from ~80mA to ~800μA.
+  //
+  // Wake sources:
+  //   • BLE wake (esp_sleep_enable_bt_wakeup) — a collector scanned us
+  //   • Timer wake (REPEATER_LIGHT_SLEEP_S)   — periodic queue forward
+  //
+  // On wake: start WiFi AP → accept uploads → forward queue → stop WiFi → sleep
   if (config.role == ROLE_REPEATER) {
-    ensureWiFiAPRepeater();
-    ensureRepeaterHttpServer();
-    
-    // Start BLE beacon once (~20ms advertising interval for reliable detection)
+
+    // Start BLE beacon once (persists across sleep/wake cycles).
+    // BLE advertising runs during light sleep on ESP32-C6 when
+    // esp_sleep_enable_bt_wakeup() is active — no WiFi AP needed.
     if (config.bleBeaconEnabled && !bleBeacon.isActive()) {
       String actualAPSSID = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
       bleBeacon.begin(actualAPSSID, config.nodeName, 0); // 0 = Repeater role
       bleBeacon.startAdvertising();
-      Serial.println("[BLE-MESH] Repeater BLE beacon active (low-power advertising)");
+      Serial.println("[BLE-MESH] Repeater BLE beacon active (BLE-only, WiFi AP off)");
 
-      // Enable BLE hardware wake trigger — CPU wakes instantly on BLE connect/data.
-      // Must be called AFTER BLEDevice::init() (which happens inside bleBeacon.begin).
+      // Enable BLE hardware wake trigger — CPU wakes instantly on BLE scan/connect.
       if (!s_btWakeupEnabled) {
         esp_err_t err = esp_sleep_enable_bt_wakeup();
         if (err == ESP_OK) {
@@ -1558,47 +1637,47 @@ void loopOperationalMode() {
                         esp_err_to_name(err));
         }
       }
-
-      // Enable WiFi hardware wake trigger — CPU wakes instantly when a collector
-      // connects to our SoftAP.  Without this, WiFi frames arrive but the CPU
-      // stays asleep until the next timer wake, causing STA connect timeouts on
-      // the collector side.
-      if (!s_wifiWakeupEnabled) {
-        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);   // required for WiFi light-sleep coexistence
-        esp_err_t err = esp_sleep_enable_wifi_wakeup();
-        if (err == ESP_OK) {
-          s_wifiWakeupEnabled = true;
-          Serial.println("[PM] WiFi wake trigger enabled (cpu wakes on AP events)");
-        } else {
-          Serial.printf("[PM] esp_sleep_enable_wifi_wakeup failed: %s\n",
-                        esp_err_to_name(err));
-        }
-      }
     }
-    
+
+    // One-time time sync from root (before first sleep)
     static bool tried = false;
     if (!tried) {
       tried = true;
+      // Temporarily bring up WiFi for time sync
+      ensureWiFiAPRepeater();
+      ensureRepeaterHttpServer();
       syncTimeFromUplink(5000);
-      // WiFi TX during time sync may have disrupted the SPI bus (brown-out /
-      // EMI on shared power rail).  Mark SD stale so the next SD access forces
-      // a full reinit rather than using the possibly-corrupted SPI state.
+      // WiFi TX may have disrupted SPI bus — force SD reinit on next access
       markSdStale();
       invalidateEnsureDirCache();
     }
 
-    // Periodically maintain uplink STA connection and forward queued files.
-    // Check every 60 seconds to avoid thrashing WiFi STA while AP is active.
-    // The repeater runs in AP_STA mode, so the AP remains active while STA
-    // connects to root for forwarding.
+    // --- On-demand WiFi AP: start when woken by BLE or timer ---
+    // WiFi AP is only active during the awake window.  During light
+    // sleep the WiFi radio is OFF — only BLE advertising runs.
+    static unsigned long s_lastWakeMillis = 0;  // timestamp of last light-sleep wake
+    static bool s_wifiStartedThisWake = false;  // track if WiFi AP was started this wake cycle
+
+    int connectedStations = s_repeaterWiFiAPActive ? WiFi.softAPgetStationNum() : 0;
+    bool awakeWindowExpired = (millis() - s_lastWakeMillis) >= REPEATER_AWAKE_AFTER_SLEEP_MS;
+
+    // If we're in the awake window and WiFi isn't started yet, start it
+    if (!s_repeaterWiFiAPActive && !awakeWindowExpired) {
+      ensureWiFiAPRepeater();
+      ensureRepeaterHttpServer();
+      s_wifiStartedThisWake = true;
+      // Re-read connected stations now that AP is up
+      connectedStations = WiFi.softAPgetStationNum();
+    }
+
+    // Periodically forward queued files to root (only when WiFi is active)
     static unsigned long lastQueueCheck = 0;
-    static constexpr unsigned long QUEUE_CHECK_INTERVAL_MS = 60000;
-    if (millis() - lastQueueCheck > QUEUE_CHECK_INTERVAL_MS) {
+    static constexpr unsigned long QUEUE_CHECK_INTERVAL_MS = 30000; // check every 30s while awake
+
+    if (s_repeaterWiFiAPActive && (millis() - lastQueueCheck > QUEUE_CHECK_INTERVAL_MS)) {
       lastQueueCheck = millis();
 
-      // Maintain uplink STA connection — retry periodically if disconnected.
-      // Without this the repeater sits in the light-sleep loop forever after
-      // the initial connect attempt fails (STA never retries).
+      // Maintain uplink STA connection for queue forwarding
       if (config.uplinkSSID.length() > 0 && WiFi.status() != WL_CONNECTED) {
         WiFi.disconnect(false);
         delay(WIFI_DISCONNECT_SETTLE_MS);
@@ -1607,7 +1686,7 @@ void loopOperationalMode() {
         unsigned long t0 = millis();
         while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
           esp_task_wdt_reset();
-          delay(50);  // shorter yield — keeps lwIP responsive for SoftAP clients on single-core C6
+          delay(50);
         }
         if (WiFi.status() == WL_CONNECTED) {
           Serial.printf("[UPLINK] STA connected to %s (IP=%s)\n",
@@ -1615,15 +1694,11 @@ void loopOperationalMode() {
         } else {
           Serial.printf("[UPLINK] STA connect failed (status=%d)\n", (int)WiFi.status());
         }
-        // WiFi TX may have disrupted SPI bus — force SD reinit on next access
         markSdStale();
         invalidateEnsureDirCache();
       }
 
-      // Only forward queued files when STA is connected to a real parent.
-      // Without this guard the auto-detected gateway may resolve to the
-      // repeater's own SoftAP IP, causing an infinite self-upload loop
-      // that eventually triggers the WDT.
+      // Forward queued files when STA is connected
       if (WiFi.status() == WL_CONNECTED) {
         String oldest;
         if (findOldestQueueFile(oldest)) {
@@ -1634,71 +1709,70 @@ void loopOperationalMode() {
             sd.remove(oldest.c_str());
             Serial.printf("[REPEATER] Forwarded and removed: %s\n", oldest.c_str());
           }
+        } else {
+          // Queue empty — download job definitions from root so we can
+          // serve them to collectors that connect to our AP.
+          Serial.println("[REPEATER] Queue empty → syncing jobs from root");
+          ensureDir("/jobs");
+          downloadFileFromRoot("/jobs/config_jobs.json", "/jobs/config_jobs.json");
+          downloadFileFromRoot("/jobs/firmware_jobs.json", "/jobs/firmware_jobs.json");
         }
       }
     }
 
     esp_task_wdt_reset();
 
-    // --- Light sleep with BLE + WiFi wake ---
-    // When no WiFi stations are connected (no collector actively transferring),
-    // enter light sleep to save power.  Wake sources (registered once above):
-    //  • esp_sleep_enable_bt_wakeup()   — instant wake on BLE scan/connect
-    //  • esp_sleep_enable_wifi_wakeup() — instant wake when a collector
-    //    associates to the SoftAP (probe/auth/data frames)
-    //  • timer — periodic housekeeping / queue forwarding
-    // Wake sources persist across multiple esp_light_sleep_start() calls.
-    //
-    // The repeater stays awake for REPEATER_AWAKE_AFTER_SLEEP_MS (60s)
-    // continuously advertising at ~100ms intervals, then briefly enters a 2s
-    // light sleep before the next awake window.  This non-blocking approach
-    // lets the main loop keep feeding the WDT and servicing HTTP requests.
-    static unsigned long s_lastWakeMillis = 0;  // timestamp of last light-sleep wake
-
-    int connectedStations = WiFi.softAPgetStationNum();
-    bool awakeWindowExpired = (millis() - s_lastWakeMillis) >= REPEATER_AWAKE_AFTER_SLEEP_MS;
-
+    // --- Light sleep with BLE wake (WiFi OFF) ---
+    // Enter light sleep when:
+    //  • No collectors connected to our WiFi AP
+    //  • No data transfer in progress
+    //  • BLE wake trigger is armed
+    //  • Awake window has expired
     if (connectedStations == 0 && !s_measureActive && s_btWakeupEnabled && !s_pmAutoSleepActive && awakeWindowExpired) {
-      // Register a timer wake so we don't sleep forever — wake every
-      // REPEATER_LIGHT_SLEEP_S seconds for housekeeping / queue forwarding.
+
+      // STOP WiFi AP before sleep — this is the key power saving:
+      // WiFi AP draws ~80mA, BLE-only light sleep draws ~800μA
+      if (s_repeaterWiFiAPActive) {
+        stopRepeaterWiFiAP();
+      }
+
+      // Register a timer wake for periodic queue forwarding
       esp_sleep_enable_timer_wakeup(REPEATER_LIGHT_SLEEP_S * 1000000ULL);
 
-      // Light sleep silently stops BLE hardware advertising.  Reset the
-      // flag so startAdvertising() logs the restart after wake.
+      // Light sleep silently stops BLE hardware advertising — reset flag
       bleBeacon.markAdvertisingStopped();
 
-      Serial.printf("[PM] Repeater entering light sleep (%lus, BLE+WiFi wake armed)\n",
+      Serial.printf("[PM] Repeater entering light sleep (%lus, BLE wake armed, WiFi OFF)\n",
                     REPEATER_LIGHT_SLEEP_S);
       Serial.flush();
 
       esp_light_sleep_start();
 
       // --- woke up ---
-      esp_task_wdt_reset();  // feed WDT immediately after wake
+      esp_task_wdt_reset();
       esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
-      Serial.printf("[PM] Repeater woke from light sleep (cause=%d)\n", (int)wc);
+      Serial.printf("[PM] Repeater woke from light sleep (cause=%d: %s)\n", (int)wc,
+                    wc == ESP_SLEEP_WAKEUP_BT    ? "BLE" :
+                    wc == ESP_SLEEP_WAKEUP_TIMER  ? "TIMER" :
+                    wc == ESP_SLEEP_WAKEUP_WIFI   ? "WIFI" : "OTHER");
 
-      // SPI peripheral may lose state during light sleep — mark SD as stale
-      // so the next SD operation forces a full reinit.
+      // SPI peripheral may lose state during light sleep
       markSdStale();
       invalidateEnsureDirCache();
 
-      // BLE advertising does NOT auto-resume after esp_light_sleep_start()
-      // on ESP32-C6.  Explicitly restart it so collectors can discover us.
-      // (startAdvertising() already checks isInitialized internally.)
+      // Restart BLE advertising immediately after wake
       bleBeacon.startAdvertising();
 
-      // Record wake time — the loop will keep running (non-blocking) for
-      // REPEATER_AWAKE_AFTER_SLEEP_MS before entering light sleep again.
+      // Record wake time — WiFi AP will be started on next loop iteration
       s_lastWakeMillis = millis();
+      s_wifiStartedThisWake = false;
+      lastQueueCheck = 0;  // trigger immediate queue check after wake
     } else {
-      // Either still in the awake window, stations connected, or transfer
-      // in progress — stay awake and let the async HTTP server handle
-      // traffic.  Short delay to yield CPU.
+      // Still in awake window, stations connected, or transfer in progress
       delay(50);
     }
 
-    return;  // REPEATER manages its own loop; do not enter the state machine below.
+    return;  // REPEATER manages its own loop
   }
 
   // NON-ROOT STATE MACHINE
@@ -2029,11 +2103,14 @@ void loopOperationalMode() {
             timeout = config.collectorDataTimeoutSec * 1000UL;
             
             if (timeSinceLastActivity > timeout) {
-              Serial.printf("[AP] %d sensor(s) connected but no activity for %lu sec, entering sleep.\n",
+              Serial.printf("[AP] %d sensor(s) connected but no activity for %lu sec.\n",
                            numConnected, timeSinceLastActivity / 1000);
-              Serial.println("[AP] Inactivity timeout reached.");
+              Serial.println("[AP] Inactivity timeout → immediate uplink.");
               stopAPMode();
-              decideAndGoToSleep();
+              // Immediate uplink: transition directly to MESH_APPOINTMENT
+              // instead of sleeping.  This way data reaches the root ASAP
+              // and the collector can pick up downstream commands.
+              currentState = STATE_MESH_APPOINTMENT;
               break;
             }
           } else {
@@ -2041,13 +2118,16 @@ void loopOperationalMode() {
             timeout = hadStation ? (config.collectorDataTimeoutSec * 1000UL) : (config.collectorApWindowSec * 1000UL);
             
             if (timeSinceLastActivity > timeout) {
-              if (hadStation)
-                Serial.println("[AP] Inactivity timeout reached.");
-              else
-                Serial.println("[AP] Window finished (no station).");
-
               stopAPMode();
-              decideAndGoToSleep();
+              if (hadStation) {
+                // Sensors were served → do immediate uplink before sleeping
+                Serial.println("[AP] Sensors done → immediate uplink.");
+                currentState = STATE_MESH_APPOINTMENT;
+              } else {
+                // No sensors connected at all → just go to sleep
+                Serial.println("[AP] Window finished (no station) → sleeping.");
+                decideAndGoToSleep();
+              }
               break;
             }
           }

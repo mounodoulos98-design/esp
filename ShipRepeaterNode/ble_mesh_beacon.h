@@ -16,13 +16,12 @@
 // Advertises the node's presence so children can discover and wake it up
 class BLEBeaconManager {
 public:
-    // Advertising interval: ~100ms in 0.625ms units (0x00A0 = 160 units).
-    // On ESP32-C6 with manual light sleep, advertising pauses during sleep
-    // and only fires during the awake window (~60s). A 100ms interval
-    // gives ~10 advertisements per second — more than enough for the
-    // collector's 5-10 second BLE scan while consuming far less power
-    // than the previous 20ms interval.
-    static constexpr uint16_t ADV_INTERVAL_DEFAULT = 0x00A0; // 100ms
+    // Advertising interval: ~250ms in 0.625ms units (0x0190 = 400 units).
+    // With the new "BLE Wake-on-Demand" architecture, the repeater sleeps
+    // in light sleep for minutes (not seconds).  A collector scans for 3-5s,
+    // so at 250ms interval it sees ~12-20 advertisements — more than enough
+    // for reliable discovery while reducing BLE power draw during light sleep.
+    static constexpr uint16_t ADV_INTERVAL_DEFAULT = 0x0190; // 250ms
 
     void begin(const String& apSSID, const String& nodeName, uint8_t nodeRole,
                uint16_t advIntervalUnits = ADV_INTERVAL_DEFAULT) {
