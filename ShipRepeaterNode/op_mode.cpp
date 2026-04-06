@@ -1635,7 +1635,7 @@ void loopOperationalMode() {
       bleBeacon.startAdvertising();
       Serial.printf("[BLE-MESH] Repeater BLE beacon active (BLE-only, WiFi AP off, SSID=%s, name=%s)\n",
                     actualAPSSID.c_str(), config.nodeName.c_str());
-      Serial.printf("[BLE-MESH] First boot awake window: %lus (BLE discoverable for this long)\n",
+      Serial.printf("[BLE-MESH] First boot awake window: %lu s (BLE discoverable for this long)\n",
                     REPEATER_FIRST_BOOT_AWAKE_MS / 1000);
 
       // Enable BLE hardware wake trigger — CPU wakes instantly on BLE scan/connect.
