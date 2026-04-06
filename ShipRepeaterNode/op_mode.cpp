@@ -125,6 +125,7 @@ static_assert((MEASURE_RING_SIZE & (MEASURE_RING_SIZE - 1)) == 0, "MEASURE_RING_
 static constexpr unsigned long MEASURE_DRAIN_TIMEOUT_MS = 30000;
 static constexpr unsigned long REPEATER_LIGHT_SLEEP_S   = 300;   // 5-min timer wake for periodic queue forwarding (BLE wake is instant)
 static constexpr unsigned long REPEATER_AWAKE_AFTER_SLEEP_MS = 10000; // stay awake 10s after wake — enough for data transfer, then back to sleep
+static constexpr unsigned long REPEATER_FIRST_BOOT_AWAKE_MS  = 120000; // first boot: stay awake 120s so BLE can be discovered
 static constexpr unsigned long WIFI_DISCONNECT_SETTLE_MS = 100;  // delay after WiFi.disconnect() before WiFi.begin() to let radio settle
 static bool s_pmAutoSleepActive = false;   // true when RTOS PM auto light-sleep is active
 static bool s_btWakeupEnabled   = false;   // true after esp_sleep_enable_bt_wakeup() succeeded
@@ -1632,7 +1633,10 @@ void loopOperationalMode() {
       String actualAPSSID = config.apSSID.length() ? config.apSSID : String("Repeater_AP");
       bleBeacon.begin(actualAPSSID, config.nodeName, 0); // 0 = Repeater role
       bleBeacon.startAdvertising();
-      Serial.println("[BLE-MESH] Repeater BLE beacon active (BLE-only, WiFi AP off)");
+      Serial.printf("[BLE-MESH] Repeater BLE beacon active (BLE-only, WiFi AP off, SSID=%s, name=%s)\n",
+                    actualAPSSID.c_str(), config.nodeName.c_str());
+      Serial.printf("[BLE-MESH] First boot awake window: %lus (BLE discoverable for this long)\n",
+                    REPEATER_FIRST_BOOT_AWAKE_MS / 1000);
 
       // Enable BLE hardware wake trigger — CPU wakes instantly on BLE scan/connect.
       if (!s_btWakeupEnabled) {
@@ -1658,7 +1662,12 @@ void loopOperationalMode() {
     static bool s_postSleepWake = false;        // true only after waking from light sleep
 
     int connectedStations = s_repeaterWiFiAPActive ? WiFi.softAPgetStationNum() : 0;
-    bool awakeWindowExpired = (millis() - s_lastWakeMillis) >= REPEATER_AWAKE_AFTER_SLEEP_MS;
+    // On first boot use a longer awake window so the repeater can be
+    // discovered via BLE before entering light sleep (BLE advertising
+    // may not persist through manual light sleep on ESP32-C6).
+    unsigned long awakeWindowMs = s_postSleepWake ? REPEATER_AWAKE_AFTER_SLEEP_MS
+                                                  : REPEATER_FIRST_BOOT_AWAKE_MS;
+    bool awakeWindowExpired = (millis() - s_lastWakeMillis) >= awakeWindowMs;
 
     // If we're in the awake window and WiFi isn't started yet, start it
     // (only after at least one sleep/wake cycle — first boot stays BLE-only)
@@ -1777,11 +1786,12 @@ void loopOperationalMode() {
       // Register a timer wake for periodic queue forwarding
       esp_sleep_enable_timer_wakeup(REPEATER_LIGHT_SLEEP_S * 1000000ULL);
 
-      // Light sleep silently stops BLE hardware advertising — reset flag
+      // Reset the software flag — on wake we will always restart advertising
+      // regardless of whether the BLE controller kept it alive during sleep.
       bleBeacon.markAdvertisingStopped();
 
-      Serial.printf("[PM] Repeater entering light sleep (%lus, BLE wake armed, WiFi OFF)\n",
-                    REPEATER_LIGHT_SLEEP_S);
+      Serial.printf("[PM] Repeater entering light sleep (%lus, BLE wake armed, WiFi OFF, awake was %lums)\n",
+                    REPEATER_LIGHT_SLEEP_S, awakeWindowMs);
       Serial.flush();
 
       esp_light_sleep_start();
@@ -1811,6 +1821,17 @@ void loopOperationalMode() {
       lastQueueCheck = millis();  // defer queue check — immediate STA connect would starve async_tcp
     } else {
       // Still in awake window, stations connected, or transfer in progress
+      static unsigned long s_lastBleStatusLog = 0;
+      if (millis() - s_lastBleStatusLog > 30000) {
+        s_lastBleStatusLog = millis();
+        Serial.printf("[BLE-BEACON] advertising=%s, awake=%lums/%lums, postSleep=%d, WiFi=%d, stations=%d\n",
+                      bleBeacon.isActive() ? "YES" : "NO",
+                      (unsigned long)(millis() - s_lastWakeMillis),
+                      awakeWindowMs,
+                      (int)s_postSleepWake,
+                      (int)s_repeaterWiFiAPActive,
+                      connectedStations);
+      }
       delay(50);
     }
 
