@@ -1771,7 +1771,7 @@ void loopOperationalMode() {
       // Record wake time — WiFi AP will be started on next loop iteration
       s_lastWakeMillis = millis();
       s_wifiStartedThisWake = false;
-      lastQueueCheck = millis();  // allow WiFi AP to stabilise before queue check
+      lastQueueCheck = millis();  // defer queue check — immediate STA connect would starve async_tcp
     } else {
       // Still in awake window, stations connected, or transfer in progress
       delay(50);
