@@ -1750,6 +1750,11 @@ void loopOperationalMode() {
 
       // --- woke up ---
       esp_task_wdt_reset();
+      // Yield to background tasks (especially async_tcp) so they can reset
+      // their watchdog timers — they were frozen during light sleep and their
+      // WDT counters accumulated.  Without this delay the single-core
+      // ESP32-C6 triggers "async_tcp" WDT immediately after wake.
+      delay(100);
       esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
       Serial.printf("[PM] Repeater woke from light sleep (cause=%d: %s)\n", (int)wc,
                     wc == ESP_SLEEP_WAKEUP_BT    ? "BLE" :
@@ -1766,7 +1771,7 @@ void loopOperationalMode() {
       // Record wake time — WiFi AP will be started on next loop iteration
       s_lastWakeMillis = millis();
       s_wifiStartedThisWake = false;
-      lastQueueCheck = 0;  // trigger immediate queue check after wake
+      lastQueueCheck = millis();  // allow WiFi AP to stabilise before queue check
     } else {
       // Still in awake window, stations connected, or transfer in progress
       delay(50);
