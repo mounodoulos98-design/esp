@@ -73,7 +73,7 @@ sensorsdaemon.py (server)
 ## 3. Sensor Communication Protocol
 
 ### 3.1 Sensor Behavior (from sensorsdaemon.py analysis)
-- **Scheduled wake**: Every 6 hours (configurable via `wakeup_every_min`)
+- **Scheduled wake**: Every 6 hours (configurable via `wakeup_every_min` in minutes, e.g., 360)
 - **Triggered wake**: Vibration threshold or temperature threshold
 - **Communication**: WiFi HTTP to collector's AP
 - **Data sizes**:
