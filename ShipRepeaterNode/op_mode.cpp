@@ -362,6 +362,18 @@ static String nextMeasureQueuePath() {
   return String(name);
 }
 
+// Progressive filename for /ingest uploads: /queue/i0000001.bin  (8.3 compatible)
+static String nextIngestQueuePath() {
+  preferences.begin(QUEUE_NS, false);
+  uint32_t idx = preferences.getUInt("ing_idx", 0);
+  idx++;
+  preferences.putUInt("ing_idx", idx);
+  preferences.end();
+  char name[64];
+  snprintf(name, sizeof(name), "%s/i%07lu.bin", QUEUE_DIR, (unsigned long)(idx % 10000000UL));
+  return String(name);
+}
+
 // Drain the measure ring buffer to SD — called from the main loop each iteration.
 // Must NOT be called from AsyncWebServer callbacks (Bug 4 fix).
 static void drainMeasureBuffer() {
@@ -784,11 +796,9 @@ void ensureRepeaterHttpServer() {
           return;
         }
         ensureDir(QUEUE_DIR);
-        char name[96];
-        snprintf(name, sizeof(name), "%s/%lu_%s", QUEUE_DIR, (unsigned long)millis(), filename.c_str());
-        current = String(name);
-        Serial.printf("[REPEATER][DBG] opening: '%s' (len=%u, buf=%u)\n",
-                      current.c_str(), (unsigned)current.length(), (unsigned)sizeof(name));
+        current = nextIngestQueuePath();  // 8.3-compatible: /queue/i0000001.bin
+        Serial.printf("[REPEATER][DBG] opening: '%s' (len=%u)\n",
+                      current.c_str(), (unsigned)current.length());
         upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
         if (!upFile) {
           // SD card may have lost SPI state (WiFi TX brown-out, light sleep, EMI).
@@ -836,12 +846,9 @@ void ensureRepeaterHttpServer() {
               testFile.close();
               sd.remove("/queue/_test.bin");
 
-              // Retry with a truncated fallback name so the upload is not lost
-              char fallback[64];
-              snprintf(fallback, sizeof(fallback), "%s/%lu_ingest.bin",
-                       QUEUE_DIR, (unsigned long)millis());
-              Serial.printf("[REPEATER][DBG] retrying with fallback name: %s\n", fallback);
-              current = String(fallback);
+              // Retry with an 8.3-compatible fallback name so the upload is not lost
+              current = nextIngestQueuePath();
+              Serial.printf("[REPEATER][DBG] retrying with fallback name: %s\n", current.c_str());
               upFile = sd.open(current.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
             } else {
               Serial.printf("[REPEATER][DBG] short-name test also failed (err=0x%02X) — SD/volume broken\n",
@@ -1640,30 +1647,22 @@ void loopOperationalMode() {
       }
     }
 
-    // One-time time sync from root (before first sleep)
-    static bool tried = false;
-    if (!tried) {
-      tried = true;
-      // Temporarily bring up WiFi for time sync
-      ensureWiFiAPRepeater();
-      ensureRepeaterHttpServer();
-      syncTimeFromUplink(5000);
-      // WiFi TX may have disrupted SPI bus — force SD reinit on next access
-      markSdStale();
-      invalidateEnsureDirCache();
-    }
-
     // --- On-demand WiFi AP: start when woken by BLE or timer ---
     // WiFi AP is only active during the awake window.  During light
     // sleep the WiFi radio is OFF — only BLE advertising runs.
+    // On first boot, skip WiFi entirely (BLE-only) — WiFi AP only starts
+    // after the first legitimate light sleep → wake cycle so that BLE
+    // advertising is never disrupted by WiFi.mode() changes.
     static unsigned long s_lastWakeMillis = 0;  // timestamp of last light-sleep wake
     static bool s_wifiStartedThisWake = false;  // track if WiFi AP was started this wake cycle
+    static bool s_postSleepWake = false;        // true only after waking from light sleep
 
     int connectedStations = s_repeaterWiFiAPActive ? WiFi.softAPgetStationNum() : 0;
     bool awakeWindowExpired = (millis() - s_lastWakeMillis) >= REPEATER_AWAKE_AFTER_SLEEP_MS;
 
     // If we're in the awake window and WiFi isn't started yet, start it
-    if (!s_repeaterWiFiAPActive && !awakeWindowExpired) {
+    // (only after at least one sleep/wake cycle — first boot stays BLE-only)
+    if (!s_repeaterWiFiAPActive && !awakeWindowExpired && s_postSleepWake) {
       ensureWiFiAPRepeater();
       ensureRepeaterHttpServer();
       s_wifiStartedThisWake = true;
@@ -1675,6 +1674,23 @@ void loopOperationalMode() {
       TaskHandle_t asyncTcpHandle = xTaskGetHandle("async_tcp");
       if (asyncTcpHandle) {
         esp_task_wdt_add(asyncTcpHandle);
+      }
+
+      // WiFi mode changes (WiFi.mode(WIFI_OFF) → WIFI_AP_STA in safeBringUpAP)
+      // may silently stop BLE hardware advertising on the shared ESP32-C6
+      // radio.  Restart it so both BLE and WiFi coexist during the awake
+      // window — collectors can still discover this node via BLE while
+      // other collectors are connected via WiFi.
+      bleBeacon.startAdvertising();
+
+      // One-time time sync from root (deferred to first WiFi-on window
+      // so BLE advertising is not disrupted during boot)
+      static bool timeSynced = false;
+      if (!timeSynced) {
+        timeSynced = true;
+        syncTimeFromUplink(5000);
+        markSdStale();
+        invalidateEnsureDirCache();
       }
 
       // Re-read connected stations now that AP is up
@@ -1791,6 +1807,7 @@ void loopOperationalMode() {
       // Record wake time — WiFi AP will be started on next loop iteration
       s_lastWakeMillis = millis();
       s_wifiStartedThisWake = false;
+      s_postSleepWake = true;  // enable on-demand WiFi from now on
       lastQueueCheck = millis();  // defer queue check — immediate STA connect would starve async_tcp
     } else {
       // Still in awake window, stations connected, or transfer in progress
