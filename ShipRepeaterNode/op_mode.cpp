@@ -19,6 +19,7 @@ extern "C" {
 #include "driver/gpio.h"
 #include "esp_sleep.h"
 #include "esp_wifi.h"
+#include "freertos/task.h"
 }
 
 // === SAFE AP bring-up helper (final stable) ===
@@ -1666,6 +1667,16 @@ void loopOperationalMode() {
       ensureWiFiAPRepeater();
       ensureRepeaterHttpServer();
       s_wifiStartedThisWake = true;
+
+      // WiFi is back — re-subscribe async_tcp to WDT so it is monitored
+      // during normal operation.  Give it a moment to run first so it can
+      // service its event queue and avoid an immediate WDT trigger.
+      delay(50);
+      TaskHandle_t asyncTcpHandle = xTaskGetHandle("async_tcp");
+      if (asyncTcpHandle) {
+        esp_task_wdt_add(asyncTcpHandle);
+      }
+
       // Re-read connected stations now that AP is up
       connectedStations = WiFi.softAPgetStationNum();
     }
@@ -1736,6 +1747,17 @@ void loopOperationalMode() {
         stopRepeaterWiFiAP();
       }
 
+      // Remove async_tcp from WDT before sleep.  With WiFi OFF the
+      // async_tcp FreeRTOS task has no work to do, but the hardware WDT
+      // timer continues ticking during light sleep.  After 300 s of
+      // sleep the 30 s WDT deadline is long exceeded and the WDT fires
+      // immediately on wake — before async_tcp ever gets scheduled on
+      // the single-core ESP32-C6.  We re-add it after WiFi AP restarts.
+      TaskHandle_t asyncTcpHandle = xTaskGetHandle("async_tcp");
+      if (asyncTcpHandle) {
+        esp_task_wdt_delete(asyncTcpHandle);
+      }
+
       // Register a timer wake for periodic queue forwarding
       esp_sleep_enable_timer_wakeup(REPEATER_LIGHT_SLEEP_S * 1000000ULL);
 
@@ -1750,10 +1772,8 @@ void loopOperationalMode() {
 
       // --- woke up ---
       esp_task_wdt_reset();
-      // Yield to background tasks (especially async_tcp) so they can reset
-      // their watchdog timers — they were frozen during light sleep and their
-      // WDT counters accumulated.  Without this delay the single-core
-      // ESP32-C6 triggers "async_tcp" WDT immediately after wake.
+      // Yield to background tasks so they can resume after being frozen
+      // during light sleep.
       delay(100);
       esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
       Serial.printf("[PM] Repeater woke from light sleep (cause=%d: %s)\n", (int)wc,
