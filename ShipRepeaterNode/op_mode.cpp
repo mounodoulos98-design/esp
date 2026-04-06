@@ -656,6 +656,13 @@ void ensureWiFiAPRepeater() {
   s_repeaterAPUp = ok;
 }
 
+// =============================
+// REPEATER: lightweight /time relay
+// =============================
+static bool repeaterHttpActive = false;       // handlers registered AND server.begin() called
+static bool repeaterHttpRoutesRegistered = false;  // handlers registered (once — re-registration duplicates routes)
+static AsyncWebServer rptServer(8080);
+
 // Shut down repeater WiFi AP before light sleep to eliminate antenna
 // contention with BLE advertising and save ~80mA.  WiFi AP restarts
 // on-demand when the repeater wakes from BLE or timer.
@@ -670,13 +677,6 @@ void stopRepeaterWiFiAP() {
   repeaterHttpActive = false;  // server needs begin() after WiFi restart
   Serial.println("[REPEATER] WiFi AP stopped for light sleep (BLE-only mode)");
 }
-
-// =============================
-// REPEATER: lightweight /time relay
-// =============================
-static bool repeaterHttpActive = false;       // handlers registered AND server.begin() called
-static bool repeaterHttpRoutesRegistered = false;  // handlers registered (once — re-registration duplicates routes)
-static AsyncWebServer rptServer(8080);
 
 bool syncTimeFromUplink(unsigned long timeout_ms) {
   if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
